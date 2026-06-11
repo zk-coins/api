@@ -1,0 +1,9 @@
+# Rust (the API layer builds alongside the Rust node)
+target/
+
+# Environment & secrets
+.env
+*.pem
+
+# OS / editor
+.DS_Store
