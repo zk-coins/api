@@ -32,6 +32,13 @@ The API layer sits **outward** of the node. It consumes the node's internal **ke
 
 > **Status: scaffold.** The API surface is currently served by [`zk-coins/node`](https://github.com/zk-coins/node) directly; this repo will hold the standalone API layer once the kernel RPC contract stabilises. The full design is specified in [§6.1 (kernel and API)](https://docs.zkcoins.com/specification), [§7.5 (REST)](https://docs.zkcoins.com/specification), and [§7.8 (kernel RPC)](https://docs.zkcoins.com/specification).
 
+### Inventory and skeleton (this branch)
+
+- Full §7.5 endpoint inventory (method, capability, feature, kernel RPC): [`docs/rest-surface.md`](docs/rest-surface.md).
+- Rust process (`axum` + `tonic` client dep): only **`GET /health`** and **`GET /`** are registered. No placeholder routes.
+- **`GET /` discovery follows registration:** the response `endpoints` object lists only surfaces this process actually serves (today: `health`). The full 29-key §7.5 catalogue stays as inventory; unbuilt surfaces are omitted, not faked.
+- Fail-closed env: `ZKCOINS_BIND_ADDR`, `ZKCOINS_KERNEL_ADDR`, `ZKCOINS_FEATURES` (see the inventory doc).
+
 ## License
 
 MIT

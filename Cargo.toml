@@ -1,0 +1,24 @@
+[package]
+name = "api"
+version = "0.1.0"
+edition = "2021"
+description = "zkCoins public REST API layer (scaffold)"
+license = "MIT"
+publish = false
+
+[dependencies]
+# Versions taken from zk-coins/node where the same crate is already a direct dep
+# (node/Cargo.toml / workspace). tonic is not yet a direct node dep; 0.14 matches
+# the version already present in the node Cargo.lock (transitive).
+axum = { version = "0.7.9", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tonic = "0.14"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Same versions as node/Cargo.toml [dev-dependencies].
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
