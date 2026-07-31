@@ -148,7 +148,11 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Replica-/Blob-Pfad).
 | Endpunkt | Status |
 |---|---|
 | `GET /health` | **implementiert** — `200` mit Body `"ok"` |
+| `GET /health/ready` | **implementiert** — Readiness aus Kernel-`GetInfo` (`ready` / `ready_reason`); Body-Form `{ ready, reason? }`, nie die generische Fehlerform. Bei fehlgeschlagenem `GetInfo` (z. B. fehlende `ChainIdentity` im node): **503** `{ ready: false, reason: "dependency_unavailable" }` — nie grünes `ready: true`. |
 | `GET /` | **implementiert** — `{ name, version, endpoints }` mit **genau** den Flächen, die dieser Prozess registriert (`ServedSurface`). Inventur der 29 Keys in `CLOSED_ENDPOINT_KEYS`; unregistrierte Keys werden weggelassen. |
+| `GET /v1/info` | **implementiert** — Kernel-`GetInfo` + API-eigene `features` aus `ZKCOINS_FEATURES` (`kernel_parts` bleibt intern). |
+| `GET /v1/chain/accumulator` | **implementiert** — `GetAccumulator`; `root` ist pass-through der Kernel-`nav_root`, keine Nachrechnung. |
+| `GET /v1/chain/nullifier/<pubkey>` | **implementiert** — `GetNullifierPath`; `present`/`absent` bleiben getrennt; Kernel-`internal_error` wird **nicht** als absent umgeschrieben. |
 | `POST /v1/tx` | **implementiert** — `SubmitTransition` |
 | `GET /v1/jobs/{job_id}` | **implementiert** — `GetJob` |
 | `GET /v1/jobs/{job_id}/stream` | **implementiert** — `StreamJob` als SSE |
@@ -156,10 +160,12 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Replica-/Blob-Pfad).
 | `POST /v1/jobs/{job_id}/cancel` | **implementiert** — `CancelJob` |
 | alle übrigen Method+Path | **nicht registriert** — kein Handler, kein `todo!()`, kein Platzhalter |
 
+**Bewusst nicht beworben:** `chain_inscriptions` — `ListInscriptions` ist im node `Unimplemented` (fehlt scanner-geschriebener Inschriften-Katalog mit Reveal-Txid und §3.5-Format). Eine REST-Hülle, die zuverlässig 501 liefert, wäre nur eine zweite Stelle für dieselbe Absenz.
+
 Router und Discovery teilen eine Quelle (`ServedSurface` in `src/routes.rs`): eine neue
 registrierte Fläche erscheint automatisch in `GET /`; ein Inventur-Key ohne Route
 wird nicht beworben. Path-Parameter in Discovery/`CLOSED_ENDPOINT_KEYS` nutzen die
-axum/OpenAPI-Form `{name}` (Spec-Text: `<name>`).
+Spec-Schreibweise `<name>` (Axum-Matcher: `:name`).
 
 gRPC: getragenes `proto/kernel/v1/kernel.proto` (Identität per SHA-256-Pin +
 Sibling-Vergleich mit `zk-coins/node`), Client `tonic 0.13.1`, Fehlerübersetzung
@@ -170,10 +176,9 @@ ausschließlich über `google.rpc.ErrorInfo` (`domain`, `reason`,
 
 | Lücke | Warum |
 |---|---|
-| `GET /v1/info` | braucht Kernel-`GetInfo` + API-eigene `features`-Konstruktion. |
-| `GET /health/ready` | `ready` / `ready_reason` aus Kernel-`GetInfo`. |
-| Chain / Pull / Bootstrap / Publish / Blossom / Attest / Grants | jeweilige Kernel-RPC noch nicht angebunden. |
-| Feature-Gate `404 feature_disabled` | Job-Fläche ist in dieser Stufe always-on; Gate folgt mit den optionalen Rollen. |
+| `GET /v1/chain/inscriptions` | Kernel-`ListInscriptions` Unimplemented bis Inschriften-Katalog. |
+| Pull / Bootstrap / Publish / Blossom / Attest / Grants | jeweilige Kernel-RPC noch nicht angebunden. |
+| Feature-Gate `404 feature_disabled` | Info/Chain/Job-Fläche ist in dieser Stufe always-on; Gate folgt mit den optionalen Rollen. |
 
 ---
 

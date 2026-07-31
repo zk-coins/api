@@ -48,7 +48,7 @@ async fn main() -> ExitCode {
         %bind_addr,
         %kernel_addr,
         feature_count,
-        "zkcoins-api listening (health + job surface)"
+        "zkcoins-api listening (health + info/chain reads + job surface)"
     );
 
     if let Err(e) = axum::serve(listener, app).await {

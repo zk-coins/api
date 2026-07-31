@@ -9,7 +9,8 @@ use crate::error::ApiError;
 use crate::kernel::error_info::kernel_status_to_api_error;
 use crate::kernel::pb::kernel_v1::kernel_client::KernelClient as TonicKernelClient;
 use crate::kernel::pb::kernel_v1::{
-    Job, JobEvent, JobHandle, JobRequest, SignRequest, TransitionRequest,
+    AccumulatorTip, GetAccumulatorRequest, GetInfoRequest, Info, Job, JobEvent, JobHandle,
+    JobRequest, NullifierPath, NullifierPathRequest, SignRequest, TransitionRequest,
 };
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
@@ -18,7 +19,7 @@ use std::sync::Arc;
 use tonic::transport::Channel;
 use tonic::Request;
 
-/// Subset of kernel procedures this stage consumes (job surface only).
+/// Subset of kernel procedures this stage consumes (job surface + info/chain reads).
 #[async_trait]
 pub trait KernelRpc: Send + Sync {
     async fn submit_transition(&self, req: TransitionRequest) -> Result<JobHandle, ApiError>;
@@ -33,6 +34,15 @@ pub trait KernelRpc: Send + Sync {
     async fn sign_transition(&self, req: SignRequest) -> Result<Job, ApiError>;
 
     async fn cancel_job(&self, req: JobRequest) -> Result<Job, ApiError>;
+
+    async fn get_info(&self) -> Result<Info, ApiError>;
+
+    async fn get_accumulator(&self) -> Result<AccumulatorTip, ApiError>;
+
+    async fn get_nullifier_path(
+        &self,
+        req: NullifierPathRequest,
+    ) -> Result<NullifierPath, ApiError>;
 }
 
 /// Shared handle installed in the axum `State`.
@@ -155,6 +165,36 @@ impl KernelRpc for KernelClient {
         let mut client = self.inner.clone();
         let response = client
             .cancel_job(Request::new(req))
+            .await
+            .map_err(map_status)?;
+        Ok(response.into_inner())
+    }
+
+    async fn get_info(&self) -> Result<Info, ApiError> {
+        let mut client = self.inner.clone();
+        let response = client
+            .get_info(Request::new(GetInfoRequest {}))
+            .await
+            .map_err(map_status)?;
+        Ok(response.into_inner())
+    }
+
+    async fn get_accumulator(&self) -> Result<AccumulatorTip, ApiError> {
+        let mut client = self.inner.clone();
+        let response = client
+            .get_accumulator(Request::new(GetAccumulatorRequest {}))
+            .await
+            .map_err(map_status)?;
+        Ok(response.into_inner())
+    }
+
+    async fn get_nullifier_path(
+        &self,
+        req: NullifierPathRequest,
+    ) -> Result<NullifierPath, ApiError> {
+        let mut client = self.inner.clone();
+        let response = client
+            .get_nullifier_path(Request::new(req))
             .await
             .map_err(map_status)?;
         Ok(response.into_inner())

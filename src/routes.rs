@@ -9,9 +9,12 @@
 //! Axum registration uses a derived **matcher** form (`:name`); see
 //! [`advertised_path_to_axum_matcher`].
 
+use crate::chain;
 use crate::config::Config;
+use crate::info;
 use crate::jobs;
 use crate::kernel::KernelHandle;
+use crate::state::AppState;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -80,14 +83,22 @@ pub const CLOSED_ENDPOINT_KEYS: &[(&str, &str)] = &[
 /// §7.5; it is registered beside this set, never as a member of it.
 ///
 /// Feature gating (§6.1): further inventory keys belong to `wallet` /
-/// `explorer` / `publisher`. This stage's job surface is always-on (the
-/// proof is self-authenticating; §7.5 L2884) once the handlers exist — the
-/// operator still must set `ZKCOINS_KERNEL_ADDR`. When capability-gated or
-/// role-optional handlers land, registration will filter `ServedSurface` by
+/// `explorer` / `publisher`. This stage's job surface and the info/chain
+/// read surface are always-on once the handlers exist — the operator still
+/// must set `ZKCOINS_KERNEL_ADDR`. When capability-gated or role-optional
+/// handlers land, registration will filter `ServedSurface` by
 /// `Config::features`.
+///
+/// `chain_inscriptions` is intentionally **not** a variant: `ListInscriptions`
+/// is Unimplemented in the node until a scanner-written inscription catalog
+/// exists; advertising a REST key that can only 501 is not progress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServedSurface {
     Health,
+    HealthReady,
+    Info,
+    ChainAccumulator,
+    ChainNullifier,
     Tx,
     Jobs,
     JobsStream,
@@ -99,6 +110,10 @@ impl ServedSurface {
     /// Every surface this binary currently serves.
     const ALL: &[ServedSurface] = &[
         ServedSurface::Health,
+        ServedSurface::HealthReady,
+        ServedSurface::Info,
+        ServedSurface::ChainAccumulator,
+        ServedSurface::ChainNullifier,
         ServedSurface::Tx,
         ServedSurface::Jobs,
         ServedSurface::JobsStream,
@@ -110,6 +125,10 @@ impl ServedSurface {
     fn discovery_key(self) -> &'static str {
         match self {
             ServedSurface::Health => "health",
+            ServedSurface::HealthReady => "health_ready",
+            ServedSurface::Info => "info",
+            ServedSurface::ChainAccumulator => "chain_accumulator",
+            ServedSurface::ChainNullifier => "chain_nullifier",
             ServedSurface::Tx => "tx",
             ServedSurface::Jobs => "jobs",
             ServedSurface::JobsStream => "jobs_stream",
@@ -122,10 +141,14 @@ impl ServedSurface {
     ///
     /// Discovery still advertises the inventory (Spec) form; only the route
     /// table sees the rewritten matcher.
-    fn register(self, router: Router<KernelHandle>) -> Router<KernelHandle> {
+    fn register(self, router: Router<AppState>) -> Router<AppState> {
         let path = advertised_path_to_axum_matcher(closed_path(self.discovery_key()));
         match self {
             ServedSurface::Health => router.route(&path, get(health)),
+            ServedSurface::HealthReady => router.route(&path, get(info::health_ready)),
+            ServedSurface::Info => router.route(&path, get(info::get_info)),
+            ServedSurface::ChainAccumulator => router.route(&path, get(chain::get_accumulator)),
+            ServedSurface::ChainNullifier => router.route(&path, get(chain::get_nullifier)),
             ServedSurface::Tx => router.route(&path, post(jobs::post_tx)),
             ServedSurface::Jobs => router.route(&path, get(jobs::get_job)),
             ServedSurface::JobsStream => router.route(&path, get(jobs::stream_job)),
@@ -212,32 +235,34 @@ struct RootResponse {
 
 /// Build the axum router for the given configuration and kernel handle.
 ///
-/// `config` is retained so feature-gated surfaces can join the same
-/// registration path later. Today the always-on set is health + the job
-/// surface; §6.1 features open no extra routes until those handlers exist.
+/// `config.features` is stored in [`AppState`] for `GET /v1/info` (API-owned
+/// advertisement). Route registration is still the always-on
+/// [`ServedSurface::ALL`] set; §6.1 feature gating of optional roles lands
+/// with those handlers.
 ///
 /// Returns a fully state-bound router (`Router` / `Router<()>`). Only that
 /// form implements `tower::Service` and is ready for `axum::serve` and test
-/// `oneshot` calls. Handlers still extract `State<KernelHandle>` during
-/// registration; the concrete handle is supplied once at the end.
+/// `oneshot` calls. Handlers extract `State<AppState>` or
+/// `State<KernelHandle>` (via [`axum::extract::FromRef`]); the concrete
+/// state is supplied once at the end.
 pub fn build_router(config: Config, kernel: KernelHandle) -> Router {
-    // Intentionally unread: feature-gated registration lands with those handlers.
     let Config {
         bind_addr: _,
         kernel_addr: _,
-        features: _,
+        features,
     } = config;
 
-    // Register every surface as `Router<KernelHandle>` (job handlers extract
-    // `State<KernelHandle>`), then bind the handle so the returned tree is
-    // `Router<()>` and implements `Service`. Binding earlier while still
-    // returning `Router<KernelHandle>` leaves the tree "missing" state and
-    // breaks both `axum::serve` and `oneshot`.
+    let state = AppState { kernel, features };
+
+    // Register every surface as `Router<AppState>`, then bind state so the
+    // returned tree is `Router<()>` and implements `Service`. Binding earlier
+    // while still returning `Router<AppState>` leaves the tree "missing"
+    // state and breaks both `axum::serve` and `oneshot`.
     let mut router = Router::new().route("/", get(root));
     for surface in ServedSurface::ALL {
         router = surface.register(router);
     }
-    router.with_state(kernel)
+    router.with_state(state)
 }
 
 async fn health() -> Response {
@@ -259,7 +284,8 @@ mod tests {
     use crate::error::ApiError;
     use crate::kernel::encode_kernel_error_status;
     use crate::kernel::kernel_v1::{
-        Job, JobEvent, JobHandle, JobRequest, SignRequest, TransitionRequest,
+        AccumulatorTip, BootstrapManifest, Info, Job, JobEvent, JobHandle, JobRequest,
+        NullifierPath, NullifierPathRequest, SignRequest, TransitionRequest,
     };
     use crate::kernel::KernelRpc;
     use async_trait::async_trait;
@@ -268,7 +294,7 @@ mod tests {
     use futures_util::stream::{self, BoxStream};
     use http_body_util::BodyExt;
     use serde_json::Value;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
     use tonic::Code;
     use tower::ServiceExt;
@@ -303,6 +329,22 @@ mod tests {
         }
         async fn cancel_job(&self, _req: JobRequest) -> Result<Job, ApiError> {
             Err(ApiError::internal("test double: cancel not configured"))
+        }
+        async fn get_info(&self) -> Result<Info, ApiError> {
+            Err(ApiError::internal("test double: get_info not configured"))
+        }
+        async fn get_accumulator(&self) -> Result<AccumulatorTip, ApiError> {
+            Err(ApiError::internal(
+                "test double: get_accumulator not configured",
+            ))
+        }
+        async fn get_nullifier_path(
+            &self,
+            _req: NullifierPathRequest,
+        ) -> Result<NullifierPath, ApiError> {
+            Err(ApiError::internal(
+                "test double: get_nullifier_path not configured",
+            ))
         }
     }
 
@@ -450,21 +492,40 @@ mod tests {
             actual_keys,
             BTreeSet::from([
                 "health",
+                "health_ready",
+                "info",
+                "chain_accumulator",
+                "chain_nullifier",
                 "tx",
                 "jobs",
                 "jobs_stream",
                 "jobs_sign",
                 "jobs_cancel",
             ]),
-            "stage A serves health + the five job-surface keys"
+            "stage B serves health + info/chain reads + the five job-surface keys"
+        );
+        // chain_inscriptions must not be advertised until ListInscriptions exists.
+        assert!(
+            !endpoints.contains_key("chain_inscriptions"),
+            "chain_inscriptions must stay unadvertised while the node catalog is missing"
         );
         assert_eq!(
             endpoints["health"].as_str(),
             Some("/health"),
             "health path must match CLOSED_ENDPOINT_KEYS inventory"
         );
-        assert_eq!(endpoints["tx"].as_str(), Some("/v1/tx"));
+        assert_eq!(endpoints["health_ready"].as_str(), Some("/health/ready"));
+        assert_eq!(endpoints["info"].as_str(), Some("/v1/info"));
+        assert_eq!(
+            endpoints["chain_accumulator"].as_str(),
+            Some("/v1/chain/accumulator")
+        );
         // Spec-Schreibweise on the wire — never the axum matcher form.
+        assert_eq!(
+            endpoints["chain_nullifier"].as_str(),
+            Some("/v1/chain/nullifier/<pubkey>")
+        );
+        assert_eq!(endpoints["tx"].as_str(), Some("/v1/tx"));
         assert_eq!(endpoints["jobs"].as_str(), Some("/v1/jobs/<job_id>"));
         assert_eq!(
             endpoints["jobs_stream"].as_str(),
@@ -632,12 +693,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unregistered_info_is_404_and_absent_from_discovery() {
+    async fn chain_inscriptions_is_404_and_absent_from_discovery() {
+        // Documented omission: ListInscriptions is Unimplemented in the node
+        // (no scanner catalog). REST must not advertise or soft-serve it.
         let app = test_app();
         let res = app
             .oneshot(
                 Request::builder()
-                    .uri("/v1/info")
+                    .uri("/v1/chain/inscriptions")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -646,7 +709,7 @@ mod tests {
         assert_eq!(
             res.status(),
             StatusCode::NOT_FOUND,
-            "GET /v1/info must not be a placeholder route"
+            "GET /v1/chain/inscriptions must not be registered without a catalog"
         );
 
         let app = test_app();
@@ -658,12 +721,20 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).expect("JSON root body");
         let endpoints = json["endpoints"].as_object().expect("endpoints object");
         assert!(
-            !endpoints.contains_key("info"),
-            "unregistered surface 'info' must be omitted from GET / endpoints"
+            !endpoints.contains_key("chain_inscriptions"),
+            "unbuilt surface 'chain_inscriptions' must be omitted from GET / endpoints"
         );
         assert!(
-            !endpoints.contains_key("health_ready"),
-            "unregistered surface 'health_ready' must be omitted from GET / endpoints"
+            endpoints.contains_key("info"),
+            "stage B must advertise info"
+        );
+        assert!(
+            endpoints.contains_key("health_ready"),
+            "stage B must advertise health_ready"
+        );
+        assert!(
+            endpoints.contains_key("chain_nullifier"),
+            "stage B must advertise chain_nullifier"
         );
     }
 
@@ -726,6 +797,9 @@ mod tests {
         stream: Option<Result<Vec<Result<JobEvent, ApiError>>, ApiError>>,
         sign: Option<Result<Job, ApiError>>,
         cancel: Option<Result<Job, ApiError>>,
+        info: Option<Result<Info, ApiError>>,
+        accumulator: Option<Result<AccumulatorTip, ApiError>>,
+        nullifier_path: Option<Result<NullifierPath, ApiError>>,
     }
 
     #[async_trait]
@@ -770,6 +844,67 @@ mod tests {
                 Some(Err(e)) => Err(e.clone()),
                 None => Err(ApiError::internal("cancel not scripted")),
             }
+        }
+        async fn get_info(&self) -> Result<Info, ApiError> {
+            match &self.info {
+                Some(Ok(i)) => Ok(i.clone()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal("info not scripted")),
+            }
+        }
+        async fn get_accumulator(&self) -> Result<AccumulatorTip, ApiError> {
+            match &self.accumulator {
+                Some(Ok(t)) => Ok(t.clone()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal("accumulator not scripted")),
+            }
+        }
+        async fn get_nullifier_path(
+            &self,
+            _req: NullifierPathRequest,
+        ) -> Result<NullifierPath, ApiError> {
+            match &self.nullifier_path {
+                Some(Ok(p)) => Ok(p.clone()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal("nullifier_path not scripted")),
+            }
+        }
+    }
+
+    fn sample_info(ready: bool, reason: Option<&str>) -> Info {
+        let mut circuit_digests = HashMap::new();
+        circuit_digests.insert("C".to_string(), vec![0x11; 32]);
+        circuit_digests.insert("C_balance".to_string(), vec![0x22; 32]);
+        Info {
+            network: "regtest".into(),
+            protocol_version: "v1".into(),
+            circuit_digests,
+            relay_url: "wss://relay.example".into(),
+            blossom_url: "https://blossom.example".into(),
+            finality_confirmations: 6,
+            max_tx_inputs: 8,
+            max_tx_outputs: 8,
+            max_rx_coins: 4,
+            max_account_assets: 32,
+            ready,
+            bitcoin_tip_height: 100,
+            accumulator_root: vec![0xAA; 32],
+            scanner_lag: 0,
+            max_blob_bytes: 1_048_576,
+            activation_height: 0,
+            bootstrap: Some(BootstrapManifest {
+                network: "regtest".into(),
+                protocol_version: "v1".into(),
+                seed_relays: vec!["wss://seed.example".into()],
+                blob_stores: vec!["https://blob.example".into()],
+                operator_ids: vec![vec![0x33; 32]],
+                issued_at: 1,
+                expires_at: 9_999_999_999,
+                manifest_sig: vec![0x44; 64],
+            }),
+            kernel_parts: vec!["scanner".into()],
+            ready_reason: reason.map(|s| s.to_string()),
+            bootstrap_pubkey: vec![0x55; 32],
         }
     }
 
@@ -1187,5 +1322,414 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
         assert_eq!(json["error"], "job_not_found");
+    }
+
+    // -----------------------------------------------------------------------
+    // Info / readiness / chain read surface
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_info_happy_path() {
+        let kernel = ScriptedKernel {
+            info: Some(Ok(sample_info(true, None))),
+            ..Default::default()
+        };
+        let mut features = BTreeSet::new();
+        features.insert(Feature::Wallet);
+        let cfg = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            kernel_addr: "http://127.0.0.1:50051".to_string(),
+            features,
+        };
+        let app = build_router(cfg, Arc::new(kernel));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["network"], "regtest");
+        assert_eq!(json["protocol_version"], "v1");
+        assert_eq!(json["finality_confirmations"], 6);
+        assert_eq!(json["max_tx_inputs"], 8);
+        assert_eq!(json["features"], serde_json::json!(["wallet"]));
+        assert_eq!(
+            json["bootstrap_pubkey"].as_str().unwrap().len(),
+            64,
+            "bootstrap_pubkey is hex32"
+        );
+        assert_eq!(json["bootstrap"]["network"], "regtest");
+        // Kernel-only fields must not leak onto the public surface.
+        assert!(json.get("ready").is_none());
+        assert!(json.get("kernel_parts").is_none());
+        assert!(json.get("accumulator_root").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_info_kernel_internal_is_500() {
+        let status = encode_kernel_error_status(
+            Code::Internal,
+            "Chain identity unavailable",
+            "internal_error",
+            500,
+        );
+        let kernel = ScriptedKernel {
+            info: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap()
+                .contains("Chain identity unavailable"),
+            "message must carry the kernel cause, got {}",
+            json["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn health_ready_true_is_200() {
+        let kernel = ScriptedKernel {
+            info: Some(Ok(sample_info(true, None))),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["ready"], true);
+        assert!(
+            json.get("reason").is_none(),
+            "ready:true must not carry reason"
+        );
+        // Diagnostics from GetInfo (MAY); root/size are not unpaired here.
+        assert_eq!(json["bitcoin_tip_height"], 100);
+        assert_eq!(json["scanner_lag"], 0);
+        assert!(json.get("root").is_none());
+        // Must not use the generic error body shape.
+        assert!(json.get("error").is_none());
+    }
+
+    #[tokio::test]
+    async fn health_ready_false_is_503_with_reason() {
+        let kernel = ScriptedKernel {
+            info: Some(Ok(sample_info(false, Some("syncing")))),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["ready"], false);
+        assert_eq!(json["reason"], "syncing");
+        assert!(json.get("error").is_none());
+    }
+
+    /// Fail-closed production posture: node `GetInfo` returns Internal when
+    /// `ChainIdentity` is unset. The readiness probe must answer **not ready**
+    /// (503 + dependency_unavailable), never invent `ready: true`.
+    #[tokio::test]
+    async fn health_ready_getinfo_failure_is_not_ready_dependency_unavailable() {
+        let status = encode_kernel_error_status(
+            Code::Internal,
+            "Chain identity unavailable",
+            "internal_error",
+            500,
+        );
+        let kernel = ScriptedKernel {
+            info: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "failed GetInfo must not green-light readiness"
+        );
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["ready"], false);
+        assert_eq!(json["reason"], "dependency_unavailable");
+        // Readiness shape, not the generic §7.5 error body.
+        assert!(
+            json.get("error").is_none(),
+            "must not use generic error body on /health/ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_accumulator_happy_path() {
+        let kernel = ScriptedKernel {
+            accumulator: Some(Ok(AccumulatorTip {
+                root: vec![0xAB; 32],
+                tip_block_hash: vec![0xCD; 32],
+                tip_height: 42,
+                size: 7,
+            })),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/chain/accumulator")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["size"], 7);
+        assert_eq!(json["tip_height"], 42);
+        assert_eq!(
+            json["root"].as_str().unwrap(),
+            crate::hexutil::encode_hex(&[0xAB; 32])
+        );
+        assert_eq!(
+            json["tip_block_hash"].as_str().unwrap(),
+            crate::hexutil::encode_hex(&[0xCD; 32])
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_accumulator_kernel_error_uses_error_info() {
+        let status = encode_kernel_error_status(
+            Code::Internal,
+            "Chain view unavailable",
+            "internal_error",
+            500,
+        );
+        let kernel = ScriptedKernel {
+            accumulator: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/chain/accumulator")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap()
+                .contains("Chain view unavailable"),
+            "message must name the cause, got {}",
+            json["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_nullifier_present_happy_path() {
+        let kernel = ScriptedKernel {
+            nullifier_path: Some(Ok(NullifierPath {
+                root: vec![0x01; 32],
+                tip_height: 10,
+                present: true,
+                leaf: vec![0x02; 32],
+                position: 3,
+                audit_path: vec![vec![0x03; 32], vec![0x04; 32]],
+                tree_size: 4,
+                tip_block_hash: vec![0x05; 32],
+            })),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let pk = hex32(0xaa);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/chain/nullifier/{pk}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["present"], true);
+        assert_eq!(json["position"], 3);
+        assert_eq!(
+            json["leaf"].as_str().unwrap(),
+            crate::hexutil::encode_hex(&[0x02; 32])
+        );
+        assert_eq!(json["audit_path"].as_array().unwrap().len(), 2);
+        assert_eq!(json["tree_size"], 4);
+        assert_eq!(json["tip_height"], 10);
+    }
+
+    #[tokio::test]
+    async fn chain_nullifier_absent_omits_position_and_leaf() {
+        let kernel = ScriptedKernel {
+            nullifier_path: Some(Ok(NullifierPath {
+                root: vec![0x01; 32],
+                tip_height: 10,
+                present: false,
+                leaf: Vec::new(),
+                position: 0,
+                audit_path: Vec::new(),
+                tree_size: 4,
+                tip_block_hash: vec![0x05; 32],
+            })),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let pk = hex32(0xbb);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/chain/nullifier/{pk}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["present"], false);
+        assert!(
+            json.get("position").is_none(),
+            "absent must omit position, got {json}"
+        );
+        assert!(
+            json.get("leaf").is_none(),
+            "absent must omit leaf, got {json}"
+        );
+        assert_eq!(json["audit_path"], serde_json::json!([]));
+        assert_eq!(json["tree_size"], 4);
+        assert_eq!(
+            json["root"].as_str().unwrap(),
+            crate::hexutil::encode_hex(&[0x01; 32])
+        );
+    }
+
+    /// The decisive case: a corrupt index is kernel `internal_error`, not
+    /// `present: false`. The api must not flatten that distinction.
+    #[tokio::test]
+    async fn chain_nullifier_kernel_internal_is_not_absent() {
+        let status = encode_kernel_error_status(
+            Code::Internal,
+            "Failed to build nullifier path",
+            "internal_error",
+            500,
+        );
+        let kernel = ScriptedKernel {
+            nullifier_path: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let pk = hex32(0xcc);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/chain/nullifier/{pk}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(
+            json["error"], "internal_error",
+            "corrupt index must surface as ErrorInfo, not as present:false"
+        );
+        assert!(
+            json.get("present").is_none(),
+            "error body must not look like a Path-B absence answer"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap()
+                .contains("Failed to build nullifier path"),
+            "message must carry the kernel cause, got {}",
+            json["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_nullifier_malformed_pubkey_is_400() {
+        let kernel = ScriptedKernel {
+            nullifier_path: Some(Ok(NullifierPath {
+                root: vec![0x01; 32],
+                tip_height: 0,
+                present: false,
+                leaf: Vec::new(),
+                position: 0,
+                audit_path: Vec::new(),
+                tree_size: 0,
+                tip_block_hash: vec![0x05; 32],
+            })),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/chain/nullifier/not-hex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+        assert!(
+            json["message"].as_str().unwrap().contains("pubkey"),
+            "message must name pubkey, got {}",
+            json["message"]
+        );
     }
 }
