@@ -32,6 +32,10 @@ use sha2::{Digest, Sha256};
 // there). Word-for-word match is the cryptographic action binding.
 // ---------------------------------------------------------------------------
 
+/// `ChallengeAction::Pull.domain()` in
+/// `node/src/kernel/bootstrap/challenges.rs`.
+pub const PULL_CHALLENGE_DOMAIN: &str = "zkCoins/v1/PullChallenge";
+
 /// `ChallengeAction::AttestBalance.domain()` in
 /// `node/src/kernel/bootstrap/challenges.rs`.
 pub const ATTEST_BALANCE_CHALLENGE_DOMAIN: &str = "zkCoins/v1/AttestBalanceChallenge";
@@ -65,6 +69,8 @@ const GOLDILOCKS_ORDER: u64 = 0xffff_ffff_0000_0001;
 /// arbitrary domain from the request body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChallengeDomain {
+    /// `POST /v1/pull` — no `request_hash` in `chal` (§5.1 L1916).
+    Pull,
     AttestBalance,
     IssueGrant,
 }
@@ -73,6 +79,7 @@ impl ChallengeDomain {
     /// Normative domain tag for this action (§5.1 table / node source).
     pub const fn as_str(self) -> &'static str {
         match self {
+            ChallengeDomain::Pull => PULL_CHALLENGE_DOMAIN,
             ChallengeDomain::AttestBalance => ATTEST_BALANCE_CHALLENGE_DOMAIN,
             ChallengeDomain::IssueGrant => ISSUE_GRANT_CHALLENGE_DOMAIN,
         }
@@ -157,6 +164,29 @@ pub fn ownership_challenge_message(
     pre.extend_from_slice(subject);
     pre.extend_from_slice(&expiry.to_be_bytes());
     pre.extend_from_slice(request_hash);
+    sha256(&pre)
+}
+
+/// `chal = H(domain ‖ nonce ‖ chan_bind ‖ subject ‖ expiry)` for pull / bootstrap
+/// (§5.1 L1916 — no `request_hash`).
+///
+/// `domain` is UTF-8 of the action tag; `nonce`/`chan_bind`/`subject` are 32
+/// raw bytes; `expiry` is u64 big-endian. Body `expiry` is bound into this
+/// digest (Redeem-body `expiry` normative): a forged value yields a different
+/// `chal` and fails signature verification.
+pub fn pull_challenge_message(
+    domain: &str,
+    nonce: &[u8; 32],
+    chan_bind: &[u8; 32],
+    subject: &[u8; 32],
+    expiry: u64,
+) -> [u8; 32] {
+    let mut pre = Vec::with_capacity(domain.len() + 32 + 32 + 32 + 8);
+    pre.extend_from_slice(domain.as_bytes());
+    pre.extend_from_slice(nonce);
+    pre.extend_from_slice(chan_bind);
+    pre.extend_from_slice(subject);
+    pre.extend_from_slice(&expiry.to_be_bytes());
     sha256(&pre)
 }
 
@@ -507,6 +537,134 @@ pub fn verify_ownership_proof(
     })
 }
 
+/// §7.5 `GrantProofJson` on the wire (pull path only).
+///
+/// Present so the pull handler can discriminate proof kinds without treating
+/// an unknown shape as ownership. Full §5.1(b) verification is **not**
+/// implemented here — see [`reject_grant_proof`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct GrantProofJson {
+    #[serde(rename = "type")]
+    pub proof_type: String,
+    /// Bech32m `zkgrant` string (§5.2).
+    pub grant: String,
+    pub grantee_pk: String,
+    pub signature: String,
+}
+
+/// Session authority that follows from the verified proof kind.
+///
+/// Wire tokens match the interim kernel metadata
+/// `x-zkcoins-session-authority` (`ownership` | `grant`) in
+/// `node/src/kernel_rpc.rs` / `parse_session_authority`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAuthority {
+    Ownership,
+    Grant,
+}
+
+impl SessionAuthority {
+    /// Metadata / wire token. Never empty; never a defaulted ownership.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            SessionAuthority::Ownership => "ownership",
+            SessionAuthority::Grant => "grant",
+        }
+    }
+}
+
+/// Verify a pull-domain OwnershipProof (`chal` without `request_hash`).
+///
+/// Pure: does not dial the kernel. Body `expiry` is part of the signed
+/// preimage (Redeem-body `expiry`); a wrong value fails BIP-340.
+pub fn verify_pull_ownership_proof(
+    request_subject: &str,
+    nonce_hex: &str,
+    expiry_decimal: &str,
+    proof: &OwnershipProofJson,
+    public_hosts: &[String],
+) -> Result<VerifiedOwnership, ApiError> {
+    // Closed capability match — GrantProof is a different type on the wire;
+    // if the ownership shape carries type=grant, reject here.
+    let capability = capability_from_wire(&proof.proof_type)?;
+    require_ownership(capability)?;
+
+    let subject_raw = decode_zk_address(request_subject)?;
+    let proof_subject_raw = decode_zk_address(&proof.subject)?;
+    if proof_subject_raw != subject_raw {
+        return Err(ApiError::unauthorized(
+            "ownership_proof.subject does not match request subject",
+        ));
+    }
+
+    let pk0 = parse_hex32_field(&proof.public_key, "ownership_proof.public_key")?;
+    let nk_commit = parse_hex32_field(&proof.nk_commit, "ownership_proof.nk_commit")?;
+    validate_nk_commit_limbs(&nk_commit)?;
+    let signature = parse_hex64_field(&proof.signature, "ownership_proof.signature")?;
+    let nonce = parse_hex32_field(nonce_hex, "nonce")?;
+    let challenge_expiry = parse_u64_decimal(expiry_decimal)
+        .map_err(|e| ApiError::malformed(format!("expiry: {}", e.body.message)))?;
+
+    let expected = address_from_pk0_nk_commit(&pk0, &nk_commit);
+    if expected != subject_raw {
+        return Err(ApiError::unauthorized(
+            "H(Pk0 ‖ nk_commit) does not equal subject address",
+        ));
+    }
+
+    if public_hosts.is_empty() {
+        return Err(ApiError::internal(
+            "no authoritative public hosts configured for chan_bind (ZKCOINS_PUBLIC_HOST)",
+        ));
+    }
+    let allowed: Vec<[u8; 32]> = public_hosts.iter().map(|h| chan_bind_for_host(h)).collect();
+
+    let domain_str = ChallengeDomain::Pull.as_str();
+    let mut accepted_bind: Option<[u8; 32]> = None;
+    for cb in &allowed {
+        let chal = pull_challenge_message(domain_str, &nonce, cb, &subject_raw, challenge_expiry);
+        if verify_bip340(&pk0, &signature, &chal).is_ok() {
+            accepted_bind = Some(*cb);
+            break;
+        }
+    }
+    let chan_bind = match accepted_bind {
+        Some(b) => b,
+        None => {
+            return Err(ApiError::unauthorized(
+                "OwnershipProof signature invalid or chan_bind/domain mismatch",
+            ));
+        }
+    };
+
+    Ok(VerifiedOwnership {
+        subject_bech32: request_subject.to_string(),
+        subject_raw,
+        nonce,
+        challenge_expiry,
+        chan_bind,
+    })
+}
+
+/// Reject a GrantProof on the pull path (fail-closed, not half-checked).
+///
+/// §5.1(b) requires verifying the grant's `op` signature against the subject's
+/// **published** `op` pubkey. This process holds no protocol state and has no
+/// kernel RPC that returns `op_pubkey` for a subject, so that check cannot be
+/// built here. A half-checked grant (structural + grantee chal only) would
+/// authorise disclosure under a forged `op` signature — worse than a loud
+/// reject. All grant pull attempts therefore fail with `401 unauthorized`.
+///
+/// Takes the proof so the call site cannot "forget" to name the grant shape
+/// (and so tests can assert the reject path against a concrete body).
+pub fn reject_grant_proof(_proof: &GrantProofJson) -> ApiError {
+    ApiError::unauthorized(
+        "GrantProof is not accepted: the API cannot verify the grant's op signature \
+         without the subject's published op_pubkey (no lookup path in this stage); \
+         half-checked grants are forbidden (§5.1(b))",
+    )
+}
+
 /// Hex-encode a 32-byte digest (re-export convenience for handlers).
 pub fn hex32(bytes: &[u8; 32]) -> String {
     encode_hex(bytes)
@@ -547,6 +705,7 @@ mod tests {
 
     #[test]
     fn domain_strings_match_node_challenge_action() {
+        assert_eq!(ChallengeDomain::Pull.as_str(), "zkCoins/v1/PullChallenge");
         assert_eq!(
             ChallengeDomain::AttestBalance.as_str(),
             "zkCoins/v1/AttestBalanceChallenge"
@@ -558,6 +717,103 @@ mod tests {
         assert_ne!(
             ChallengeDomain::AttestBalance.as_str(),
             ChallengeDomain::IssueGrant.as_str()
+        );
+        assert_ne!(
+            ChallengeDomain::Pull.as_str(),
+            ChallengeDomain::AttestBalance.as_str()
+        );
+    }
+
+    #[test]
+    fn pull_ownership_proof_verifies_without_request_hash() {
+        let (sk, pk0, nkc, subject_raw, subject_bech) = fixture_identity();
+        let host = "node.example.com";
+        let nonce = [0xAAu8; 32];
+        let expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            ChallengeDomain::Pull.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = sign_chal(&sk, &chal);
+        let verified = verify_pull_ownership_proof(
+            &subject_bech,
+            &encode_hex(&nonce),
+            &expiry.to_string(),
+            &OwnershipProofJson {
+                proof_type: "ownership".into(),
+                subject: subject_bech.clone(),
+                public_key: encode_hex(&pk0),
+                nk_commit: encode_hex(&nkc),
+                signature: encode_hex(&sig),
+            },
+            &[host.to_string()],
+        )
+        .expect("valid pull proof");
+        assert_eq!(verified.chan_bind, cb);
+        assert_eq!(verified.nonce, nonce);
+    }
+
+    #[test]
+    fn pull_ownership_wrong_expiry_is_unauthorized() {
+        let (sk, pk0, nkc, subject_raw, subject_bech) = fixture_identity();
+        let host = "node.example.com";
+        let nonce = [0xBBu8; 32];
+        let signed_expiry = 100u64;
+        let presented_expiry = 999u64;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            ChallengeDomain::Pull.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            signed_expiry,
+        );
+        let sig = sign_chal(&sk, &chal);
+        let err = verify_pull_ownership_proof(
+            &subject_bech,
+            &encode_hex(&nonce),
+            &presented_expiry.to_string(),
+            &OwnershipProofJson {
+                proof_type: "ownership".into(),
+                subject: subject_bech.clone(),
+                public_key: encode_hex(&pk0),
+                nk_commit: encode_hex(&nkc),
+                signature: encode_hex(&sig),
+            },
+            &[host.to_string()],
+        )
+        .expect_err("altered expiry");
+        assert_eq!(err.body.error, "unauthorized");
+    }
+
+    #[test]
+    fn grant_proof_is_rejected_not_half_checked() {
+        let err = reject_grant_proof(&GrantProofJson {
+            proof_type: "grant".into(),
+            grant: "zkgrant1qq".into(),
+            grantee_pk: encode_hex(&[0u8; 32]),
+            signature: encode_hex(&[0u8; 64]),
+        });
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("op_pubkey") || err.body.message.contains("op signature"),
+            "message must name the missing op check: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn session_authority_wire_tokens_match_node_metadata() {
+        // node `parse_session_authority`: "ownership" | "grant" only.
+        assert_eq!(SessionAuthority::Ownership.as_str(), "ownership");
+        assert_eq!(SessionAuthority::Grant.as_str(), "grant");
+        assert_ne!(
+            SessionAuthority::Ownership.as_str(),
+            SessionAuthority::Grant.as_str()
         );
     }
 

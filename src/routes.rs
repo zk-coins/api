@@ -16,6 +16,7 @@ use crate::grants;
 use crate::info;
 use crate::jobs;
 use crate::kernel::KernelHandle;
+use crate::pull;
 use crate::state::AppState;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -111,6 +112,11 @@ enum ServedSurface {
     AttestBalance,
     GrantsChallenge,
     Grants,
+    PullChallenge,
+    Pull,
+    Record,
+    Proof,
+    AccountState,
 }
 
 impl ServedSurface {
@@ -130,6 +136,11 @@ impl ServedSurface {
         ServedSurface::AttestBalance,
         ServedSurface::GrantsChallenge,
         ServedSurface::Grants,
+        ServedSurface::PullChallenge,
+        ServedSurface::Pull,
+        ServedSurface::Record,
+        ServedSurface::Proof,
+        ServedSurface::AccountState,
     ];
 
     /// Closed §7.5 discovery key for this surface.
@@ -149,6 +160,11 @@ impl ServedSurface {
             ServedSurface::AttestBalance => "attest_balance",
             ServedSurface::GrantsChallenge => "grants_challenge",
             ServedSurface::Grants => "grants",
+            ServedSurface::PullChallenge => "pull_challenge",
+            ServedSurface::Pull => "pull",
+            ServedSurface::Record => "record",
+            ServedSurface::Proof => "proof",
+            ServedSurface::AccountState => "account_state",
         }
     }
 
@@ -177,6 +193,11 @@ impl ServedSurface {
                 router.route(&path, post(grants::post_grants_challenge))
             }
             ServedSurface::Grants => router.route(&path, post(grants::post_grants)),
+            ServedSurface::PullChallenge => router.route(&path, post(pull::post_pull_challenge)),
+            ServedSurface::Pull => router.route(&path, post(pull::post_pull)),
+            ServedSurface::Record => router.route(&path, get(pull::get_record)),
+            ServedSurface::Proof => router.route(&path, get(pull::get_proof)),
+            ServedSurface::AccountState => router.route(&path, get(pull::get_account_state)),
         }
     }
 }
@@ -312,11 +333,14 @@ mod tests {
     use crate::error::ApiError;
     use crate::kernel::encode_kernel_error_status;
     use crate::kernel::kernel_v1::{
-        AccumulatorTip, AttestRequest, BootstrapManifest, Challenge, GrantRequest, GrantResult,
-        Info, Job, JobEvent, JobHandle, JobRequest, NullifierPath, NullifierPathRequest,
-        PullChallengeRequest, SignRequest, TransitionRequest,
+        AccountStateRequest, AccountStateResult, AccumulatorTip, AttestRequest, BootstrapManifest,
+        Challenge, CoinProofBlob, CoinProofRequest, GrantRequest, GrantResult, Info, Job, JobEvent,
+        JobHandle, JobRequest, NullifierPath, NullifierPathRequest, PullChallengeRequest,
+        PullRequest, PullResult as ProtoPullResult, RecordBlob, RecordRequest, SignRequest,
+        TransitionRequest,
     };
     use crate::kernel::KernelRpc;
+    use crate::ownership::SessionAuthority;
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -325,7 +349,7 @@ mod tests {
     use serde_json::Value;
     use std::collections::{BTreeSet, HashMap};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tonic::Code;
     use tower::ServiceExt;
 
@@ -393,6 +417,29 @@ mod tests {
         async fn issue_view_grant(&self, _req: GrantRequest) -> Result<GrantResult, ApiError> {
             Err(ApiError::internal(
                 "test double: issue_view_grant not configured",
+            ))
+        }
+        async fn pull(
+            &self,
+            _req: PullRequest,
+            _authority: SessionAuthority,
+        ) -> Result<ProtoPullResult, ApiError> {
+            Err(ApiError::internal("test double: pull not configured"))
+        }
+        async fn get_record(&self, _req: RecordRequest) -> Result<RecordBlob, ApiError> {
+            Err(ApiError::internal("test double: get_record not configured"))
+        }
+        async fn get_coin_proof(&self, _req: CoinProofRequest) -> Result<CoinProofBlob, ApiError> {
+            Err(ApiError::internal(
+                "test double: get_coin_proof not configured",
+            ))
+        }
+        async fn get_account_state(
+            &self,
+            _req: AccountStateRequest,
+        ) -> Result<AccountStateResult, ApiError> {
+            Err(ApiError::internal(
+                "test double: get_account_state not configured",
             ))
         }
     }
@@ -554,8 +601,13 @@ mod tests {
                 "attest_balance",
                 "grants_challenge",
                 "grants",
+                "pull_challenge",
+                "pull",
+                "record",
+                "proof",
+                "account_state",
             ]),
-            "stage C1 adds the four attest/grants keys to the prior job+info surface"
+            "stage C2 adds the five pull/record/proof/account_state keys"
         );
         assert_eq!(
             endpoints["attest_balance_challenge"].as_str(),
@@ -570,6 +622,17 @@ mod tests {
             Some("/v1/grants/challenge")
         );
         assert_eq!(endpoints["grants"].as_str(), Some("/v1/grants"));
+        assert_eq!(
+            endpoints["pull_challenge"].as_str(),
+            Some("/v1/pull/challenge")
+        );
+        assert_eq!(endpoints["pull"].as_str(), Some("/v1/pull"));
+        assert_eq!(endpoints["record"].as_str(), Some("/v1/record/<record_id>"));
+        assert_eq!(endpoints["proof"].as_str(), Some("/v1/proof/<coin_id>"));
+        assert_eq!(
+            endpoints["account_state"].as_str(),
+            Some("/v1/account/state")
+        );
         // chain_inscriptions must not be advertised until ListInscriptions exists.
         assert!(
             !endpoints.contains_key("chain_inscriptions"),
@@ -849,8 +912,12 @@ mod tests {
             "job surface key 'tx' must be advertised once the handler exists"
         );
         assert!(
-            !endpoints.contains_key("pull"),
-            "wallet feature must not advertise /v1/pull before that handler exists"
+            endpoints.contains_key("pull"),
+            "stage C2 advertises /v1/pull once the handler exists"
+        );
+        assert!(
+            !endpoints.contains_key("receipts_stream"),
+            "receipts_stream must stay unadvertised until SubscribeReceipts is wired"
         );
     }
 
@@ -871,10 +938,20 @@ mod tests {
         open_challenge: Option<Result<Challenge, ApiError>>,
         attest: Option<Result<JobHandle, ApiError>>,
         issue_grant: Option<Result<GrantResult, ApiError>>,
+        pull: Option<Result<ProtoPullResult, ApiError>>,
+        get_record: Option<Result<RecordBlob, ApiError>>,
+        get_coin_proof: Option<Result<CoinProofBlob, ApiError>>,
+        get_account_state: Option<Result<AccountStateResult, ApiError>>,
         /// Call counters for proving "no kernel call" on auth failure.
         attest_calls: AtomicUsize,
         issue_grant_calls: AtomicUsize,
         open_challenge_calls: AtomicUsize,
+        pull_calls: AtomicUsize,
+        get_record_calls: AtomicUsize,
+        get_coin_proof_calls: AtomicUsize,
+        get_account_state_calls: AtomicUsize,
+        /// Last pull authority observed (for grant/ownership plumbing asserts).
+        last_pull_authority: Mutex<Option<SessionAuthority>>,
     }
 
     #[async_trait]
@@ -969,6 +1046,46 @@ mod tests {
                 Some(Ok(r)) => Ok(r.clone()),
                 Some(Err(e)) => Err(e.clone()),
                 None => Err(ApiError::internal("issue_grant not scripted")),
+            }
+        }
+        async fn pull(
+            &self,
+            _req: PullRequest,
+            authority: SessionAuthority,
+        ) -> Result<ProtoPullResult, ApiError> {
+            self.pull_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_pull_authority.lock().expect("authority mutex") = Some(authority);
+            match &self.pull {
+                Some(Ok(r)) => Ok(r.clone()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal("pull not scripted")),
+            }
+        }
+        async fn get_record(&self, _req: RecordRequest) -> Result<RecordBlob, ApiError> {
+            self.get_record_calls.fetch_add(1, Ordering::SeqCst);
+            match &self.get_record {
+                Some(Ok(r)) => Ok(r.clone()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal("get_record not scripted")),
+            }
+        }
+        async fn get_coin_proof(&self, _req: CoinProofRequest) -> Result<CoinProofBlob, ApiError> {
+            self.get_coin_proof_calls.fetch_add(1, Ordering::SeqCst);
+            match &self.get_coin_proof {
+                Some(Ok(r)) => Ok(r.clone()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal("get_coin_proof not scripted")),
+            }
+        }
+        async fn get_account_state(
+            &self,
+            _req: AccountStateRequest,
+        ) -> Result<AccountStateResult, ApiError> {
+            self.get_account_state_calls.fetch_add(1, Ordering::SeqCst);
+            match &self.get_account_state {
+                Some(Ok(r)) => Ok(r.clone()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal("get_account_state not scripted")),
             }
         }
     }
@@ -2459,5 +2576,670 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
         assert_eq!(json["domain"], ISSUE_GRANT_CHALLENGE_DOMAIN);
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage C2 — Pull / Record / Proof / AccountState
+    // -----------------------------------------------------------------------
+
+    use crate::kernel::kernel_v1::RecordRef;
+    use crate::ownership::{pull_challenge_message, PULL_CHALLENGE_DOMAIN};
+
+    fn sample_pull_result() -> ProtoPullResult {
+        ProtoPullResult {
+            records: vec![RecordRef {
+                record_id: vec![0x11u8; 32],
+                record_type: "coinproof".into(),
+                transition_kind: String::new(),
+                blob_id: vec![0x22u8; 32],
+                occurred_at: 1_700_000_000,
+            }],
+            session: "sess-token-1".into(),
+            session_expiry: 1_700_000_300,
+        }
+    }
+
+    fn pull_body_ownership(
+        subject: &str,
+        pk0: &[u8; 32],
+        nkc: &[u8; 32],
+        nonce: &[u8; 32],
+        expiry: u64,
+        sig: &[u8; 64],
+    ) -> Value {
+        serde_json::json!({
+            "nonce": encode_hex(nonce),
+            "expiry": expiry.to_string(),
+            "proof": {
+                "type": "ownership",
+                "subject": subject,
+                "public_key": encode_hex(pk0),
+                "nk_commit": encode_hex(nkc),
+                "signature": encode_hex(sig),
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn pull_challenge_returns_pull_domain() {
+        let (_, _, _, _, subject_bech) = ownership_fixtures::identity();
+        let kernel = Arc::new(ScriptedKernel {
+            open_challenge: Some(Ok(Challenge {
+                nonce: vec![0xABu8; 32],
+                expiry: 1_700_000_060,
+                domain: PULL_CHALLENGE_DOMAIN.to_string(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull/challenge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "subject": subject_bech }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["domain"], PULL_CHALLENGE_DOMAIN);
+        assert_eq!(json["expiry"], "1700000060");
+        assert_eq!(json["nonce"].as_str().unwrap().len(), 64);
+        assert_eq!(kernel.open_challenge_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pull_valid_ownership_opens_session_with_ownership_authority() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x11u8; 32];
+        let expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            ChallengeDomain::Pull.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+
+        let kernel = Arc::new(ScriptedKernel {
+            pull: Some(Ok(sample_pull_result())),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        pull_body_ownership(&subject_bech, &pk0, &nkc, &nonce, expiry, &sig)
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["session"], "sess-token-1");
+        assert_eq!(json["session_expiry"], "1700000300");
+        assert_eq!(json["records"][0]["record_type"], "coinproof");
+        assert_eq!(json["records"][0]["occurred_at"], "1700000000");
+        assert!(
+            json["records"][0].get("transition_kind").is_none(),
+            "coinproof without transition_kind must omit the field"
+        );
+        assert_eq!(kernel.pull_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *kernel.last_pull_authority.lock().unwrap(),
+            Some(SessionAuthority::Ownership),
+            "session authority must follow the OwnershipProof kind"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_grant_proof_is_rejected_without_kernel_call() {
+        // Befund: no op_pubkey lookup → GrantProof always 401, never half-checked.
+        let kernel = Arc::new(ScriptedKernel {
+            pull: Some(Ok(sample_pull_result())),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let body = serde_json::json!({
+            "nonce": encode_hex(&[0x11u8; 32]),
+            "expiry": "1700000060",
+            "proof": {
+                "type": "grant",
+                "grant": "zkgrant1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+                "grantee_pk": encode_hex(&[0x33u8; 32]),
+                "signature": encode_hex(&[0x44u8; 64]),
+            }
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+        assert!(
+            json["message"].as_str().unwrap().contains("op_pubkey")
+                || json["message"].as_str().unwrap().contains("op signature"),
+            "message must name the missing op check: {}",
+            json["message"]
+        );
+        assert_eq!(
+            kernel.pull_calls.load(Ordering::SeqCst),
+            0,
+            "rejected grant must not consume the challenge nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_bad_signature_does_not_call_kernel() {
+        let (_sk, pk0, nkc, _subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x11u8; 32];
+        let expiry = 1_700_000_060u64;
+        let bad_sig = [0xFFu8; 64];
+        let kernel = Arc::new(ScriptedKernel {
+            pull: Some(Ok(sample_pull_result())),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        pull_body_ownership(&subject_bech, &pk0, &nkc, &nonce, expiry, &bad_sig)
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(kernel.pull_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pull_wrong_domain_signature_does_not_call_kernel() {
+        // Sign under AttestBalance domain, redeem under Pull → unauthorized.
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x22u8; 32];
+        let expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        let request_hash = [0u8; 32];
+        let chal = ownership_challenge_message(
+            ChallengeDomain::AttestBalance.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+            &request_hash,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        let kernel = Arc::new(ScriptedKernel {
+            pull: Some(Ok(sample_pull_result())),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        pull_body_ownership(&subject_bech, &pk0, &nkc, &nonce, expiry, &sig)
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(kernel.pull_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pull_wrong_chan_bind_does_not_call_kernel() {
+        let signed_host = "signed.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x33u8; 32];
+        let expiry = 50u64;
+        let cb = chan_bind_for_host(signed_host);
+        let chal = pull_challenge_message(
+            ChallengeDomain::Pull.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        // test_config serves node.example.com — different chan_bind.
+        let kernel = Arc::new(ScriptedKernel {
+            pull: Some(Ok(sample_pull_result())),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        pull_body_ownership(&subject_bech, &pk0, &nkc, &nonce, expiry, &sig)
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(kernel.pull_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pull_altered_expiry_does_not_call_kernel() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x44u8; 32];
+        let signed_expiry = 100u64;
+        let presented_expiry = 999u64;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            ChallengeDomain::Pull.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            signed_expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        let kernel = Arc::new(ScriptedKernel {
+            pull: Some(Ok(sample_pull_result())),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        pull_body_ownership(
+                            &subject_bech,
+                            &pk0,
+                            &nkc,
+                            &nonce,
+                            presented_expiry,
+                            &sig,
+                        )
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(kernel.pull_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn session_missing_bearer_is_401_not_410() {
+        let kernel = Arc::new(ScriptedKernel {
+            get_record: Some(Ok(RecordBlob {
+                canonical: vec![0xABu8; 8],
+                record_type: "coinproof".into(),
+                transition_kind: String::new(),
+            })),
+            get_account_state: Some(Ok(AccountStateResult {
+                account_state: vec![0x01],
+                state_head: vec![0x02; 32],
+                head_record_id: Vec::new(),
+                send_counter: 0,
+                current_pubkey: vec![0x03; 32],
+                last_nullifier_pk: Vec::new(),
+                last_nullifier_r: Vec::new(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/record/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+        assert_eq!(kernel.get_record_calls.load(Ordering::SeqCst), 0);
+
+        // Same split on ownership-only account/state.
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/account/state")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+        assert_eq!(kernel.get_account_state_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn session_malformed_bearer_is_401_not_410() {
+        let kernel = Arc::new(ScriptedKernel {
+            get_coin_proof: Some(Ok(CoinProofBlob {
+                canonical: vec![0xCDu8; 4],
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/proof/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                    .header("authorization", "NotBearer xyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+        assert_eq!(kernel.get_coin_proof_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn session_expired_from_kernel_is_410() {
+        // Kernel maps unknown/expired/chan_bind-mismatch → session_expired / 410.
+        let status = encode_kernel_error_status(
+            Code::Unauthenticated,
+            "pull session expired or channel mismatch",
+            "session_expired",
+            410,
+        );
+        let kernel = Arc::new(ScriptedKernel {
+            get_record: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/record/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                    .header("authorization", "Bearer expired-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::GONE);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "session_expired");
+        assert_eq!(kernel.get_record_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn account_state_grant_session_is_401() {
+        // Kernel enforces ownership-only; a grant session is unauthorized / 401.
+        let status = encode_kernel_error_status(
+            Code::Unauthenticated,
+            "grant session does not authorise GetAccountState",
+            "unauthorized",
+            401,
+        );
+        let kernel = Arc::new(ScriptedKernel {
+            get_account_state: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/account/state")
+                    .header("authorization", "Bearer grant-session-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+        assert_eq!(kernel.get_account_state_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pull_rejects_unknown_record_type_from_kernel() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x55u8; 32];
+        let expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            ChallengeDomain::Pull.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        let mut result = sample_pull_result();
+        result.records[0].record_type = "mystery".into();
+        let kernel = Arc::new(ScriptedKernel {
+            pull: Some(Ok(result)),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        pull_body_ownership(&subject_bech, &pk0, &nkc, &nonce, expiry, &sig)
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert!(
+            json["message"].as_str().unwrap().contains("record_type"),
+            "message must name record_type: {}",
+            json["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_rejects_unknown_transition_kind_from_kernel() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x66u8; 32];
+        let expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            ChallengeDomain::Pull.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        let mut result = sample_pull_result();
+        result.records[0].record_type = "self_delivery".into();
+        result.records[0].transition_kind = "explode".into();
+        let kernel = Arc::new(ScriptedKernel {
+            pull: Some(Ok(result)),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        pull_body_ownership(&subject_bech, &pk0, &nkc, &nonce, expiry, &sig)
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap()
+                .contains("transition_kind"),
+            "message must name transition_kind: {}",
+            json["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_record_returns_binary_octet_stream() {
+        let kernel = Arc::new(ScriptedKernel {
+            get_record: Some(Ok(RecordBlob {
+                canonical: b"canonical-record-bytes".to_vec(),
+                record_type: "coinproof".into(),
+                transition_kind: String::new(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/record/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        let body = body_bytes(res).await;
+        assert_eq!(body, b"canonical-record-bytes");
+    }
+
+    #[tokio::test]
+    async fn get_account_state_json_shape() {
+        let kernel = Arc::new(ScriptedKernel {
+            get_account_state: Some(Ok(AccountStateResult {
+                account_state: vec![0xAAu8; 16],
+                state_head: vec![0xBBu8; 32],
+                head_record_id: vec![0xCCu8; 32],
+                send_counter: 7,
+                current_pubkey: vec![0xDDu8; 32],
+                last_nullifier_pk: vec![0xEEu8; 32],
+                last_nullifier_r: vec![0xFFu8; 32],
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/account/state")
+                    .header("authorization", "Bearer own-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["send_counter"], "7");
+        assert_eq!(
+            json["current_pubkey"].as_str().unwrap().len(),
+            64,
+            "current_pubkey is hex32"
+        );
+        assert_eq!(
+            json["state_head"].as_str().unwrap().len(),
+            64,
+            "state_head is hex32"
+        );
+        assert!(json["account_state"].as_str().unwrap().len() >= 2);
+        assert_eq!(json["last_nullifier"]["pubkey"].as_str().unwrap().len(), 64);
+        // API does not recompute consistency against serialize(AccountState) —
+        // that is a kernel guarantee (report).
+    }
+
+    #[tokio::test]
+    async fn get_proof_returns_binary_octet_stream() {
+        let kernel = Arc::new(ScriptedKernel {
+            get_coin_proof: Some(Ok(CoinProofBlob {
+                canonical: b"coin-proof-bytes".to_vec(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/proof/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        assert_eq!(body_bytes(res).await, b"coin-proof-bytes");
     }
 }

@@ -9,19 +9,28 @@ use crate::error::ApiError;
 use crate::kernel::error_info::kernel_status_to_api_error;
 use crate::kernel::pb::kernel_v1::kernel_client::KernelClient as TonicKernelClient;
 use crate::kernel::pb::kernel_v1::{
-    AccumulatorTip, AttestRequest, Challenge, GetAccumulatorRequest, GetInfoRequest, GrantRequest,
+    AccountStateRequest, AccountStateResult, AccumulatorTip, AttestRequest, Challenge,
+    CoinProofBlob, CoinProofRequest, GetAccumulatorRequest, GetInfoRequest, GrantRequest,
     GrantResult, Info, Job, JobEvent, JobHandle, JobRequest, NullifierPath, NullifierPathRequest,
-    PullChallengeRequest, SignRequest, TransitionRequest,
+    PullChallengeRequest, PullRequest, PullResult, RecordBlob, RecordRequest, SignRequest,
+    TransitionRequest,
 };
+use crate::ownership::SessionAuthority;
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use std::sync::Arc;
+use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tonic::Request;
 
+/// Interim metadata key the node reads for pull session authority
+/// (`node/src/kernel_rpc.rs`). Missing ⇒ kernel `malformed_request` (never
+/// silent Ownership).
+const SESSION_AUTHORITY_METADATA: &str = "x-zkcoins-session-authority";
+
 /// Subset of kernel procedures this stage consumes
-/// (job surface + info/chain reads + attest/grants).
+/// (job surface + info/chain reads + attest/grants + pull/records).
 #[async_trait]
 pub trait KernelRpc: Send + Sync {
     async fn submit_transition(&self, req: TransitionRequest) -> Result<JobHandle, ApiError>;
@@ -51,6 +60,22 @@ pub trait KernelRpc: Send + Sync {
     async fn attest_balance(&self, req: AttestRequest) -> Result<JobHandle, ApiError>;
 
     async fn issue_view_grant(&self, req: GrantRequest) -> Result<GrantResult, ApiError>;
+
+    /// `Pull` with session authority metadata (never omitted, never defaulted).
+    async fn pull(
+        &self,
+        req: PullRequest,
+        authority: SessionAuthority,
+    ) -> Result<PullResult, ApiError>;
+
+    async fn get_record(&self, req: RecordRequest) -> Result<RecordBlob, ApiError>;
+
+    async fn get_coin_proof(&self, req: CoinProofRequest) -> Result<CoinProofBlob, ApiError>;
+
+    async fn get_account_state(
+        &self,
+        req: AccountStateRequest,
+    ) -> Result<AccountStateResult, ApiError>;
 }
 
 /// Shared handle installed in the axum `State`.
@@ -230,6 +255,54 @@ impl KernelRpc for KernelClient {
         let mut client = self.inner.clone();
         let response = client
             .issue_view_grant(Request::new(req))
+            .await
+            .map_err(map_status)?;
+        Ok(response.into_inner())
+    }
+
+    async fn pull(
+        &self,
+        req: PullRequest,
+        authority: SessionAuthority,
+    ) -> Result<PullResult, ApiError> {
+        let mut client = self.inner.clone();
+        let mut request = Request::new(req);
+        // Fail-closed: authority is always set from the verified proof kind.
+        // The node rejects a missing key as malformed_request (never Ownership).
+        // `as_str` is a closed `'static` token (`ownership` | `grant`).
+        request.metadata_mut().insert(
+            SESSION_AUTHORITY_METADATA,
+            MetadataValue::from_static(authority.as_str()),
+        );
+        let response = client.pull(request).await.map_err(map_status)?;
+        Ok(response.into_inner())
+    }
+
+    async fn get_record(&self, req: RecordRequest) -> Result<RecordBlob, ApiError> {
+        let mut client = self.inner.clone();
+        let response = client
+            .get_record(Request::new(req))
+            .await
+            .map_err(map_status)?;
+        Ok(response.into_inner())
+    }
+
+    async fn get_coin_proof(&self, req: CoinProofRequest) -> Result<CoinProofBlob, ApiError> {
+        let mut client = self.inner.clone();
+        let response = client
+            .get_coin_proof(Request::new(req))
+            .await
+            .map_err(map_status)?;
+        Ok(response.into_inner())
+    }
+
+    async fn get_account_state(
+        &self,
+        req: AccountStateRequest,
+    ) -> Result<AccountStateResult, ApiError> {
+        let mut client = self.inner.clone();
+        let response = client
+            .get_account_state(Request::new(req))
             .await
             .map_err(map_status)?;
         Ok(response.into_inner())
