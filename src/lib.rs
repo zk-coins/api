@@ -4,6 +4,7 @@
 //! `tonic`. Holds no protocol state, no value-bearing store, and no secrets.
 
 pub mod attest;
+pub mod bootstrap;
 pub mod chain;
 pub mod config;
 pub mod error;
@@ -14,6 +15,7 @@ pub mod jobs;
 pub mod kernel;
 pub mod ownership;
 pub mod proto_identity;
+pub mod publish;
 pub mod pull;
 pub mod routes;
 pub mod state;

@@ -162,9 +162,24 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Replica-/Blob-Pfad).
 | `POST /v1/attest/balance` | **implementiert** — OwnershipProof-Verifikation am API-Rand, dann `AttestBalance` |
 | `POST /v1/grants/challenge` | **implementiert** — `OpenPullChallenge` (`action = issue_grant`) |
 | `POST /v1/grants` | **implementiert** — OwnershipProof-Verifikation am API-Rand, dann `IssueViewGrant` |
+| `POST /v1/pull/challenge` | **implementiert** — `OpenPullChallenge` (`action = pull`) |
+| `POST /v1/pull` | **implementiert** — OwnershipProof am API-Rand, dann `Pull` (GrantProof fail-closed) |
+| `GET /v1/record/<record_id>` | **implementiert** — `GetRecord` (Bearer-Session) |
+| `GET /v1/proof/<coin_id>` | **implementiert** — `GetCoinProof` (Bearer-Session) |
+| `GET /v1/account/state` | **implementiert** — `GetAccountState` (Ownership-Session) |
+| `POST /v1/bootstrap/challenge` | **implementiert** — `OpenPullChallenge` (`action = entrust` \| `revoke`) |
+| `POST /v1/bootstrap/entrust` | **implementiert** — OwnershipProof (Entrust-Domain) + Bundle-Längenprüfung (161 B), dann `EntrustOperationalBundle`; Bundle wird nie geloggt |
+| `POST /v1/bootstrap/revoke` | **implementiert** — OwnershipProof (Revoke-Domain), dann `RevokeOperationalBundle` |
+| `POST /v1/publish/spendrecord` | **implementiert** — `Publish`; Ablehnung → HTTP 200 `{accepted:false, reason}`; v1-Fee-Felder → 400 |
 | alle übrigen Method+Path | **nicht registriert** — kein Handler, kein `todo!()`, kein Platzhalter |
 
-**Bewusst nicht beworben:** `chain_inscriptions` — `ListInscriptions` ist im node `Unimplemented` (fehlt scanner-geschriebener Inschriften-Katalog mit Reveal-Txid und §3.5-Format). Eine REST-Hülle, die zuverlässig 501 liefert, wäre nur eine zweite Stelle für dieselbe Absenz.
+**Bewusst nicht beworben:**
+
+| Key | Warum |
+|---|---|
+| `chain_inscriptions` | Kernel-`ListInscriptions` Unimplemented bis Inschriften-Katalog (Reveal-Txid + §3.5). |
+| `receipts_stream` | Kernel-`SubscribeReceipts` Unimplemented; der node nennt die fehlende Push-/Quell-Voraussetzung. |
+| `blossom_get` / `blossom_head` / `blossom_upload` / `blossom_delete` | §7.4; im node gibt es keinen Blossom-Pfad, Recovery ist nicht implementiert. |
 
 Router und Discovery teilen eine Quelle (`ServedSurface` in `src/routes.rs`): eine neue
 registrierte Fläche erscheint automatisch in `GET /`; ein Inventur-Key ohne Route
@@ -181,8 +196,9 @@ ausschließlich über `google.rpc.ErrorInfo` (`domain`, `reason`,
 | Lücke | Warum |
 |---|---|
 | `GET /v1/chain/inscriptions` | Kernel-`ListInscriptions` Unimplemented bis Inschriften-Katalog. |
-| Pull / Bootstrap / Publish / Blossom | jeweilige Kernel-RPC noch nicht angebunden. |
-| Feature-Gate `404 feature_disabled` | Info/Chain/Job/Attest/Grants-Fläche ist in dieser Stufe always-on; Gate folgt mit den optionalen Rollen. |
+| `GET /v1/receipts/stream` | Kernel-`SubscribeReceipts` Unimplemented. |
+| Blossom (`/blossom/*`) | Kein Blossom-Pfad im node; Recovery nicht implementiert. |
+| Feature-Gate `404 feature_disabled` | Bootstrap/Publish/Job/Attest-Fläche ist in dieser Stufe always-on; Gate folgt mit den optionalen Rollen. |
 
 ---
 

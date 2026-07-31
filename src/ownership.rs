@@ -44,6 +44,14 @@ pub const ATTEST_BALANCE_CHALLENGE_DOMAIN: &str = "zkCoins/v1/AttestBalanceChall
 /// `node/src/kernel/bootstrap/challenges.rs`.
 pub const ISSUE_GRANT_CHALLENGE_DOMAIN: &str = "zkCoins/v1/IssueGrantChallenge";
 
+/// `ChallengeAction::Entrust.domain()` in
+/// `node/src/kernel/bootstrap/challenges.rs`.
+pub const ENTRUST_CHALLENGE_DOMAIN: &str = "zkCoins/v1/EntrustChallenge";
+
+/// `ChallengeAction::Revoke.domain()` in
+/// `node/src/kernel/bootstrap/challenges.rs`.
+pub const REVOKE_CHALLENGE_DOMAIN: &str = "zkCoins/v1/RevokeChallenge";
+
 /// §7.5 `request_hash` tag for `POST /v1/attest/balance`.
 pub const ATTEST_BALANCE_REQUEST_TAG: &str = "zkCoins/v1/AttestBalance";
 
@@ -66,13 +74,18 @@ const GOLDILOCKS_ORDER: u64 = 0xffff_ffff_0000_0001;
 /// Closed set of challenge domains this stage verifies.
 ///
 /// The domain string is a method on the enum — callers cannot pass an
-/// arbitrary domain from the request body.
+/// arbitrary domain from the request body. Entrust and Revoke are distinct
+/// from Pull so a proof cannot be retargeted across bootstrap actions (§7.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChallengeDomain {
     /// `POST /v1/pull` — no `request_hash` in `chal` (§5.1 L1916).
     Pull,
     AttestBalance,
     IssueGrant,
+    /// `POST /v1/bootstrap/entrust` — no `request_hash` (§7.7).
+    Entrust,
+    /// `POST /v1/bootstrap/revoke` — no `request_hash` (§7.7).
+    Revoke,
 }
 
 impl ChallengeDomain {
@@ -82,7 +95,17 @@ impl ChallengeDomain {
             ChallengeDomain::Pull => PULL_CHALLENGE_DOMAIN,
             ChallengeDomain::AttestBalance => ATTEST_BALANCE_CHALLENGE_DOMAIN,
             ChallengeDomain::IssueGrant => ISSUE_GRANT_CHALLENGE_DOMAIN,
+            ChallengeDomain::Entrust => ENTRUST_CHALLENGE_DOMAIN,
+            ChallengeDomain::Revoke => REVOKE_CHALLENGE_DOMAIN,
         }
+    }
+
+    /// Whether `chal` omits `request_hash` (pull / bootstrap).
+    pub const fn is_simple(self) -> bool {
+        matches!(
+            self,
+            ChallengeDomain::Pull | ChallengeDomain::Entrust | ChallengeDomain::Revoke
+        )
     }
 }
 
@@ -432,7 +455,8 @@ fn require_ownership(kind: OwnerOnlyCapability) -> Result<(), ApiError> {
         OwnerOnlyCapability::Ownership => Ok(()),
         OwnerOnlyCapability::Grant => Err(ApiError::unauthorized(
             "GrantProof does not authorise this owner-only action \
-             (AttestBalance / IssueViewGrant require OwnershipProof; no-escalation)",
+             (AttestBalance / IssueViewGrant / Entrust / Revoke require OwnershipProof; \
+             no-escalation)",
         )),
     }
 }
@@ -573,17 +597,26 @@ impl SessionAuthority {
     }
 }
 
-/// Verify a pull-domain OwnershipProof (`chal` without `request_hash`).
+/// Verify an OwnershipProof for domains **without** `request_hash`
+/// (Pull / Entrust / Revoke — §5.1 L1916 / §7.7).
 ///
 /// Pure: does not dial the kernel. Body `expiry` is part of the signed
-/// preimage (Redeem-body `expiry`); a wrong value fails BIP-340.
-pub fn verify_pull_ownership_proof(
+/// preimage (Redeem-body `expiry` normative); a wrong value fails BIP-340.
+/// `domain` is endpoint-selected — never taken from the request body.
+pub fn verify_simple_ownership_proof(
+    domain: ChallengeDomain,
     request_subject: &str,
-    nonce_hex: &str,
-    expiry_decimal: &str,
+    challenge: &ChallengeEcho,
     proof: &OwnershipProofJson,
     public_hosts: &[String],
 ) -> Result<VerifiedOwnership, ApiError> {
+    if !domain.is_simple() {
+        return Err(ApiError::internal(format!(
+            "verify_simple_ownership_proof refuses request_hash domain {:?}",
+            domain.as_str()
+        )));
+    }
+
     // Closed capability match — GrantProof is a different type on the wire;
     // if the ownership shape carries type=grant, reject here.
     let capability = capability_from_wire(&proof.proof_type)?;
@@ -601,9 +634,9 @@ pub fn verify_pull_ownership_proof(
     let nk_commit = parse_hex32_field(&proof.nk_commit, "ownership_proof.nk_commit")?;
     validate_nk_commit_limbs(&nk_commit)?;
     let signature = parse_hex64_field(&proof.signature, "ownership_proof.signature")?;
-    let nonce = parse_hex32_field(nonce_hex, "nonce")?;
-    let challenge_expiry = parse_u64_decimal(expiry_decimal)
-        .map_err(|e| ApiError::malformed(format!("expiry: {}", e.body.message)))?;
+    let nonce = parse_hex32_field(&challenge.nonce, "challenge.nonce")?;
+    let challenge_expiry = parse_u64_decimal(&challenge.expiry)
+        .map_err(|e| ApiError::malformed(format!("challenge.expiry: {}", e.body.message)))?;
 
     let expected = address_from_pk0_nk_commit(&pk0, &nk_commit);
     if expected != subject_raw {
@@ -619,7 +652,7 @@ pub fn verify_pull_ownership_proof(
     }
     let allowed: Vec<[u8; 32]> = public_hosts.iter().map(|h| chan_bind_for_host(h)).collect();
 
-    let domain_str = ChallengeDomain::Pull.as_str();
+    let domain_str = domain.as_str();
     let mut accepted_bind: Option<[u8; 32]> = None;
     for cb in &allowed {
         let chal = pull_challenge_message(domain_str, &nonce, cb, &subject_raw, challenge_expiry);
@@ -644,6 +677,29 @@ pub fn verify_pull_ownership_proof(
         challenge_expiry,
         chan_bind,
     })
+}
+
+/// Verify a pull-domain OwnershipProof (`chal` without `request_hash`).
+///
+/// Thin adapter over [`verify_simple_ownership_proof`] for the pull wire shape
+/// (top-level `nonce` / `expiry` rather than nested `challenge`).
+pub fn verify_pull_ownership_proof(
+    request_subject: &str,
+    nonce_hex: &str,
+    expiry_decimal: &str,
+    proof: &OwnershipProofJson,
+    public_hosts: &[String],
+) -> Result<VerifiedOwnership, ApiError> {
+    verify_simple_ownership_proof(
+        ChallengeDomain::Pull,
+        request_subject,
+        &ChallengeEcho {
+            nonce: nonce_hex.to_string(),
+            expiry: expiry_decimal.to_string(),
+        },
+        proof,
+        public_hosts,
+    )
 }
 
 /// Reject a GrantProof on the pull path (fail-closed, not half-checked).
@@ -714,6 +770,14 @@ mod tests {
             ChallengeDomain::IssueGrant.as_str(),
             "zkCoins/v1/IssueGrantChallenge"
         );
+        assert_eq!(
+            ChallengeDomain::Entrust.as_str(),
+            "zkCoins/v1/EntrustChallenge"
+        );
+        assert_eq!(
+            ChallengeDomain::Revoke.as_str(),
+            "zkCoins/v1/RevokeChallenge"
+        );
         assert_ne!(
             ChallengeDomain::AttestBalance.as_str(),
             ChallengeDomain::IssueGrant.as_str()
@@ -722,6 +786,96 @@ mod tests {
             ChallengeDomain::Pull.as_str(),
             ChallengeDomain::AttestBalance.as_str()
         );
+        // Bootstrap domains are pairwise distinct from each other and from Pull
+        // so a proof cannot be retargeted across actions (§7.7).
+        assert_ne!(
+            ChallengeDomain::Entrust.as_str(),
+            ChallengeDomain::Revoke.as_str()
+        );
+        assert_ne!(
+            ChallengeDomain::Entrust.as_str(),
+            ChallengeDomain::Pull.as_str()
+        );
+        assert_ne!(
+            ChallengeDomain::Revoke.as_str(),
+            ChallengeDomain::Pull.as_str()
+        );
+        assert!(ChallengeDomain::Entrust.is_simple());
+        assert!(ChallengeDomain::Revoke.is_simple());
+        assert!(ChallengeDomain::Pull.is_simple());
+        assert!(!ChallengeDomain::AttestBalance.is_simple());
+        assert!(!ChallengeDomain::IssueGrant.is_simple());
+    }
+
+    #[test]
+    fn entrust_domain_rejects_revoke_signed_proof() {
+        let (sk, pk0, nkc, subject_raw, subject_bech) = fixture_identity();
+        let host = "node.example.com";
+        let nonce = [0xCCu8; 32];
+        let expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        // Sign under Revoke; redeem under Entrust.
+        let chal = pull_challenge_message(
+            ChallengeDomain::Revoke.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = sign_chal(&sk, &chal);
+        let err = verify_simple_ownership_proof(
+            ChallengeDomain::Entrust,
+            &subject_bech,
+            &ChallengeEcho {
+                nonce: encode_hex(&nonce),
+                expiry: expiry.to_string(),
+            },
+            &OwnershipProofJson {
+                proof_type: "ownership".into(),
+                subject: subject_bech.clone(),
+                public_key: encode_hex(&pk0),
+                nk_commit: encode_hex(&nkc),
+                signature: encode_hex(&sig),
+            },
+            &[host.to_string()],
+        )
+        .expect_err("revoke-signed proof must not authorise entrust");
+        assert_eq!(err.body.error, "unauthorized");
+    }
+
+    #[test]
+    fn revoke_domain_rejects_entrust_signed_proof() {
+        let (sk, pk0, nkc, subject_raw, subject_bech) = fixture_identity();
+        let host = "node.example.com";
+        let nonce = [0xDDu8; 32];
+        let expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            ChallengeDomain::Entrust.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = sign_chal(&sk, &chal);
+        let err = verify_simple_ownership_proof(
+            ChallengeDomain::Revoke,
+            &subject_bech,
+            &ChallengeEcho {
+                nonce: encode_hex(&nonce),
+                expiry: expiry.to_string(),
+            },
+            &OwnershipProofJson {
+                proof_type: "ownership".into(),
+                subject: subject_bech.clone(),
+                public_key: encode_hex(&pk0),
+                nk_commit: encode_hex(&nkc),
+                signature: encode_hex(&sig),
+            },
+            &[host.to_string()],
+        )
+        .expect_err("entrust-signed proof must not authorise revoke");
+        assert_eq!(err.body.error, "unauthorized");
     }
 
     #[test]

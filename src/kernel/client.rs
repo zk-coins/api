@@ -10,9 +10,10 @@ use crate::kernel::error_info::kernel_status_to_api_error;
 use crate::kernel::pb::kernel_v1::kernel_client::KernelClient as TonicKernelClient;
 use crate::kernel::pb::kernel_v1::{
     AccountStateRequest, AccountStateResult, AccumulatorTip, AttestRequest, Challenge,
-    CoinProofBlob, CoinProofRequest, GetAccumulatorRequest, GetInfoRequest, GrantRequest,
-    GrantResult, Info, Job, JobEvent, JobHandle, JobRequest, NullifierPath, NullifierPathRequest,
-    PullChallengeRequest, PullRequest, PullResult, RecordBlob, RecordRequest, SignRequest,
+    CoinProofBlob, CoinProofRequest, EntrustRequest, EntrustResult, GetAccumulatorRequest,
+    GetInfoRequest, GrantRequest, GrantResult, Info, Job, JobEvent, JobHandle, JobRequest,
+    NullifierPath, NullifierPathRequest, PublishRequest, PublishResult, PullChallengeRequest,
+    PullRequest, PullResult, RecordBlob, RecordRequest, RevokeRequest, RevokeResult, SignRequest,
     TransitionRequest,
 };
 use crate::ownership::SessionAuthority;
@@ -30,7 +31,7 @@ use tonic::Request;
 const SESSION_AUTHORITY_METADATA: &str = "x-zkcoins-session-authority";
 
 /// Subset of kernel procedures this stage consumes
-/// (job surface + info/chain reads + attest/grants + pull/records).
+/// (job surface + info/chain + attest/grants + pull/records + bootstrap + publish).
 #[async_trait]
 pub trait KernelRpc: Send + Sync {
     async fn submit_transition(&self, req: TransitionRequest) -> Result<JobHandle, ApiError>;
@@ -76,6 +77,17 @@ pub trait KernelRpc: Send + Sync {
         &self,
         req: AccountStateRequest,
     ) -> Result<AccountStateResult, ApiError>;
+
+    async fn entrust_operational_bundle(
+        &self,
+        req: EntrustRequest,
+    ) -> Result<EntrustResult, ApiError>;
+
+    async fn revoke_operational_bundle(&self, req: RevokeRequest)
+        -> Result<RevokeResult, ApiError>;
+
+    /// `Publish` — hand-off outcome is a successful result even when rejected.
+    async fn publish(&self, req: PublishRequest) -> Result<PublishResult, ApiError>;
 }
 
 /// Shared handle installed in the axum `State`.
@@ -303,6 +315,39 @@ impl KernelRpc for KernelClient {
         let mut client = self.inner.clone();
         let response = client
             .get_account_state(Request::new(req))
+            .await
+            .map_err(map_status)?;
+        Ok(response.into_inner())
+    }
+
+    async fn entrust_operational_bundle(
+        &self,
+        req: EntrustRequest,
+    ) -> Result<EntrustResult, ApiError> {
+        let mut client = self.inner.clone();
+        let response = client
+            .entrust_operational_bundle(Request::new(req))
+            .await
+            .map_err(map_status)?;
+        Ok(response.into_inner())
+    }
+
+    async fn revoke_operational_bundle(
+        &self,
+        req: RevokeRequest,
+    ) -> Result<RevokeResult, ApiError> {
+        let mut client = self.inner.clone();
+        let response = client
+            .revoke_operational_bundle(Request::new(req))
+            .await
+            .map_err(map_status)?;
+        Ok(response.into_inner())
+    }
+
+    async fn publish(&self, req: PublishRequest) -> Result<PublishResult, ApiError> {
+        let mut client = self.inner.clone();
+        let response = client
+            .publish(Request::new(req))
             .await
             .map_err(map_status)?;
         Ok(response.into_inner())

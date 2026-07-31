@@ -10,12 +10,14 @@
 //! [`advertised_path_to_axum_matcher`].
 
 use crate::attest;
+use crate::bootstrap;
 use crate::chain;
 use crate::config::Config;
 use crate::grants;
 use crate::info;
 use crate::jobs;
 use crate::kernel::KernelHandle;
+use crate::publish;
 use crate::pull;
 use crate::state::AppState;
 use axum::http::StatusCode;
@@ -93,9 +95,20 @@ pub const CLOSED_ENDPOINT_KEYS: &[(&str, &str)] = &[
 /// handlers land, registration will filter `ServedSurface` by
 /// `Config::features`.
 ///
-/// `chain_inscriptions` is intentionally **not** a variant: `ListInscriptions`
-/// is Unimplemented in the node until a scanner-written inscription catalog
-/// exists; advertising a REST key that can only 501 is not progress.
+/// Surfaces intentionally **not** registered (and therefore omitted from
+/// `GET /`), with the reason each stays off the map:
+///
+/// - `chain_inscriptions` — kernel `ListInscriptions` is Unimplemented until a
+///   scanner-written inscription catalog (reveal txid + §3.5 format) exists.
+/// - `receipts_stream` — kernel `SubscribeReceipts` is Unimplemented; the node
+///   names the missing push/source prerequisite. A REST shell would only 501.
+/// - `blossom_get` / `blossom_head` / `blossom_upload` / `blossom_delete` —
+///   §7.4 Blossom surface. The node exposes no Blossom path and recovery is
+///   not implemented; inventing REST routes without a store is a map of
+///   streets that do not exist.
+///
+/// Inventory keys remain in [`CLOSED_ENDPOINT_KEYS`]; advertisement tracks
+/// [`ServedSurface::ALL`] only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServedSurface {
     Health,
@@ -117,6 +130,10 @@ enum ServedSurface {
     Record,
     Proof,
     AccountState,
+    PublishSpendrecord,
+    BootstrapChallenge,
+    BootstrapEntrust,
+    BootstrapRevoke,
 }
 
 impl ServedSurface {
@@ -141,6 +158,10 @@ impl ServedSurface {
         ServedSurface::Record,
         ServedSurface::Proof,
         ServedSurface::AccountState,
+        ServedSurface::PublishSpendrecord,
+        ServedSurface::BootstrapChallenge,
+        ServedSurface::BootstrapEntrust,
+        ServedSurface::BootstrapRevoke,
     ];
 
     /// Closed §7.5 discovery key for this surface.
@@ -165,6 +186,10 @@ impl ServedSurface {
             ServedSurface::Record => "record",
             ServedSurface::Proof => "proof",
             ServedSurface::AccountState => "account_state",
+            ServedSurface::PublishSpendrecord => "publish_spendrecord",
+            ServedSurface::BootstrapChallenge => "bootstrap_challenge",
+            ServedSurface::BootstrapEntrust => "bootstrap_entrust",
+            ServedSurface::BootstrapRevoke => "bootstrap_revoke",
         }
     }
 
@@ -198,6 +223,18 @@ impl ServedSurface {
             ServedSurface::Record => router.route(&path, get(pull::get_record)),
             ServedSurface::Proof => router.route(&path, get(pull::get_proof)),
             ServedSurface::AccountState => router.route(&path, get(pull::get_account_state)),
+            ServedSurface::PublishSpendrecord => {
+                router.route(&path, post(publish::post_publish_spendrecord))
+            }
+            ServedSurface::BootstrapChallenge => {
+                router.route(&path, post(bootstrap::post_bootstrap_challenge))
+            }
+            ServedSurface::BootstrapEntrust => {
+                router.route(&path, post(bootstrap::post_bootstrap_entrust))
+            }
+            ServedSurface::BootstrapRevoke => {
+                router.route(&path, post(bootstrap::post_bootstrap_revoke))
+            }
         }
     }
 }
@@ -334,10 +371,11 @@ mod tests {
     use crate::kernel::encode_kernel_error_status;
     use crate::kernel::kernel_v1::{
         AccountStateRequest, AccountStateResult, AccumulatorTip, AttestRequest, BootstrapManifest,
-        Challenge, CoinProofBlob, CoinProofRequest, GrantRequest, GrantResult, Info, Job, JobEvent,
-        JobHandle, JobRequest, NullifierPath, NullifierPathRequest, PullChallengeRequest,
-        PullRequest, PullResult as ProtoPullResult, RecordBlob, RecordRequest, SignRequest,
-        TransitionRequest,
+        Challenge, CoinProofBlob, CoinProofRequest, EntrustRequest, EntrustResult, GrantRequest,
+        GrantResult, Info, Job, JobEvent, JobHandle, JobRequest, NullifierPath,
+        NullifierPathRequest, PublishRequest, PublishResult, PullChallengeRequest, PullRequest,
+        PullResult as ProtoPullResult, RecordBlob, RecordRequest, RevokeRequest, RevokeResult,
+        SignRequest, TransitionRequest,
     };
     use crate::kernel::KernelRpc;
     use crate::ownership::SessionAuthority;
@@ -441,6 +479,21 @@ mod tests {
             Err(ApiError::internal(
                 "test double: get_account_state not configured",
             ))
+        }
+        async fn entrust_operational_bundle(
+            &self,
+            _req: EntrustRequest,
+        ) -> Result<EntrustResult, ApiError> {
+            Err(ApiError::internal("test double: entrust not configured"))
+        }
+        async fn revoke_operational_bundle(
+            &self,
+            _req: RevokeRequest,
+        ) -> Result<RevokeResult, ApiError> {
+            Err(ApiError::internal("test double: revoke not configured"))
+        }
+        async fn publish(&self, _req: PublishRequest) -> Result<PublishResult, ApiError> {
+            Err(ApiError::internal("test double: publish not configured"))
         }
     }
 
@@ -606,9 +659,43 @@ mod tests {
                 "record",
                 "proof",
                 "account_state",
+                "publish_spendrecord",
+                "bootstrap_challenge",
+                "bootstrap_entrust",
+                "bootstrap_revoke",
             ]),
-            "stage C2 adds the five pull/record/proof/account_state keys"
+            "stage D adds bootstrap_* and publish_spendrecord"
         );
+        assert_eq!(
+            endpoints["bootstrap_challenge"].as_str(),
+            Some("/v1/bootstrap/challenge")
+        );
+        assert_eq!(
+            endpoints["bootstrap_entrust"].as_str(),
+            Some("/v1/bootstrap/entrust")
+        );
+        assert_eq!(
+            endpoints["bootstrap_revoke"].as_str(),
+            Some("/v1/bootstrap/revoke")
+        );
+        assert_eq!(
+            endpoints["publish_spendrecord"].as_str(),
+            Some("/v1/publish/spendrecord")
+        );
+        // Unbuilt surfaces stay off discovery (documented in ServedSurface).
+        for absent in [
+            "chain_inscriptions",
+            "receipts_stream",
+            "blossom_get",
+            "blossom_head",
+            "blossom_upload",
+            "blossom_delete",
+        ] {
+            assert!(
+                !endpoints.contains_key(absent),
+                "unbuilt surface {absent} must stay unadvertised"
+            );
+        }
         assert_eq!(
             endpoints["attest_balance_challenge"].as_str(),
             Some("/v1/attest/balance/challenge")
@@ -942,6 +1029,9 @@ mod tests {
         get_record: Option<Result<RecordBlob, ApiError>>,
         get_coin_proof: Option<Result<CoinProofBlob, ApiError>>,
         get_account_state: Option<Result<AccountStateResult, ApiError>>,
+        entrust: Option<Result<EntrustResult, ApiError>>,
+        revoke: Option<Result<RevokeResult, ApiError>>,
+        publish: Option<Result<PublishResult, ApiError>>,
         /// Call counters for proving "no kernel call" on auth failure.
         attest_calls: AtomicUsize,
         issue_grant_calls: AtomicUsize,
@@ -950,8 +1040,17 @@ mod tests {
         get_record_calls: AtomicUsize,
         get_coin_proof_calls: AtomicUsize,
         get_account_state_calls: AtomicUsize,
+        entrust_calls: AtomicUsize,
+        revoke_calls: AtomicUsize,
+        publish_calls: AtomicUsize,
         /// Last pull authority observed (for grant/ownership plumbing asserts).
         last_pull_authority: Mutex<Option<SessionAuthority>>,
+        /// Last OpenPullChallenge.action observed (bootstrap domain plumbing).
+        last_open_challenge_action: Mutex<Option<String>>,
+        /// Last entrust request (bundle length / subject checks — never log bundle).
+        last_entrust: Mutex<Option<EntrustRequest>>,
+        last_revoke: Mutex<Option<RevokeRequest>>,
+        last_publish: Mutex<Option<PublishRequest>>,
     }
 
     #[async_trait]
@@ -1023,9 +1122,13 @@ mod tests {
         }
         async fn open_pull_challenge(
             &self,
-            _req: PullChallengeRequest,
+            req: PullChallengeRequest,
         ) -> Result<Challenge, ApiError> {
             self.open_challenge_calls.fetch_add(1, Ordering::SeqCst);
+            *self
+                .last_open_challenge_action
+                .lock()
+                .expect("open action mutex") = Some(req.action);
             match &self.open_challenge {
                 Some(Ok(c)) => Ok(c.clone()),
                 Some(Err(e)) => Err(e.clone()),
@@ -1086,6 +1189,39 @@ mod tests {
                 Some(Ok(r)) => Ok(r.clone()),
                 Some(Err(e)) => Err(e.clone()),
                 None => Err(ApiError::internal("get_account_state not scripted")),
+            }
+        }
+        async fn entrust_operational_bundle(
+            &self,
+            req: EntrustRequest,
+        ) -> Result<EntrustResult, ApiError> {
+            self.entrust_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_entrust.lock().expect("entrust mutex") = Some(req);
+            match &self.entrust {
+                Some(Ok(r)) => Ok(*r),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal("entrust not scripted")),
+            }
+        }
+        async fn revoke_operational_bundle(
+            &self,
+            req: RevokeRequest,
+        ) -> Result<RevokeResult, ApiError> {
+            self.revoke_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_revoke.lock().expect("revoke mutex") = Some(req);
+            match &self.revoke {
+                Some(Ok(r)) => Ok(*r),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal("revoke not scripted")),
+            }
+        }
+        async fn publish(&self, req: PublishRequest) -> Result<PublishResult, ApiError> {
+            self.publish_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_publish.lock().expect("publish mutex") = Some(req);
+            match &self.publish {
+                Some(Ok(r)) => Ok(r.clone()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal("publish not scripted")),
             }
         }
     }
@@ -3241,5 +3377,615 @@ mod tests {
             Some("application/octet-stream")
         );
         assert_eq!(body_bytes(res).await, b"coin-proof-bytes");
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage D — Bootstrap + Publish
+    // -----------------------------------------------------------------------
+
+    use crate::bootstrap::{OPERATIONAL_BUNDLE_HEX_CHARS, OPERATIONAL_BUNDLE_LEN};
+    use crate::ownership::{ENTRUST_CHALLENGE_DOMAIN, REVOKE_CHALLENGE_DOMAIN};
+
+    /// Canonical 161-byte version-0x01 bundle as hex (322 chars). Secrets are
+    /// zeros — only length/form matters at the API edge in these tests.
+    fn sample_bundle_hex() -> String {
+        format!("01{}", "00".repeat(160))
+    }
+
+    fn bootstrap_ownership_body(
+        subject: &str,
+        pk0: &[u8; 32],
+        nkc: &[u8; 32],
+        nonce: &[u8; 32],
+        expiry: u64,
+        sig: &[u8; 64],
+        bundle_hex: Option<&str>,
+    ) -> Value {
+        let mut obj = serde_json::json!({
+            "challenge": {
+                "nonce": encode_hex(nonce),
+                "expiry": expiry.to_string(),
+            },
+            "ownership_proof": ownership_proof_json(subject, pk0, nkc, sig),
+        });
+        if let Some(h) = bundle_hex {
+            obj.as_object_mut()
+                .expect("object")
+                .insert("bundle".into(), Value::String(h.to_string()));
+        }
+        obj
+    }
+
+    #[tokio::test]
+    async fn bootstrap_challenge_entrust_and_revoke_return_distinct_domains() {
+        let (_, _, _, _, subject_bech) = ownership_fixtures::identity();
+
+        // entrust
+        let kernel = Arc::new(ScriptedKernel {
+            open_challenge: Some(Ok(Challenge {
+                nonce: vec![0xABu8; 32],
+                expiry: 1_700_000_060,
+                domain: ENTRUST_CHALLENGE_DOMAIN.to_string(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bootstrap/challenge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "subject": subject_bech,
+                            "action": "entrust",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["domain"], ENTRUST_CHALLENGE_DOMAIN);
+        assert_eq!(
+            kernel.last_open_challenge_action.lock().unwrap().as_deref(),
+            Some("entrust")
+        );
+
+        // revoke
+        let kernel2 = Arc::new(ScriptedKernel {
+            open_challenge: Some(Ok(Challenge {
+                nonce: vec![0xCDu8; 32],
+                expiry: 1_700_000_120,
+                domain: REVOKE_CHALLENGE_DOMAIN.to_string(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel2.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bootstrap/challenge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "subject": subject_bech,
+                            "action": "revoke",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["domain"], REVOKE_CHALLENGE_DOMAIN);
+        assert_eq!(
+            kernel2
+                .last_open_challenge_action
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("revoke")
+        );
+        assert_ne!(ENTRUST_CHALLENGE_DOMAIN, REVOKE_CHALLENGE_DOMAIN);
+        assert_ne!(ENTRUST_CHALLENGE_DOMAIN, PULL_CHALLENGE_DOMAIN);
+        assert_ne!(REVOKE_CHALLENGE_DOMAIN, PULL_CHALLENGE_DOMAIN);
+    }
+
+    #[tokio::test]
+    async fn entrust_signed_proof_rejected_on_revoke_endpoint_no_kernel() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x11u8; 32];
+        let expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        // Sign under Entrust domain — must not authorise /revoke.
+        let chal = pull_challenge_message(
+            ChallengeDomain::Entrust.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        let kernel = Arc::new(ScriptedKernel {
+            revoke: Some(Ok(RevokeResult { revoked: true })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bootstrap/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        bootstrap_ownership_body(
+                            &subject_bech,
+                            &pk0,
+                            &nkc,
+                            &nonce,
+                            expiry,
+                            &sig,
+                            None,
+                        )
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+        assert_eq!(kernel.revoke_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn revoke_signed_proof_rejected_on_entrust_endpoint_no_kernel() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x22u8; 32];
+        let expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            ChallengeDomain::Revoke.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        let kernel = Arc::new(ScriptedKernel {
+            entrust: Some(Ok(EntrustResult { accepted: true })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let bundle = sample_bundle_hex();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bootstrap/entrust")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        bootstrap_ownership_body(
+                            &subject_bech,
+                            &pk0,
+                            &nkc,
+                            &nonce,
+                            expiry,
+                            &sig,
+                            Some(&bundle),
+                        )
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(kernel.entrust_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn entrust_bundle_160_and_162_are_400_161_is_forwarded() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x33u8; 32];
+        let expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            ChallengeDomain::Entrust.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+
+        // 160 bytes → 400, no kernel.
+        let kernel = Arc::new(ScriptedKernel {
+            entrust: Some(Ok(EntrustResult { accepted: true })),
+            ..Default::default()
+        });
+        let short_hex = "01".to_string() + &"00".repeat(159);
+        assert_eq!(short_hex.len(), 320);
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bootstrap/entrust")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        bootstrap_ownership_body(
+                            &subject_bech,
+                            &pk0,
+                            &nkc,
+                            &nonce,
+                            expiry,
+                            &sig,
+                            Some(&short_hex),
+                        )
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = body_bytes(res).await;
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+        assert_eq!(kernel.entrust_calls.load(Ordering::SeqCst), 0);
+        // Secret must not appear in the error body.
+        assert!(
+            !String::from_utf8_lossy(&body).contains(&short_hex),
+            "bundle hex must not appear in error response"
+        );
+
+        // 162 bytes → 400, no kernel.
+        let long_hex = "01".to_string() + &"00".repeat(161);
+        assert_eq!(long_hex.len(), 324);
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bootstrap/entrust")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        bootstrap_ownership_body(
+                            &subject_bech,
+                            &pk0,
+                            &nkc,
+                            &nonce,
+                            expiry,
+                            &sig,
+                            Some(&long_hex),
+                        )
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(kernel.entrust_calls.load(Ordering::SeqCst), 0);
+
+        // 161 bytes → forwarded.
+        let ok_hex = sample_bundle_hex();
+        assert_eq!(ok_hex.len(), OPERATIONAL_BUNDLE_HEX_CHARS);
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bootstrap/entrust")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        bootstrap_ownership_body(
+                            &subject_bech,
+                            &pk0,
+                            &nkc,
+                            &nonce,
+                            expiry,
+                            &sig,
+                            Some(&ok_hex),
+                        )
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["accepted"], true);
+        assert_eq!(kernel.entrust_calls.load(Ordering::SeqCst), 1);
+        let last = kernel.last_entrust.lock().unwrap();
+        let req = last.as_ref().expect("entrust request captured");
+        assert_eq!(req.bundle.len(), OPERATIONAL_BUNDLE_LEN);
+        assert_eq!(req.bundle[0], 0x01);
+        assert_eq!(req.subject, subject_bech);
+        assert_eq!(req.nonce, nonce.to_vec());
+        assert_eq!(req.chan_bind, cb.to_vec());
+    }
+
+    #[tokio::test]
+    async fn entrust_auth_failure_response_does_not_contain_bundle_hex() {
+        // Distinctive non-zero secret hex — if any error path echoes the body,
+        // this substring will show up.
+        let marker = "f1e2d3c4b5a69788".repeat(20); // 320 chars of pattern
+        let bundle = format!("01{}", &marker[..320]);
+        assert_eq!(bundle.len(), 322);
+
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x44u8; 32];
+        let expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        // Sign under Revoke so Entrust verification fails after bundle parse.
+        let chal = pull_challenge_message(
+            ChallengeDomain::Revoke.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        let kernel = Arc::new(ScriptedKernel {
+            entrust: Some(Ok(EntrustResult { accepted: true })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bootstrap/entrust")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        bootstrap_ownership_body(
+                            &subject_bech,
+                            &pk0,
+                            &nkc,
+                            &nonce,
+                            expiry,
+                            &sig,
+                            Some(&bundle),
+                        )
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let body = String::from_utf8(body_bytes(res).await).expect("utf8");
+        assert!(
+            !body.contains(&bundle),
+            "full bundle hex must not appear in error body"
+        );
+        assert!(
+            !body.contains("f1e2d3c4b5a69788"),
+            "distinctive secret substring must not appear in error body: {body}"
+        );
+        assert_eq!(kernel.entrust_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn revoke_valid_ownership_calls_kernel() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x55u8; 32];
+        let expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            ChallengeDomain::Revoke.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        let kernel = Arc::new(ScriptedKernel {
+            revoke: Some(Ok(RevokeResult { revoked: true })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bootstrap/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        bootstrap_ownership_body(
+                            &subject_bech,
+                            &pk0,
+                            &nkc,
+                            &nonce,
+                            expiry,
+                            &sig,
+                            None,
+                        )
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["revoked"], true);
+        assert_eq!(kernel.revoke_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn publish_rejection_is_http_200_with_reason() {
+        let kernel = Arc::new(ScriptedKernel {
+            publish: Some(Ok(PublishResult {
+                accepted: false,
+                reason: Some("invalid_signature".into()),
+                batch_eta: None,
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let body = serde_json::json!({
+            "public_key": hex32(0x11),
+            "r": hex32(0x22),
+            "s": hex32(0x33),
+            "r_prime": hex32(0x44),
+            "block_anchor": {
+                "block_hash": hex32(0x55),
+                "height": "100",
+            }
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/publish/spendrecord")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "policy/crypto rejection is a successful hand-off result, not 4xx/5xx"
+        );
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["accepted"], false);
+        assert_eq!(json["reason"], "invalid_signature");
+        assert!(json.get("batch_eta").is_none());
+        assert!(json.get("error").is_none());
+        assert_eq!(kernel.publish_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn publish_accepted_returns_batch_eta() {
+        let kernel = Arc::new(ScriptedKernel {
+            publish: Some(Ok(PublishResult {
+                accepted: true,
+                reason: None,
+                batch_eta: Some(45),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel);
+        let body = serde_json::json!({
+            "public_key": hex32(0x11),
+            "r": hex32(0x22),
+            "s": hex32(0x33),
+            "r_prime": hex32(0x44),
+            "block_anchor": {
+                "block_hash": hex32(0x55),
+                "height": "42",
+            }
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/publish/spendrecord")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["accepted"], true);
+        assert_eq!(json["batch_eta"], "45");
+        assert!(json.get("reason").is_none());
+    }
+
+    #[tokio::test]
+    async fn publish_fee_field_is_400_not_silent() {
+        let kernel = Arc::new(ScriptedKernel {
+            publish: Some(Ok(PublishResult {
+                accepted: true,
+                reason: None,
+                batch_eta: Some(1),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let body = serde_json::json!({
+            "public_key": hex32(0x11),
+            "r": hex32(0x22),
+            "s": hex32(0x33),
+            "r_prime": hex32(0x44),
+            "block_anchor": {
+                "block_hash": hex32(0x55),
+                "height": "100",
+            },
+            "fee_blob_id": hex32(0x66),
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/publish/spendrecord")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+        assert_eq!(
+            kernel.publish_calls.load(Ordering::SeqCst),
+            0,
+            "fee field must fail at the edge before any kernel call"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbuilt_surfaces_remain_404_and_absent_from_discovery() {
+        let app = test_app();
+        for path in [
+            "/v1/receipts/stream",
+            "/blossom/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "/blossom/upload",
+        ] {
+            let res = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::NOT_FOUND,
+                "unbuilt surface {path} must not be registered"
+            );
+        }
+        let res = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        let endpoints = json["endpoints"].as_object().unwrap();
+        assert!(!endpoints.contains_key("receipts_stream"));
+        assert!(!endpoints.contains_key("blossom_get"));
+        assert!(!endpoints.contains_key("blossom_upload"));
+        assert!(!endpoints.contains_key("chain_inscriptions"));
+        assert!(endpoints.contains_key("bootstrap_entrust"));
+        assert!(endpoints.contains_key("publish_spendrecord"));
     }
 }
