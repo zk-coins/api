@@ -1,0 +1,53 @@
+//! §7.5 generic REST error body and HTTP mapping helpers.
+
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::Serialize;
+
+/// Closed §7.5 error body: `{ "error": "<machine_code>", "message": "<human>" }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ErrorBody {
+    pub error: String,
+    pub message: String,
+}
+
+/// An HTTP error ready to return from a handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiError {
+    pub status: StatusCode,
+    pub body: ErrorBody,
+}
+
+impl ApiError {
+    pub fn new(status: StatusCode, error: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: ErrorBody {
+                error: error.into(),
+                message: message.into(),
+            },
+        }
+    }
+
+    /// §7.5 `malformed_request` / 400.
+    pub fn malformed(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "malformed_request", message)
+    }
+
+    /// Fail-closed stand-in when the kernel transport breaks or the kernel
+    /// violates the ErrorInfo contract. Spec §7.5 closes the enumeration with
+    /// `internal_error` / 500 for any condition not listed.
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        // Always a §7.5 JSON body — never a bare status with an empty body.
+        // (Axum's default 404 fallback is status-only; handlers must not
+        // look like that when they intentionally return an ApiError.)
+        (self.status, Json(self.body)).into_response()
+    }
+}

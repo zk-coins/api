@@ -32,11 +32,13 @@ The API layer sits **outward** of the node. It consumes the node's internal **ke
 
 > **Status: scaffold.** The API surface is currently served by [`zk-coins/node`](https://github.com/zk-coins/node) directly; this repo will hold the standalone API layer once the kernel RPC contract stabilises. The full design is specified in [§6.1 (kernel and API)](https://docs.zkcoins.com/specification), [§7.5 (REST)](https://docs.zkcoins.com/specification), and [§7.8 (kernel RPC)](https://docs.zkcoins.com/specification).
 
-### Inventory and skeleton (this branch)
+### Inventory and stage A (this branch)
 
 - Full §7.5 endpoint inventory (method, capability, feature, kernel RPC): [`docs/rest-surface.md`](docs/rest-surface.md).
-- Rust process (`axum` + `tonic` client dep): only **`GET /health`** and **`GET /`** are registered. No placeholder routes.
-- **`GET /` discovery follows registration:** the response `endpoints` object lists only surfaces this process actually serves (today: `health`). The full 29-key §7.5 catalogue stays as inventory; unbuilt surfaces are omitted, not faked.
+- Rust process (`axum` + `tonic 0.13.1` client): **`GET /`**, **`GET /health`**, and the job surface (`POST /v1/tx`, `GET /v1/jobs/{job_id}`, stream/sign/cancel). No placeholder routes for unbuilt keys.
+- **`GET /` discovery follows registration** via `ServedSurface` — only served keys are advertised. The 29-key catalogue stays as inventory.
+- Kernel contract: carried `proto/kernel/v1/kernel.proto` with SHA-256 identity pin (`src/proto_identity.rs`); REST errors from `ErrorInfo.metadata["http_status"]` only.
+- Codegen lives in the workspace member **`kernel-proto`** (tonic client stubs only). Workspace `default-members = ["."]` keeps default `cargo clippy` / `cargo test` on the **api** package so generated code is not linted.
 - Fail-closed env: `ZKCOINS_BIND_ADDR`, `ZKCOINS_KERNEL_ADDR`, `ZKCOINS_FEATURES` (see the inventory doc).
 
 ## License

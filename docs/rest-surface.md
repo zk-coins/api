@@ -148,24 +148,32 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Replica-/Blob-Pfad).
 | Endpunkt | Status |
 |---|---|
 | `GET /health` | **implementiert** — `200` mit Body `"ok"` |
-| `GET /` | **implementiert** — `{ name, version, endpoints }` mit **genau** den Flächen, die dieser Prozess registriert (heute: nur `health` → `/health`). Die 29 geschlossenen Keys (L2874) bleiben Inventur in `CLOSED_ENDPOINT_KEYS`; unregistrierte Keys werden weggelassen (Spec: emit only surfaces this deployment exposes). |
+| `GET /` | **implementiert** — `{ name, version, endpoints }` mit **genau** den Flächen, die dieser Prozess registriert (`ServedSurface`). Inventur der 29 Keys in `CLOSED_ENDPOINT_KEYS`; unregistrierte Keys werden weggelassen. |
+| `POST /v1/tx` | **implementiert** — `SubmitTransition` |
+| `GET /v1/jobs/{job_id}` | **implementiert** — `GetJob` |
+| `GET /v1/jobs/{job_id}/stream` | **implementiert** — `StreamJob` als SSE |
+| `POST /v1/jobs/{job_id}/sign` | **implementiert** — `SignTransition` |
+| `POST /v1/jobs/{job_id}/cancel` | **implementiert** — `CancelJob` |
 | alle übrigen Method+Path | **nicht registriert** — kein Handler, kein `todo!()`, kein Platzhalter |
 
 Router und Discovery teilen eine Quelle (`ServedSurface` in `src/routes.rs`): eine neue
 registrierte Fläche erscheint automatisch in `GET /`; ein Inventur-Key ohne Route
-wird nicht beworben.
+wird nicht beworben. Path-Parameter in Discovery/`CLOSED_ENDPOINT_KEYS` nutzen die
+axum/OpenAPI-Form `{name}` (Spec-Text: `<name>`).
 
-### Dokumentierte Lücken (ohne Kernel-Verbindung nicht ehrlich darstellbar)
+gRPC: getragenes `proto/kernel/v1/kernel.proto` (Identität per SHA-256-Pin +
+Sibling-Vergleich mit `zk-coins/node`), Client `tonic 0.13.1`, Fehlerübersetzung
+ausschließlich über `google.rpc.ErrorInfo` (`domain`, `reason`,
+`metadata["http_status"]`) — keine zweite Status-Tabelle im api.
 
-Siehe auch Abschnitt **GAPS** im Implementierungsbericht. Kurz:
+### Dokumentierte Lücken
 
 | Lücke | Warum |
 |---|---|
-| `GET /v1/info` | braucht Kernel-`GetInfo`: `circuit_digests`, `bootstrap` / `bootstrap_pubkey`, Sync-Felder, Bounds. API-`features` allein würden nur erfundene Kernel-Werte ergänzen. **Absichtlich nicht implementiert.** |
-| `GET /health/ready` | `ready` / `ready_reason` und optionale Diagnosefelder kommen aus Kernel-`GetInfo`. |
-| Chain / Jobs / Pull / Bootstrap / Publish / Blossom | jeweils Kernel-RPC oder Kernel-Store; ohne gRPC-Client-Verbindung keine ehrliche Antwort. |
-| Feature-Gate `404 feature_disabled` | erst sinnvoll, sobald die jeweiligen Routen existieren. |
-| gRPC-Client (`tonic`) | Abhängigkeit ist deklariert; es gibt noch keinen generierten `kernel.v1`-Client und keinen Connect beim Start (Bind + Adresse werden fail-closed gelesen, aber nicht geöffnet). |
+| `GET /v1/info` | braucht Kernel-`GetInfo` + API-eigene `features`-Konstruktion. |
+| `GET /health/ready` | `ready` / `ready_reason` aus Kernel-`GetInfo`. |
+| Chain / Pull / Bootstrap / Publish / Blossom / Attest / Grants | jeweilige Kernel-RPC noch nicht angebunden. |
+| Feature-Gate `404 feature_disabled` | Job-Fläche ist in dieser Stufe always-on; Gate folgt mit den optionalen Rollen. |
 
 ---
 

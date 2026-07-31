@@ -1,24 +1,53 @@
+[workspace]
+members = [".", "kernel-proto"]
+# Lint/test default surface is the api package only — same idea as node CI
+# (`-p node -p shared`): the generated kernel-proto crate is not on the
+# clippy line. Identity tests for the carried .proto live in api.
+default-members = ["."]
+resolver = "2"
+
 [package]
 name = "api"
 version = "0.1.0"
 edition = "2021"
-description = "zkCoins public REST API layer (scaffold)"
+description = "zkCoins public REST API layer"
 license = "MIT"
 publish = false
 
 [dependencies]
-# Versions taken from zk-coins/node where the same crate is already a direct dep
-# (node/Cargo.toml / workspace). tonic is not yet a direct node dep; 0.14 matches
-# the version already present in the node Cargo.lock (transitive).
+# tonic 0.13.1 matches zk-coins/node (kernel-proto): last line whose
+# tonic-build still owns prost codegen (`compile_protos`). 0.14 moved that
+# to tonic-prost-build — two codegen paths for the same .proto are avoided.
+# Client features only: no `router` (server add_service). Handler tests use
+# a trait double, not an in-process tonic server.
 axum = { version = "0.7.9", features = ["json"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
-tonic = "0.14"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+    "sync",
+    "time",
+] }
+tonic = { version = "0.13.1", default-features = false, features = [
+    "codegen",
+    "prost",
+    "transport",
+] }
+prost = "0.13.5"
+prost-types = "0.13.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
+async-trait = "0.1"
+# Generated kernel.v1 client stubs — separate crate so default clippy/test
+# of `api` does not lint tonic-build output (result_large_err on Status).
+kernel-proto = { path = "kernel-proto" }
 
 [dev-dependencies]
-# Same versions as node/Cargo.toml [dev-dependencies].
+# Same versions as node/Cargo.toml [dev-dependencies] where shared.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+sha2 = "0.10"
