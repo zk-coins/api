@@ -158,6 +158,10 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Replica-/Blob-Pfad).
 | `GET /v1/jobs/{job_id}/stream` | **implementiert** — `StreamJob` als SSE |
 | `POST /v1/jobs/{job_id}/sign` | **implementiert** — `SignTransition` |
 | `POST /v1/jobs/{job_id}/cancel` | **implementiert** — `CancelJob` |
+| `POST /v1/attest/balance/challenge` | **implementiert** — `OpenPullChallenge` (`action = attest_balance`) |
+| `POST /v1/attest/balance` | **implementiert** — OwnershipProof-Verifikation am API-Rand, dann `AttestBalance` |
+| `POST /v1/grants/challenge` | **implementiert** — `OpenPullChallenge` (`action = issue_grant`) |
+| `POST /v1/grants` | **implementiert** — OwnershipProof-Verifikation am API-Rand, dann `IssueViewGrant` |
 | alle übrigen Method+Path | **nicht registriert** — kein Handler, kein `todo!()`, kein Platzhalter |
 
 **Bewusst nicht beworben:** `chain_inscriptions` — `ListInscriptions` ist im node `Unimplemented` (fehlt scanner-geschriebener Inschriften-Katalog mit Reveal-Txid und §3.5-Format). Eine REST-Hülle, die zuverlässig 501 liefert, wäre nur eine zweite Stelle für dieselbe Absenz.
@@ -177,8 +181,8 @@ ausschließlich über `google.rpc.ErrorInfo` (`domain`, `reason`,
 | Lücke | Warum |
 |---|---|
 | `GET /v1/chain/inscriptions` | Kernel-`ListInscriptions` Unimplemented bis Inschriften-Katalog. |
-| Pull / Bootstrap / Publish / Blossom / Attest / Grants | jeweilige Kernel-RPC noch nicht angebunden. |
-| Feature-Gate `404 feature_disabled` | Info/Chain/Job-Fläche ist in dieser Stufe always-on; Gate folgt mit den optionalen Rollen. |
+| Pull / Bootstrap / Publish / Blossom | jeweilige Kernel-RPC noch nicht angebunden. |
+| Feature-Gate `404 feature_disabled` | Info/Chain/Job/Attest/Grants-Fläche ist in dieser Stufe always-on; Gate folgt mit den optionalen Rollen. |
 
 ---
 
@@ -189,3 +193,4 @@ ausschließlich über `google.rpc.ErrorInfo` (`domain`, `reason`,
 | `ZKCOINS_BIND_ADDR` | Socket-Adresse für den HTTP-Listener (z. B. `127.0.0.1:8080`). **Kein Default.** |
 | `ZKCOINS_KERNEL_ADDR` | Adresse des Kernel-gRPC (z. B. `http://127.0.0.1:50051`). **Kein Default.** Pflicht, auch wenn dieser Scaffold den Kanal noch nicht öffnet — Start ohne konfigurierte Kernel-Adresse ist unzulässig. |
 | `ZKCOINS_FEATURES` | Komma-separierte Teilmenge von `{wallet,explorer,publisher,lightning_bridge,mail_bridge}`. Darf leer sein (alle Features off). Unbekannter Token → **Startfehler**. Variable selbst ist Pflicht (explizit leer = absichtlich nichts freigeschaltet). |
+| `ZKCOINS_PUBLIC_HOST` | Komma-separierte autoritative Hostnamen für §5.1 `chan_bind` (lowercase, trailing-dot gestrichen). **Nie** aus `Host`-Header. Darf leer sein (dann schlägt OwnershipProof-Auth laut fehl). Variable selbst ist Pflicht. |

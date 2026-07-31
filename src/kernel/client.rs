@@ -9,8 +9,9 @@ use crate::error::ApiError;
 use crate::kernel::error_info::kernel_status_to_api_error;
 use crate::kernel::pb::kernel_v1::kernel_client::KernelClient as TonicKernelClient;
 use crate::kernel::pb::kernel_v1::{
-    AccumulatorTip, GetAccumulatorRequest, GetInfoRequest, Info, Job, JobEvent, JobHandle,
-    JobRequest, NullifierPath, NullifierPathRequest, SignRequest, TransitionRequest,
+    AccumulatorTip, AttestRequest, Challenge, GetAccumulatorRequest, GetInfoRequest, GrantRequest,
+    GrantResult, Info, Job, JobEvent, JobHandle, JobRequest, NullifierPath, NullifierPathRequest,
+    PullChallengeRequest, SignRequest, TransitionRequest,
 };
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
@@ -19,7 +20,8 @@ use std::sync::Arc;
 use tonic::transport::Channel;
 use tonic::Request;
 
-/// Subset of kernel procedures this stage consumes (job surface + info/chain reads).
+/// Subset of kernel procedures this stage consumes
+/// (job surface + info/chain reads + attest/grants).
 #[async_trait]
 pub trait KernelRpc: Send + Sync {
     async fn submit_transition(&self, req: TransitionRequest) -> Result<JobHandle, ApiError>;
@@ -43,6 +45,12 @@ pub trait KernelRpc: Send + Sync {
         &self,
         req: NullifierPathRequest,
     ) -> Result<NullifierPath, ApiError>;
+
+    async fn open_pull_challenge(&self, req: PullChallengeRequest) -> Result<Challenge, ApiError>;
+
+    async fn attest_balance(&self, req: AttestRequest) -> Result<JobHandle, ApiError>;
+
+    async fn issue_view_grant(&self, req: GrantRequest) -> Result<GrantResult, ApiError>;
 }
 
 /// Shared handle installed in the axum `State`.
@@ -195,6 +203,33 @@ impl KernelRpc for KernelClient {
         let mut client = self.inner.clone();
         let response = client
             .get_nullifier_path(Request::new(req))
+            .await
+            .map_err(map_status)?;
+        Ok(response.into_inner())
+    }
+
+    async fn open_pull_challenge(&self, req: PullChallengeRequest) -> Result<Challenge, ApiError> {
+        let mut client = self.inner.clone();
+        let response = client
+            .open_pull_challenge(Request::new(req))
+            .await
+            .map_err(map_status)?;
+        Ok(response.into_inner())
+    }
+
+    async fn attest_balance(&self, req: AttestRequest) -> Result<JobHandle, ApiError> {
+        let mut client = self.inner.clone();
+        let response = client
+            .attest_balance(Request::new(req))
+            .await
+            .map_err(map_status)?;
+        Ok(response.into_inner())
+    }
+
+    async fn issue_view_grant(&self, req: GrantRequest) -> Result<GrantResult, ApiError> {
+        let mut client = self.inner.clone();
+        let response = client
+            .issue_view_grant(Request::new(req))
             .await
             .map_err(map_status)?;
         Ok(response.into_inner())

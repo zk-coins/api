@@ -42,6 +42,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
 async-trait = "0.1"
+# SHA-256 for chal / request_hash / chan_bind / address binding (§1.1, §5.1).
+sha2 = "0.10"
+# BIP-340 Schnorr — same line as zk-coins/node (`bitcoin` → secp256k1).
+# Used only for OwnershipProof verification at the API edge.
+bitcoin = { version = "0.32.5", default-features = false, features = [
+    "std",
+    "secp-recovery",
+] }
+# Bech32m for `zk` addresses (§1.7.7); same major as node workspace.
+bech32 = "0.11"
 # Generated kernel.v1 client stubs — separate crate so default clippy/test
 # of `api` does not lint tonic-build output (result_large_err on Status).
 kernel-proto = { path = "kernel-proto" }
@@ -50,4 +60,3 @@ kernel-proto = { path = "kernel-proto" }
 # Same versions as node/Cargo.toml [dev-dependencies] where shared.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-sha2 = "0.10"

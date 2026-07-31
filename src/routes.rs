@@ -9,8 +9,10 @@
 //! Axum registration uses a derived **matcher** form (`:name`); see
 //! [`advertised_path_to_axum_matcher`].
 
+use crate::attest;
 use crate::chain;
 use crate::config::Config;
+use crate::grants;
 use crate::info;
 use crate::jobs;
 use crate::kernel::KernelHandle;
@@ -21,6 +23,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Closed `endpoints` key set from specification §7.5 (`GET /` row).
 ///
@@ -104,6 +107,10 @@ enum ServedSurface {
     JobsStream,
     JobsSign,
     JobsCancel,
+    AttestBalanceChallenge,
+    AttestBalance,
+    GrantsChallenge,
+    Grants,
 }
 
 impl ServedSurface {
@@ -119,6 +126,10 @@ impl ServedSurface {
         ServedSurface::JobsStream,
         ServedSurface::JobsSign,
         ServedSurface::JobsCancel,
+        ServedSurface::AttestBalanceChallenge,
+        ServedSurface::AttestBalance,
+        ServedSurface::GrantsChallenge,
+        ServedSurface::Grants,
     ];
 
     /// Closed §7.5 discovery key for this surface.
@@ -134,6 +145,10 @@ impl ServedSurface {
             ServedSurface::JobsStream => "jobs_stream",
             ServedSurface::JobsSign => "jobs_sign",
             ServedSurface::JobsCancel => "jobs_cancel",
+            ServedSurface::AttestBalanceChallenge => "attest_balance_challenge",
+            ServedSurface::AttestBalance => "attest_balance",
+            ServedSurface::GrantsChallenge => "grants_challenge",
+            ServedSurface::Grants => "grants",
         }
     }
 
@@ -154,6 +169,14 @@ impl ServedSurface {
             ServedSurface::JobsStream => router.route(&path, get(jobs::stream_job)),
             ServedSurface::JobsSign => router.route(&path, post(jobs::post_sign)),
             ServedSurface::JobsCancel => router.route(&path, post(jobs::post_cancel)),
+            ServedSurface::AttestBalanceChallenge => {
+                router.route(&path, post(attest::post_attest_balance_challenge))
+            }
+            ServedSurface::AttestBalance => router.route(&path, post(attest::post_attest_balance)),
+            ServedSurface::GrantsChallenge => {
+                router.route(&path, post(grants::post_grants_challenge))
+            }
+            ServedSurface::Grants => router.route(&path, post(grants::post_grants)),
         }
     }
 }
@@ -250,9 +273,14 @@ pub fn build_router(config: Config, kernel: KernelHandle) -> Router {
         bind_addr: _,
         kernel_addr: _,
         features,
+        public_hosts,
     } = config;
 
-    let state = AppState { kernel, features };
+    let state = AppState {
+        kernel,
+        features,
+        public_hosts: Arc::new(public_hosts),
+    };
 
     // Register every surface as `Router<AppState>`, then bind state so the
     // returned tree is `Router<()>` and implements `Service`. Binding earlier
@@ -284,8 +312,9 @@ mod tests {
     use crate::error::ApiError;
     use crate::kernel::encode_kernel_error_status;
     use crate::kernel::kernel_v1::{
-        AccumulatorTip, BootstrapManifest, Info, Job, JobEvent, JobHandle, JobRequest,
-        NullifierPath, NullifierPathRequest, SignRequest, TransitionRequest,
+        AccumulatorTip, AttestRequest, BootstrapManifest, Challenge, GrantRequest, GrantResult,
+        Info, Job, JobEvent, JobHandle, JobRequest, NullifierPath, NullifierPathRequest,
+        PullChallengeRequest, SignRequest, TransitionRequest,
     };
     use crate::kernel::KernelRpc;
     use async_trait::async_trait;
@@ -295,6 +324,7 @@ mod tests {
     use http_body_util::BodyExt;
     use serde_json::Value;
     use std::collections::{BTreeSet, HashMap};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tonic::Code;
     use tower::ServiceExt;
@@ -304,6 +334,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             kernel_addr: "http://127.0.0.1:50051".to_string(),
             features: BTreeSet::new(),
+            public_hosts: vec!["node.example.com".to_string()],
         }
     }
 
@@ -344,6 +375,24 @@ mod tests {
         ) -> Result<NullifierPath, ApiError> {
             Err(ApiError::internal(
                 "test double: get_nullifier_path not configured",
+            ))
+        }
+        async fn open_pull_challenge(
+            &self,
+            _req: PullChallengeRequest,
+        ) -> Result<Challenge, ApiError> {
+            Err(ApiError::internal(
+                "test double: open_pull_challenge not configured",
+            ))
+        }
+        async fn attest_balance(&self, _req: AttestRequest) -> Result<JobHandle, ApiError> {
+            Err(ApiError::internal(
+                "test double: attest_balance not configured",
+            ))
+        }
+        async fn issue_view_grant(&self, _req: GrantRequest) -> Result<GrantResult, ApiError> {
+            Err(ApiError::internal(
+                "test double: issue_view_grant not configured",
             ))
         }
     }
@@ -501,9 +550,26 @@ mod tests {
                 "jobs_stream",
                 "jobs_sign",
                 "jobs_cancel",
+                "attest_balance_challenge",
+                "attest_balance",
+                "grants_challenge",
+                "grants",
             ]),
-            "stage B serves health + info/chain reads + the five job-surface keys"
+            "stage C1 adds the four attest/grants keys to the prior job+info surface"
         );
+        assert_eq!(
+            endpoints["attest_balance_challenge"].as_str(),
+            Some("/v1/attest/balance/challenge")
+        );
+        assert_eq!(
+            endpoints["attest_balance"].as_str(),
+            Some("/v1/attest/balance")
+        );
+        assert_eq!(
+            endpoints["grants_challenge"].as_str(),
+            Some("/v1/grants/challenge")
+        );
+        assert_eq!(endpoints["grants"].as_str(), Some("/v1/grants"));
         // chain_inscriptions must not be advertised until ListInscriptions exists.
         assert!(
             !endpoints.contains_key("chain_inscriptions"),
@@ -746,6 +812,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             kernel_addr: "http://kernel:1".to_string(),
             features,
+            public_hosts: vec!["node.example.com".to_string()],
         };
         let app = build_router(cfg, Arc::new(UnreachableKernel));
         let res = app
@@ -766,6 +833,7 @@ mod tests {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
                 kernel_addr: "http://kernel:1".to_string(),
                 features: BTreeSet::from([Feature::Wallet]),
+                public_hosts: vec!["node.example.com".to_string()],
             },
             Arc::new(UnreachableKernel),
         );
@@ -800,6 +868,13 @@ mod tests {
         info: Option<Result<Info, ApiError>>,
         accumulator: Option<Result<AccumulatorTip, ApiError>>,
         nullifier_path: Option<Result<NullifierPath, ApiError>>,
+        open_challenge: Option<Result<Challenge, ApiError>>,
+        attest: Option<Result<JobHandle, ApiError>>,
+        issue_grant: Option<Result<GrantResult, ApiError>>,
+        /// Call counters for proving "no kernel call" on auth failure.
+        attest_calls: AtomicUsize,
+        issue_grant_calls: AtomicUsize,
+        open_challenge_calls: AtomicUsize,
     }
 
     #[async_trait]
@@ -867,6 +942,33 @@ mod tests {
                 Some(Ok(p)) => Ok(p.clone()),
                 Some(Err(e)) => Err(e.clone()),
                 None => Err(ApiError::internal("nullifier_path not scripted")),
+            }
+        }
+        async fn open_pull_challenge(
+            &self,
+            _req: PullChallengeRequest,
+        ) -> Result<Challenge, ApiError> {
+            self.open_challenge_calls.fetch_add(1, Ordering::SeqCst);
+            match &self.open_challenge {
+                Some(Ok(c)) => Ok(c.clone()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal("open_challenge not scripted")),
+            }
+        }
+        async fn attest_balance(&self, _req: AttestRequest) -> Result<JobHandle, ApiError> {
+            self.attest_calls.fetch_add(1, Ordering::SeqCst);
+            match &self.attest {
+                Some(Ok(h)) => Ok(h.clone()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal("attest not scripted")),
+            }
+        }
+        async fn issue_view_grant(&self, _req: GrantRequest) -> Result<GrantResult, ApiError> {
+            self.issue_grant_calls.fetch_add(1, Ordering::SeqCst);
+            match &self.issue_grant {
+                Some(Ok(r)) => Ok(r.clone()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal("issue_grant not scripted")),
             }
         }
     }
@@ -1340,6 +1442,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             kernel_addr: "http://127.0.0.1:50051".to_string(),
             features,
+            public_hosts: vec!["node.example.com".to_string()],
         };
         let app = build_router(cfg, Arc::new(kernel));
         let res = app
@@ -1731,5 +1834,630 @@ mod tests {
             "message must name pubkey, got {}",
             json["message"]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage C1 — OwnershipProof gate (attest / grants)
+    // -----------------------------------------------------------------------
+
+    use crate::hexutil::encode_hex;
+    use crate::ownership::{
+        attest_request_hash, ceiling_encoding, chan_bind_for_host, encode_grant_asset_ids,
+        encode_zk_address, issue_grant_request_hash, ownership_challenge_message, ChallengeDomain,
+        ATTEST_BALANCE_CHALLENGE_DOMAIN, ISSUE_GRANT_CHALLENGE_DOMAIN, SCOPE_NOT_AFTER_UNBOUNDED,
+    };
+    use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
+
+    /// Expose address helper for tests via a thin re-export path.
+    /// (`address_from_pk0_nk_commit` is private; tests use the public
+    /// ownership helpers that already cover the same path.)
+    mod ownership_fixtures {
+        use super::*;
+
+        pub fn sample_sk_pk() -> (SecretKey, [u8; 32]) {
+            let secp = Secp256k1::new();
+            let sk = SecretKey::from_slice(&[0x42u8; 32]).expect("32-byte secret");
+            let kp = Keypair::from_secret_key(&secp, &sk);
+            let (xonly, _) = kp.x_only_public_key();
+            (sk, xonly.serialize())
+        }
+
+        pub fn sign_chal(sk: &SecretKey, chal: &[u8; 32]) -> [u8; 64] {
+            let secp = Secp256k1::new();
+            let kp = Keypair::from_secret_key(&secp, sk);
+            let msg = Message::from_digest_slice(chal).expect("32-byte digest");
+            let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp);
+            let mut out = [0u8; 64];
+            out.copy_from_slice(sig.as_ref());
+            out
+        }
+
+        pub fn identity() -> (SecretKey, [u8; 32], [u8; 32], [u8; 32], String) {
+            let (sk, pk0) = sample_sk_pk();
+            let nk_commit = [0u8; 32];
+            // H(Pk0 ‖ nk_commit) with zero digest — same as ownership unit tests.
+            let mut pre = [0u8; 64];
+            pre[..32].copy_from_slice(&pk0);
+            pre[32..].copy_from_slice(&nk_commit);
+            let subject_raw: [u8; 32] = {
+                use sha2::{Digest, Sha256};
+                Sha256::digest(pre).into()
+            };
+            let subject_bech = encode_zk_address(&subject_raw);
+            (sk, pk0, nk_commit, subject_raw, subject_bech)
+        }
+    }
+
+    fn ownership_proof_json(
+        subject: &str,
+        pk0: &[u8; 32],
+        nkc: &[u8; 32],
+        sig: &[u8; 64],
+    ) -> Value {
+        serde_json::json!({
+            "type": "ownership",
+            "subject": subject,
+            "public_key": encode_hex(pk0),
+            "nk_commit": encode_hex(nkc),
+            "signature": encode_hex(sig),
+        })
+    }
+
+    #[tokio::test]
+    async fn attest_balance_valid_ownership_calls_kernel() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x11u8; 32];
+        let expiry = 1_700_000_060u64;
+        let asset = [0x22u8; 32];
+        let ceiling_enc = ceiling_encoding(None, None).unwrap();
+        let request_hash = attest_request_hash(&subject_raw, &asset, &ceiling_enc);
+        let cb = chan_bind_for_host(host);
+        let chal = ownership_challenge_message(
+            ChallengeDomain::AttestBalance.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+            &request_hash,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+
+        let kernel = Arc::new(ScriptedKernel {
+            attest: Some(Ok(JobHandle {
+                job_id: "attest-job-1".into(),
+                status: "accepted".into(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let body = serde_json::json!({
+            "subject": subject_bech,
+            "asset_id": encode_hex(&asset),
+            "challenge": {
+                "nonce": encode_hex(&nonce),
+                "expiry": expiry.to_string(),
+            },
+            "ownership_proof": ownership_proof_json(&subject_bech, &pk0, &nkc, &sig),
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/attest/balance")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["job_id"], "attest-job-1");
+        assert_eq!(kernel.attest_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn attest_balance_bad_signature_does_not_call_kernel() {
+        let host = "node.example.com";
+        let (_sk, pk0, nkc, _subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x11u8; 32];
+        let expiry = 1_700_000_060u64;
+        let asset = [0x22u8; 32];
+        let bad_sig = [0xFFu8; 64];
+
+        let kernel = Arc::new(ScriptedKernel {
+            attest: Some(Ok(JobHandle {
+                job_id: "should-not-run".into(),
+                status: "accepted".into(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let body = serde_json::json!({
+            "subject": subject_bech,
+            "asset_id": encode_hex(&asset),
+            "challenge": {
+                "nonce": encode_hex(&nonce),
+                "expiry": expiry.to_string(),
+            },
+            "ownership_proof": ownership_proof_json(&subject_bech, &pk0, &nkc, &bad_sig),
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/attest/balance")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+        assert_eq!(
+            kernel.attest_calls.load(Ordering::SeqCst),
+            0,
+            "failed signature must not reach AttestBalance (nonce not consumed)"
+        );
+        let _ = host; // documents the host used by test_config
+    }
+
+    /// Domain separation in both directions — the most important test of C1.
+    #[tokio::test]
+    async fn domain_separation_attest_signed_proof_does_not_authorise_grants() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x33u8; 32];
+        let expiry = 1_700_000_060u64;
+        let grantee = [0x44u8; 32];
+        let grant_expiry = 2_000_000_000u64;
+        let asset_enc = encode_grant_asset_ids(true, &[]).unwrap();
+        let request_hash = issue_grant_request_hash(
+            &subject_raw,
+            &grantee,
+            &asset_enc,
+            0,
+            SCOPE_NOT_AFTER_UNBOUNDED,
+            grant_expiry,
+        );
+        let cb = chan_bind_for_host(host);
+        // Sign under **AttestBalance** domain (wrong for /v1/grants).
+        let chal = ownership_challenge_message(
+            ChallengeDomain::AttestBalance.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+            &request_hash,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+
+        let kernel = Arc::new(ScriptedKernel {
+            issue_grant: Some(Ok(GrantResult {
+                grant: "zkgrant1qqqq".into(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let body = serde_json::json!({
+            "subject": subject_bech,
+            "grantee_pk": encode_hex(&grantee),
+            "scope": { "asset_ids": "*" },
+            "expiry": grant_expiry.to_string(),
+            "challenge": {
+                "nonce": encode_hex(&nonce),
+                "expiry": expiry.to_string(),
+            },
+            "ownership_proof": ownership_proof_json(&subject_bech, &pk0, &nkc, &sig),
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+        assert_eq!(
+            kernel.issue_grant_calls.load(Ordering::SeqCst),
+            0,
+            "attest-domain proof must not call IssueViewGrant"
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_separation_grant_signed_proof_does_not_authorise_attest() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x55u8; 32];
+        let expiry = 1_700_000_060u64;
+        let asset = [0x66u8; 32];
+        let ceiling_enc = ceiling_encoding(None, None).unwrap();
+        let request_hash = attest_request_hash(&subject_raw, &asset, &ceiling_enc);
+        let cb = chan_bind_for_host(host);
+        // Sign under **IssueGrant** domain (wrong for /v1/attest/balance).
+        let chal = ownership_challenge_message(
+            ChallengeDomain::IssueGrant.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+            &request_hash,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+
+        let kernel = Arc::new(ScriptedKernel {
+            attest: Some(Ok(JobHandle {
+                job_id: "nope".into(),
+                status: "accepted".into(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let body = serde_json::json!({
+            "subject": subject_bech,
+            "asset_id": encode_hex(&asset),
+            "challenge": {
+                "nonce": encode_hex(&nonce),
+                "expiry": expiry.to_string(),
+            },
+            "ownership_proof": ownership_proof_json(&subject_bech, &pk0, &nkc, &sig),
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/attest/balance")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(kernel.attest_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn wrong_chan_bind_rejects_without_kernel() {
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let signed_host = "other.example.com";
+        let nonce = [0x77u8; 32];
+        let expiry = 99u64;
+        let asset = [0x88u8; 32];
+        let ceiling_enc = ceiling_encoding(None, None).unwrap();
+        let request_hash = attest_request_hash(&subject_raw, &asset, &ceiling_enc);
+        let cb = chan_bind_for_host(signed_host);
+        let chal = ownership_challenge_message(
+            ChallengeDomain::AttestBalance.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+            &request_hash,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+
+        let kernel = Arc::new(ScriptedKernel {
+            attest: Some(Ok(JobHandle {
+                job_id: "x".into(),
+                status: "accepted".into(),
+            })),
+            ..Default::default()
+        });
+        // test_config serves node.example.com — signature bound to other host.
+        let app = build_router(test_config(), kernel.clone());
+        let body = serde_json::json!({
+            "subject": subject_bech,
+            "asset_id": encode_hex(&asset),
+            "challenge": {
+                "nonce": encode_hex(&nonce),
+                "expiry": expiry.to_string(),
+            },
+            "ownership_proof": ownership_proof_json(&subject_bech, &pk0, &nkc, &sig),
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/attest/balance")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(kernel.attest_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn wrong_request_hash_rejects_without_kernel() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x99u8; 32];
+        let expiry = 100u64;
+        let asset_signed = [0xAAu8; 32];
+        let asset_presented = [0xBBu8; 32];
+        let ceiling_enc = ceiling_encoding(None, None).unwrap();
+        let request_hash = attest_request_hash(&subject_raw, &asset_signed, &ceiling_enc);
+        let cb = chan_bind_for_host(host);
+        let chal = ownership_challenge_message(
+            ChallengeDomain::AttestBalance.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+            &request_hash,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+
+        let kernel = Arc::new(ScriptedKernel {
+            attest: Some(Ok(JobHandle {
+                job_id: "x".into(),
+                status: "accepted".into(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let body = serde_json::json!({
+            "subject": subject_bech,
+            "asset_id": encode_hex(&asset_presented),
+            "challenge": {
+                "nonce": encode_hex(&nonce),
+                "expiry": expiry.to_string(),
+            },
+            "ownership_proof": ownership_proof_json(&subject_bech, &pk0, &nkc, &sig),
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/attest/balance")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(kernel.attest_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn expired_challenge_is_passthrough_from_kernel() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0xCCu8; 32];
+        let expiry = 1_700_000_060u64;
+        let asset = [0xDDu8; 32];
+        let ceiling_enc = ceiling_encoding(None, None).unwrap();
+        let request_hash = attest_request_hash(&subject_raw, &asset, &ceiling_enc);
+        let cb = chan_bind_for_host(host);
+        let chal = ownership_challenge_message(
+            ChallengeDomain::AttestBalance.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+            &request_hash,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+
+        // Signature is valid; kernel reports challenge_expired via ErrorInfo.
+        let expired = encode_kernel_error_status(
+            tonic::Code::FailedPrecondition,
+            "challenge nonce expired",
+            "challenge_expired",
+            410,
+        );
+        let kernel = Arc::new(ScriptedKernel {
+            attest: Some(Err(crate::kernel::kernel_status_to_api_error(&expired))),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let body = serde_json::json!({
+            "subject": subject_bech,
+            "asset_id": encode_hex(&asset),
+            "challenge": {
+                "nonce": encode_hex(&nonce),
+                "expiry": expiry.to_string(),
+            },
+            "ownership_proof": ownership_proof_json(&subject_bech, &pk0, &nkc, &sig),
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/attest/balance")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::GONE);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "challenge_expired");
+        assert_eq!(kernel.attest_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn grant_proof_type_is_unauthorized_without_kernel() {
+        let (_sk, pk0, nkc, _subject_raw, subject_bech) = ownership_fixtures::identity();
+        let kernel = Arc::new(ScriptedKernel {
+            attest: Some(Ok(JobHandle {
+                job_id: "x".into(),
+                status: "accepted".into(),
+            })),
+            issue_grant: Some(Ok(GrantResult {
+                grant: "zkgrant1".into(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let body = serde_json::json!({
+            "subject": subject_bech,
+            "asset_id": encode_hex(&[0u8; 32]),
+            "challenge": {
+                "nonce": encode_hex(&[1u8; 32]),
+                "expiry": "100",
+            },
+            "ownership_proof": {
+                "type": "grant",
+                "subject": subject_bech,
+                "public_key": encode_hex(&pk0),
+                "nk_commit": encode_hex(&nkc),
+                "signature": encode_hex(&[0u8; 64]),
+            },
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/attest/balance")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+        assert!(json["message"].as_str().unwrap().contains("GrantProof"));
+        assert_eq!(kernel.attest_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(kernel.issue_grant_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn grants_valid_ownership_calls_kernel() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0xEEu8; 32];
+        let challenge_expiry = 1_700_000_060u64;
+        let grantee = [0xFFu8; 32];
+        let grant_expiry = 2_000_000_000u64;
+        let asset_enc = encode_grant_asset_ids(true, &[]).unwrap();
+        let request_hash = issue_grant_request_hash(
+            &subject_raw,
+            &grantee,
+            &asset_enc,
+            0,
+            SCOPE_NOT_AFTER_UNBOUNDED,
+            grant_expiry,
+        );
+        let cb = chan_bind_for_host(host);
+        let chal = ownership_challenge_message(
+            ChallengeDomain::IssueGrant.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            challenge_expiry,
+            &request_hash,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+
+        let kernel = Arc::new(ScriptedKernel {
+            issue_grant: Some(Ok(GrantResult {
+                grant: "zkgrant1qpvalid".into(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let body = serde_json::json!({
+            "subject": subject_bech,
+            "grantee_pk": encode_hex(&grantee),
+            "scope": { "asset_ids": "*" },
+            "expiry": grant_expiry.to_string(),
+            "challenge": {
+                "nonce": encode_hex(&nonce),
+                "expiry": challenge_expiry.to_string(),
+            },
+            "ownership_proof": ownership_proof_json(&subject_bech, &pk0, &nkc, &sig),
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["grant"], "zkgrant1qpvalid");
+        assert_eq!(kernel.issue_grant_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn challenge_endpoints_return_endpoint_domain() {
+        let (_, _, _, _, subject_bech) = ownership_fixtures::identity();
+        let kernel = Arc::new(ScriptedKernel {
+            open_challenge: Some(Ok(Challenge {
+                nonce: vec![0xABu8; 32],
+                expiry: 1_700_000_060,
+                domain: ATTEST_BALANCE_CHALLENGE_DOMAIN.to_string(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/attest/balance/challenge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "subject": subject_bech }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["domain"], ATTEST_BALANCE_CHALLENGE_DOMAIN);
+        assert_eq!(json["expiry"], "1700000060");
+        assert_eq!(json["nonce"].as_str().unwrap().len(), 64);
+        assert_eq!(kernel.open_challenge_calls.load(Ordering::SeqCst), 1);
+
+        let kernel2 = Arc::new(ScriptedKernel {
+            open_challenge: Some(Ok(Challenge {
+                nonce: vec![0xCDu8; 32],
+                expiry: 1_700_000_120,
+                domain: ISSUE_GRANT_CHALLENGE_DOMAIN.to_string(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel2);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants/challenge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "subject": subject_bech }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["domain"], ISSUE_GRANT_CHALLENGE_DOMAIN);
     }
 }
