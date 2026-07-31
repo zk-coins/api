@@ -705,18 +705,34 @@ pub fn verify_pull_ownership_proof(
 /// Reject a GrantProof on the pull path (fail-closed, not half-checked).
 ///
 /// §5.1(b) requires verifying the grant's `op` signature against the subject's
-/// **published** `op` pubkey. This process holds no protocol state and has no
-/// kernel RPC that returns `op_pubkey` for a subject, so that check cannot be
-/// built here. A half-checked grant (structural + grantee chal only) would
-/// authorise disclosure under a forged `op` signature — worse than a loud
-/// reject. All grant pull attempts therefore fail with `401 unauthorized`.
+/// **published** `op` pubkey. A half-checked grant (structural + grantee chal
+/// only) would authorise disclosure under a forged `op` signature — worse than
+/// a loud reject. All grant pull attempts therefore fail with `401 unauthorized`.
+///
+/// # The missing prerequisite is Nostr, not a config field
+///
+/// `op` is **node-held** (§1.2 key-custody table) and is published as the author
+/// of the subject's kind-0 profile (§7.3, §4.3). A node the subject does not
+/// control therefore cannot be handed `op_pubkey` as an operator setting, and no
+/// kernel RPC can supply it either — the kernel knows its **own** `op`, not a
+/// foreign subject's. Obtaining it means resolving that profile and running the
+/// §4.3 address binding on the result: `H(pk0 ‖ nk_commit) == subject`, `addr_sig`
+/// under `pk0`, and the event signature under the author `op_pubkey`. Without all
+/// three, an attacker who knows the subject's public `pk0` / `nk_commit` publishes
+/// a profile naming their own `op_pubkey` and the grant check verifies against the
+/// forger's key.
+///
+/// So the prerequisite is a **Nostr profile-resolution path** — the same one the
+/// bundle delivery (§4.2) and recovery (§4.5) wait on — not a lookup that could be
+/// bolted onto this process.
 ///
 /// Takes the proof so the call site cannot "forget" to name the grant shape
 /// (and so tests can assert the reject path against a concrete body).
 pub fn reject_grant_proof(_proof: &GrantProofJson) -> ApiError {
     ApiError::unauthorized(
-        "GrantProof is not accepted: the API cannot verify the grant's op signature \
-         without the subject's published op_pubkey (no lookup path in this stage); \
+        "GrantProof is not accepted: verifying the grant's op signature needs the subject's \
+         published op_pubkey, which is the author of its kind-0 Nostr profile (§7.3) and is \
+         reachable only through profile resolution plus the §4.3 address binding — not built; \
          half-checked grants are forbidden (§5.1(b))",
     )
 }

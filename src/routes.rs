@@ -2844,7 +2844,9 @@ mod tests {
 
     #[tokio::test]
     async fn pull_grant_proof_is_rejected_without_kernel_call() {
-        // Befund: no op_pubkey lookup → GrantProof always 401, never half-checked.
+        // Befund: the subject's published op_pubkey lives in its kind-0 Nostr
+        // profile (§7.3) and there is no profile-resolution path → GrantProof
+        // always 401, never half-checked. See `reject_grant_proof`.
         let kernel = Arc::new(ScriptedKernel {
             pull: Some(Ok(sample_pull_result())),
             ..Default::default()
