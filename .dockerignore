@@ -1,0 +1,24 @@
+# Build context exclusions for the api image.
+# Keep the context small and avoid shipping host build artefacts or stores.
+
+# Rust build output
+target/
+
+# VCS
+.git/
+.gitignore
+
+# Local Blossom content-addressed store (operator path; never bake into image)
+# Matches common local paths used with ZKCOINS_BLOSSOM_STORE.
+data/
+blossom/
+**/blossom-store/
+
+# Secrets / local env (if present)
+.env
+.env.*
+*.pem
+
+# Editor / OS noise
+.DS_Store
+**/.DS_Store
