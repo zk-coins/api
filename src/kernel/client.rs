@@ -11,10 +11,10 @@ use crate::kernel::pb::kernel_v1::kernel_client::KernelClient as TonicKernelClie
 use crate::kernel::pb::kernel_v1::{
     AccountStateRequest, AccountStateResult, AccumulatorTip, AttestRequest, Challenge,
     CoinProofBlob, CoinProofRequest, EntrustRequest, EntrustResult, GetAccumulatorRequest,
-    GetInfoRequest, GrantRequest, GrantResult, Info, Job, JobEvent, JobHandle, JobRequest,
-    NullifierPath, NullifierPathRequest, PublishRequest, PublishResult, PullChallengeRequest,
-    PullRequest, PullResult, RecordBlob, RecordRequest, RevokeRequest, RevokeResult, SignRequest,
-    TransitionRequest,
+    GetInfoRequest, GrantRequest, GrantResult, Info, Inscription, Job, JobEvent, JobHandle,
+    JobRequest, ListInscriptionsRequest, NullifierPath, NullifierPathRequest, PublishRequest,
+    PublishResult, PullChallengeRequest, PullRequest, PullResult, RecordBlob, RecordRequest,
+    RevokeRequest, RevokeResult, SignRequest, TransitionRequest,
 };
 use crate::ownership::SessionAuthority;
 use async_trait::async_trait;
@@ -50,6 +50,13 @@ pub trait KernelRpc: Send + Sync {
     async fn get_info(&self) -> Result<Info, ApiError>;
 
     async fn get_accumulator(&self) -> Result<AccumulatorTip, ApiError>;
+
+    /// Server-stream of inscriptions from an inclusive triple cursor (§7.8).
+    /// The REST handler collects the stream into one page.
+    async fn list_inscriptions(
+        &self,
+        req: ListInscriptionsRequest,
+    ) -> Result<BoxStream<'static, Result<Inscription, ApiError>>, ApiError>;
 
     async fn get_nullifier_path(
         &self,
@@ -231,6 +238,22 @@ impl KernelRpc for KernelClient {
             .await
             .map_err(map_status)?;
         Ok(response.into_inner())
+    }
+
+    async fn list_inscriptions(
+        &self,
+        req: ListInscriptionsRequest,
+    ) -> Result<BoxStream<'static, Result<Inscription, ApiError>>, ApiError> {
+        let mut client = self.inner.clone();
+        let response = client
+            .list_inscriptions(Request::new(req))
+            .await
+            .map_err(map_status)?;
+        let stream = response.into_inner().map(|item| match item {
+            Ok(ins) => Ok(ins),
+            Err(status) => Err(kernel_status_to_api_error(&status)),
+        });
+        Ok(Box::pin(stream))
     }
 
     async fn get_nullifier_path(

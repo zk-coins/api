@@ -35,6 +35,13 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, "malformed_request", message)
     }
 
+    /// §7.5 `bounds_exceeded` / 400 — numeric but outside the closed range
+    /// (e.g. `limit` ∉ `1..=1000`). Distinct from `malformed_request`, which
+    /// covers non-numeric / overflowing query values.
+    pub fn bounds_exceeded(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "bounds_exceeded", message)
+    }
+
     /// §7.5 `unauthorized` / 401 — API-edge OwnershipProof / capability failures
     /// (wrong domain, bad signature, GrantProof, address mismatch, chan_bind).
     ///

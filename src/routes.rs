@@ -98,8 +98,6 @@ pub const CLOSED_ENDPOINT_KEYS: &[(&str, &str)] = &[
 /// Surfaces intentionally **not** registered (and therefore omitted from
 /// `GET /`), with the reason each stays off the map:
 ///
-/// - `chain_inscriptions` — kernel `ListInscriptions` is Unimplemented until a
-///   scanner-written inscription catalog (reveal txid + §3.5 format) exists.
 /// - `receipts_stream` — kernel `SubscribeReceipts` is Unimplemented; the node
 ///   names the missing push/source prerequisite. A REST shell would only 501.
 /// - `blossom_get` / `blossom_head` / `blossom_upload` / `blossom_delete` —
@@ -108,13 +106,15 @@ pub const CLOSED_ENDPOINT_KEYS: &[(&str, &str)] = &[
 ///   streets that do not exist.
 ///
 /// Inventory keys remain in [`CLOSED_ENDPOINT_KEYS`]; advertisement tracks
-/// [`ServedSurface::ALL`] only.
+/// [`ServedSurface::ALL`] only. `chain_inscriptions` is registered once the
+/// node inscription catalog backs `ListInscriptions`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServedSurface {
     Health,
     HealthReady,
     Info,
     ChainAccumulator,
+    ChainInscriptions,
     ChainNullifier,
     Tx,
     Jobs,
@@ -143,6 +143,7 @@ impl ServedSurface {
         ServedSurface::HealthReady,
         ServedSurface::Info,
         ServedSurface::ChainAccumulator,
+        ServedSurface::ChainInscriptions,
         ServedSurface::ChainNullifier,
         ServedSurface::Tx,
         ServedSurface::Jobs,
@@ -171,6 +172,7 @@ impl ServedSurface {
             ServedSurface::HealthReady => "health_ready",
             ServedSurface::Info => "info",
             ServedSurface::ChainAccumulator => "chain_accumulator",
+            ServedSurface::ChainInscriptions => "chain_inscriptions",
             ServedSurface::ChainNullifier => "chain_nullifier",
             ServedSurface::Tx => "tx",
             ServedSurface::Jobs => "jobs",
@@ -204,6 +206,7 @@ impl ServedSurface {
             ServedSurface::HealthReady => router.route(&path, get(info::health_ready)),
             ServedSurface::Info => router.route(&path, get(info::get_info)),
             ServedSurface::ChainAccumulator => router.route(&path, get(chain::get_accumulator)),
+            ServedSurface::ChainInscriptions => router.route(&path, get(chain::list_inscriptions)),
             ServedSurface::ChainNullifier => router.route(&path, get(chain::get_nullifier)),
             ServedSurface::Tx => router.route(&path, post(jobs::post_tx)),
             ServedSurface::Jobs => router.route(&path, get(jobs::get_job)),
@@ -372,8 +375,9 @@ mod tests {
     use crate::kernel::kernel_v1::{
         AccountStateRequest, AccountStateResult, AccumulatorTip, AttestRequest, BootstrapManifest,
         Challenge, CoinProofBlob, CoinProofRequest, EntrustRequest, EntrustResult, GrantRequest,
-        GrantResult, Info, Job, JobEvent, JobHandle, JobRequest, NullifierPath,
-        NullifierPathRequest, PublishRequest, PublishResult, PullChallengeRequest, PullRequest,
+        GrantResult, Info, Inscription, Job, JobEvent, JobHandle, JobRequest,
+        ListInscriptionsRequest, Nullifier as ProtoNullifier, NullifierPath, NullifierPathRequest,
+        PublishRequest, PublishResult, PullChallengeRequest, PullRequest,
         PullResult as ProtoPullResult, RecordBlob, RecordRequest, RevokeRequest, RevokeResult,
         SignRequest, TransitionRequest,
     };
@@ -429,6 +433,14 @@ mod tests {
         async fn get_accumulator(&self) -> Result<AccumulatorTip, ApiError> {
             Err(ApiError::internal(
                 "test double: get_accumulator not configured",
+            ))
+        }
+        async fn list_inscriptions(
+            &self,
+            _req: ListInscriptionsRequest,
+        ) -> Result<BoxStream<'static, Result<Inscription, ApiError>>, ApiError> {
+            Err(ApiError::internal(
+                "test double: list_inscriptions not configured",
             ))
         }
         async fn get_nullifier_path(
@@ -644,6 +656,7 @@ mod tests {
                 "health_ready",
                 "info",
                 "chain_accumulator",
+                "chain_inscriptions",
                 "chain_nullifier",
                 "tx",
                 "jobs",
@@ -664,7 +677,7 @@ mod tests {
                 "bootstrap_entrust",
                 "bootstrap_revoke",
             ]),
-            "stage D adds bootstrap_* and publish_spendrecord"
+            "chain_inscriptions is served once ListInscriptions is catalog-backed"
         );
         assert_eq!(
             endpoints["bootstrap_challenge"].as_str(),
@@ -684,7 +697,6 @@ mod tests {
         );
         // Unbuilt surfaces stay off discovery (documented in ServedSurface).
         for absent in [
-            "chain_inscriptions",
             "receipts_stream",
             "blossom_get",
             "blossom_head",
@@ -696,6 +708,11 @@ mod tests {
                 "unbuilt surface {absent} must stay unadvertised"
             );
         }
+        assert_eq!(
+            endpoints["chain_inscriptions"].as_str(),
+            Some("/v1/chain/inscriptions"),
+            "chain_inscriptions must be advertised once ListInscriptions is served"
+        );
         assert_eq!(
             endpoints["attest_balance_challenge"].as_str(),
             Some("/v1/attest/balance/challenge")
@@ -720,10 +737,10 @@ mod tests {
             endpoints["account_state"].as_str(),
             Some("/v1/account/state")
         );
-        // chain_inscriptions must not be advertised until ListInscriptions exists.
+        // chain_inscriptions is advertised — the node catalog backs ListInscriptions.
         assert!(
-            !endpoints.contains_key("chain_inscriptions"),
-            "chain_inscriptions must stay unadvertised while the node catalog is missing"
+            endpoints.contains_key("chain_inscriptions"),
+            "chain_inscriptions must be advertised while the node catalog is present"
         );
         assert_eq!(
             endpoints["health"].as_str(),
@@ -910,9 +927,13 @@ mod tests {
 
     #[tokio::test]
     async fn chain_inscriptions_is_404_and_absent_from_discovery() {
-        // Documented omission: ListInscriptions is Unimplemented in the node
-        // (no scanner catalog). REST must not advertise or soft-serve it.
-        let app = test_app();
+        // Renamed historically: the route is registered, returns a page, and
+        // the discovery key is present. The node catalog backs ListInscriptions.
+        let kernel = ScriptedKernel {
+            list_inscriptions: Some(Ok(Vec::new())),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
         let res = app
             .oneshot(
                 Request::builder()
@@ -924,8 +945,21 @@ mod tests {
             .unwrap();
         assert_eq!(
             res.status(),
-            StatusCode::NOT_FOUND,
-            "GET /v1/chain/inscriptions must not be registered without a catalog"
+            StatusCode::OK,
+            "GET /v1/chain/inscriptions must be registered and return a page"
+        );
+        let body = body_bytes(res).await;
+        let json: Value = serde_json::from_slice(&body).expect("JSON page body");
+        assert_eq!(
+            json["inscriptions"],
+            serde_json::json!([]),
+            "empty catalog is an empty list, not 404"
+        );
+        assert!(
+            json.get("next_height").is_none()
+                && json.get("next_tx_index").is_none()
+                && json.get("next_vin_index").is_none(),
+            "empty page must omit all three next_* fields, got {json}"
         );
 
         let app = test_app();
@@ -937,8 +971,12 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).expect("JSON root body");
         let endpoints = json["endpoints"].as_object().expect("endpoints object");
         assert!(
-            !endpoints.contains_key("chain_inscriptions"),
-            "unbuilt surface 'chain_inscriptions' must be omitted from GET / endpoints"
+            endpoints.contains_key("chain_inscriptions"),
+            "served surface 'chain_inscriptions' must appear in GET / endpoints"
+        );
+        assert_eq!(
+            endpoints["chain_inscriptions"].as_str(),
+            Some("/v1/chain/inscriptions")
         );
         assert!(
             endpoints.contains_key("info"),
@@ -1021,6 +1059,8 @@ mod tests {
         cancel: Option<Result<Job, ApiError>>,
         info: Option<Result<Info, ApiError>>,
         accumulator: Option<Result<AccumulatorTip, ApiError>>,
+        /// Full catalog; the double filters by inclusive triple + limit.
+        list_inscriptions: Option<Result<Vec<Inscription>, ApiError>>,
         nullifier_path: Option<Result<NullifierPath, ApiError>>,
         open_challenge: Option<Result<Challenge, ApiError>>,
         attest: Option<Result<JobHandle, ApiError>>,
@@ -1043,6 +1083,7 @@ mod tests {
         entrust_calls: AtomicUsize,
         revoke_calls: AtomicUsize,
         publish_calls: AtomicUsize,
+        list_inscriptions_calls: AtomicUsize,
         /// Last pull authority observed (for grant/ownership plumbing asserts).
         last_pull_authority: Mutex<Option<SessionAuthority>>,
         /// Last OpenPullChallenge.action observed (bootstrap domain plumbing).
@@ -1051,6 +1092,8 @@ mod tests {
         last_entrust: Mutex<Option<EntrustRequest>>,
         last_revoke: Mutex<Option<RevokeRequest>>,
         last_publish: Mutex<Option<PublishRequest>>,
+        /// Last ListInscriptions request (limit / cursor plumbing).
+        last_list_inscriptions: Mutex<Option<ListInscriptionsRequest>>,
     }
 
     #[async_trait]
@@ -1108,6 +1151,44 @@ mod tests {
                 Some(Ok(t)) => Ok(t.clone()),
                 Some(Err(e)) => Err(e.clone()),
                 None => Err(ApiError::internal("accumulator not scripted")),
+            }
+        }
+        async fn list_inscriptions(
+            &self,
+            req: ListInscriptionsRequest,
+        ) -> Result<BoxStream<'static, Result<Inscription, ApiError>>, ApiError> {
+            self.list_inscriptions_calls.fetch_add(1, Ordering::SeqCst);
+            // ListInscriptionsRequest is Copy (scalar Option fields only).
+            *self
+                .last_list_inscriptions
+                .lock()
+                .expect("list_inscriptions mutex") = Some(req);
+            match &self.list_inscriptions {
+                Some(Ok(catalog)) => {
+                    // §7.5 defaults (same as API normalisation before RPC /
+                    // ListInscriptionsRequest proto comment). Named so the
+                    // protocol values stay visible — not unwrap_or_default().
+                    const DEFAULT_FROM_HEIGHT: u64 = 0;
+                    const DEFAULT_FROM_TX_INDEX: u64 = 0;
+                    const DEFAULT_FROM_VIN_INDEX: u64 = 0;
+                    const DEFAULT_LIMIT: u32 = 100;
+                    let from_h = req.from_height.unwrap_or(DEFAULT_FROM_HEIGHT);
+                    let from_t = req.from_tx_index.unwrap_or(DEFAULT_FROM_TX_INDEX);
+                    let from_v = req.from_vin_index.unwrap_or(DEFAULT_FROM_VIN_INDEX);
+                    let limit = req.limit.unwrap_or(DEFAULT_LIMIT) as usize;
+                    let items: Vec<Result<Inscription, ApiError>> = catalog
+                        .iter()
+                        .filter(|ins| {
+                            (ins.height, ins.tx_index, ins.vin_index) >= (from_h, from_t, from_v)
+                        })
+                        .take(limit)
+                        .cloned()
+                        .map(Ok)
+                        .collect();
+                    Ok(Box::pin(stream::iter(items)))
+                }
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal("list_inscriptions not scripted")),
             }
         }
         async fn get_nullifier_path(
@@ -3986,8 +4067,252 @@ mod tests {
         assert!(!endpoints.contains_key("receipts_stream"));
         assert!(!endpoints.contains_key("blossom_get"));
         assert!(!endpoints.contains_key("blossom_upload"));
-        assert!(!endpoints.contains_key("chain_inscriptions"));
+        assert!(
+            endpoints.contains_key("chain_inscriptions"),
+            "chain_inscriptions is served and must appear in discovery"
+        );
         assert!(endpoints.contains_key("bootstrap_entrust"));
         assert!(endpoints.contains_key("publish_spendrecord"));
+    }
+
+    // -----------------------------------------------------------------------
+    // chain_inscriptions HTTP surface
+    // -----------------------------------------------------------------------
+
+    fn sample_inscription_http(
+        height: u64,
+        tx_index: u64,
+        vin_index: u64,
+        confirmation_state: &str,
+        member_states: &[&str],
+    ) -> Inscription {
+        let mut txid = vec![0u8; 32];
+        for (i, b) in txid.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_add(0x40);
+        }
+        let nullifiers: Vec<ProtoNullifier> = member_states
+            .iter()
+            .enumerate()
+            .map(|(i, state)| ProtoNullifier {
+                pubkey: vec![0xA0 + i as u8; 32],
+                r: vec![0xB0 + i as u8; 32],
+                state: (*state).to_string(),
+            })
+            .collect();
+        Inscription {
+            txid,
+            height,
+            count: nullifiers.len() as u32,
+            format: 1,
+            nullifiers,
+            confirmation_state: confirmation_state.to_string(),
+            tx_index,
+            vin_index,
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_inscriptions_failed_member_completed_confirmation() {
+        // The decisive state split: a later Pk collision is failed while the
+        // reveal-tx confirmation depth is independently completed.
+        let kernel = ScriptedKernel {
+            list_inscriptions: Some(Ok(vec![sample_inscription_http(
+                50,
+                1,
+                0,
+                "completed",
+                &["pending", "failed"],
+            )])),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/chain/inscriptions?limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        let ins = &json["inscriptions"][0];
+        assert_eq!(ins["confirmation_state"], "completed");
+        assert_eq!(ins["nullifiers"][0]["state"], "pending");
+        assert_eq!(ins["nullifiers"][1]["state"], "failed");
+        assert!(
+            json.get("next_height").is_none(),
+            "single-page result must omit next_*"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_inscriptions_mid_tx_pagination_three_pages() {
+        // Reveal tx (10,0) carries vin 0/1/2; page boundary cuts between them.
+        let catalog = vec![
+            sample_inscription_http(10, 0, 0, "completed", &["completed"]),
+            sample_inscription_http(10, 0, 1, "completed", &["completed"]),
+            sample_inscription_http(10, 0, 2, "completed", &["failed"]),
+            sample_inscription_http(11, 0, 0, "pending", &["pending"]),
+        ];
+        let kernel = Arc::new(ScriptedKernel {
+            list_inscriptions: Some(Ok(catalog)),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+
+        // Page 1
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/chain/inscriptions?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let p1: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(p1["inscriptions"].as_array().unwrap().len(), 1);
+        assert_eq!(p1["inscriptions"][0]["vin_index"], 0);
+        assert_eq!(p1["next_height"], 10);
+        assert_eq!(p1["next_tx_index"], 0);
+        assert_eq!(p1["next_vin_index"], 1);
+        // PAGE_LOOKAHEAD: kernel received limit+1
+        // Option<ListInscriptionsRequest> is Copy — take by value, no clone.
+        let last_req =
+            (*kernel.last_list_inscriptions.lock().expect("mutex")).expect("list called");
+        assert_eq!(last_req.limit, Some(2), "PAGE_LOOKAHEAD sends limit+1");
+
+        // Page 2 — exclusive next of p1 is inclusive from
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/chain/inscriptions?from_height=10&from_tx_index=0&from_vin_index=1&limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let p2: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(p2["inscriptions"][0]["vin_index"], 1);
+        assert_eq!(p2["inscriptions"][0]["height"], 10);
+        assert_eq!(p2["inscriptions"][0]["tx_index"], 0);
+        assert_eq!(p2["next_height"], 10);
+        assert_eq!(p2["next_tx_index"], 0);
+        assert_eq!(p2["next_vin_index"], 2);
+
+        // Page 3
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/chain/inscriptions?from_height=10&from_tx_index=0&from_vin_index=2&limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let p3: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(p3["inscriptions"][0]["vin_index"], 2);
+        assert_eq!(p3["next_height"], 11);
+        assert_eq!(p3["next_tx_index"], 0);
+        assert_eq!(p3["next_vin_index"], 0);
+        // Three distinct triples, mid-tx split, no gap between p1→p2→p3.
+        // Typed .get/.as_u64 — Index sugar yields a place of type Value; packing
+        // three places into a by-value tuple would move out of the JSON tree.
+        let vin_at = |page: &Value, label: &str| -> u64 {
+            page.get("inscriptions")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|ins| ins.get("vin_index"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or_else(|| {
+                    panic!("{label}: inscriptions[0].vin_index must be present as u64")
+                })
+        };
+        assert_eq!(
+            (vin_at(&p1, "p1"), vin_at(&p2, "p2"), vin_at(&p3, "p3")),
+            (0, 1, 2),
+            "mid-reveal-tx pages must cover vin 0,1,2 without gap or duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_inscriptions_limit_zero_is_bounds_exceeded() {
+        let kernel = ScriptedKernel {
+            list_inscriptions: Some(Ok(Vec::new())),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/chain/inscriptions?limit=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "bounds_exceeded");
+        assert!(
+            json["message"].as_str().unwrap().contains("limit"),
+            "message must name limit, got {}",
+            json["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_inscriptions_limit_non_numeric_is_malformed() {
+        let kernel = ScriptedKernel {
+            list_inscriptions: Some(Ok(Vec::new())),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/chain/inscriptions?limit=nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+    }
+
+    #[tokio::test]
+    async fn chain_inscriptions_defaults_normalised_before_rpc() {
+        let kernel = Arc::new(ScriptedKernel {
+            list_inscriptions: Some(Ok(Vec::new())),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/chain/inscriptions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        // Option<ListInscriptionsRequest> is Copy — take by value, no clone.
+        let req = (*kernel.last_list_inscriptions.lock().expect("mutex")).expect("list called");
+        // API normalises defaults before RPC — all fields are Some.
+        assert_eq!(req.from_height, Some(0));
+        assert_eq!(req.from_tx_index, Some(0));
+        assert_eq!(req.from_vin_index, Some(0));
+        // PAGE_LOOKAHEAD: default rest limit 100 → kernel limit 101
+        assert_eq!(req.limit, Some(101));
     }
 }

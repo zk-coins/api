@@ -152,6 +152,7 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Replica-/Blob-Pfad).
 | `GET /` | **implementiert** — `{ name, version, endpoints }` mit **genau** den Flächen, die dieser Prozess registriert (`ServedSurface`). Inventur der 29 Keys in `CLOSED_ENDPOINT_KEYS`; unregistrierte Keys werden weggelassen. |
 | `GET /v1/info` | **implementiert** — Kernel-`GetInfo` + API-eigene `features` aus `ZKCOINS_FEATURES` (`kernel_parts` bleibt intern). |
 | `GET /v1/chain/accumulator` | **implementiert** — `GetAccumulator`; `root` ist pass-through der Kernel-`nav_root`, keine Nachrechnung. |
+| `GET /v1/chain/inscriptions` | **implementiert** — `ListInscriptions` (Server-Stream → eine Seite); Triple-Cursor ganz-oder-gar-nicht; leerer Katalog → leere Liste (kein 404). |
 | `GET /v1/chain/nullifier/<pubkey>` | **implementiert** — `GetNullifierPath`; `present`/`absent` bleiben getrennt; Kernel-`internal_error` wird **nicht** als absent umgeschrieben. |
 | `POST /v1/tx` | **implementiert** — `SubmitTransition` |
 | `GET /v1/jobs/{job_id}` | **implementiert** — `GetJob` |
@@ -177,7 +178,6 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Replica-/Blob-Pfad).
 
 | Key | Warum |
 |---|---|
-| `chain_inscriptions` | Kernel-`ListInscriptions` Unimplemented bis Inschriften-Katalog (Reveal-Txid + §3.5). |
 | `receipts_stream` | Kernel-`SubscribeReceipts` Unimplemented; der node nennt die fehlende Push-/Quell-Voraussetzung. |
 | `blossom_get` / `blossom_head` / `blossom_upload` / `blossom_delete` | §7.4; im node gibt es keinen Blossom-Pfad, Recovery ist nicht implementiert. |
 
@@ -195,7 +195,6 @@ ausschließlich über `google.rpc.ErrorInfo` (`domain`, `reason`,
 
 | Lücke | Warum |
 |---|---|
-| `GET /v1/chain/inscriptions` | Kernel-`ListInscriptions` Unimplemented bis Inschriften-Katalog. |
 | `GET /v1/receipts/stream` | Kernel-`SubscribeReceipts` Unimplemented. |
 | Blossom (`/blossom/*`) | Kein Blossom-Pfad im node; Recovery nicht implementiert. |
 | Feature-Gate `404 feature_disabled` | Bootstrap/Publish/Job/Attest-Fläche ist in dieser Stufe always-on; Gate folgt mit den optionalen Rollen. |
