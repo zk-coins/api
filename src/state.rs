@@ -2,9 +2,10 @@
 //!
 //! Handlers that need only the kernel extract `State<KernelHandle>` via
 //! [`FromRef`]; handlers that also need API-owned config (e.g. `features`
-//! for `GET /v1/info`, `public_hosts` for OwnershipProof `chan_bind`)
-//! extract `State<AppState>`.
+//! for `GET /v1/info`, `public_hosts` for OwnershipProof `chan_bind`,
+//! optional Blossom store) extract `State<AppState>`.
 
+use crate::blossom::BlossomState;
 use crate::config::Feature;
 use crate::kernel::KernelHandle;
 use axum::extract::FromRef;
@@ -21,6 +22,9 @@ pub struct AppState {
     /// Authoritative public hostnames for §5.1 `chan_bind`
     /// (`ZKCOINS_PUBLIC_HOST`). Never derived from request headers.
     pub public_hosts: Arc<Vec<String>>,
+    /// §7.4 Blossom surface. `None` when `ZKCOINS_BLOSSOM_STORE` is unset —
+    /// routes are not mounted and discovery keys are not advertised.
+    pub blossom: Option<BlossomState>,
 }
 
 impl FromRef<AppState> for KernelHandle {

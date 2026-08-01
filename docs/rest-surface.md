@@ -172,6 +172,7 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Replica-/Blob-Pfad).
 | `POST /v1/bootstrap/entrust` | **implementiert** — OwnershipProof (Entrust-Domain) + Bundle-Längenprüfung (161 B), dann `EntrustOperationalBundle`; Bundle wird nie geloggt |
 | `POST /v1/bootstrap/revoke` | **implementiert** — OwnershipProof (Revoke-Domain), dann `RevokeOperationalBundle` |
 | `POST /v1/publish/spendrecord` | **implementiert** — `Publish`; Ablehnung → HTTP 200 `{accepted:false, reason}`; v1-Fee-Felder → 400 |
+| `GET`/`HEAD`/`DELETE /blossom/<sha256>`, `PUT`/`POST /blossom/upload` | **implementiert** wenn `ZKCOINS_BLOSSOM_STORE` gesetzt — API-lokaler inhaltsadressierter Store (§7.4); kein Kernel-RPC; ohne Store unregistriert |
 | alle übrigen Method+Path | **nicht registriert** — kein Handler, kein `todo!()`, kein Platzhalter |
 
 **Bewusst nicht beworben:**
@@ -179,7 +180,7 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Replica-/Blob-Pfad).
 | Key | Warum |
 |---|---|
 | `receipts_stream` | Kernel-`SubscribeReceipts` Unimplemented; der node nennt die fehlende Push-/Quell-Voraussetzung. |
-| `blossom_get` / `blossom_head` / `blossom_upload` / `blossom_delete` | §7.4; im node gibt es keinen Blossom-Pfad, Recovery ist nicht implementiert. |
+| `blossom_*` (ohne `ZKCOINS_BLOSSOM_STORE`) | §7.4; die vier Schlüssel werden **nur** advertised, wenn der inhaltsadressierte Store konfiguriert ist. |
 
 Router und Discovery teilen eine Quelle (`ServedSurface` in `src/routes.rs`): eine neue
 registrierte Fläche erscheint automatisch in `GET /`; ein Inventur-Key ohne Route
@@ -196,7 +197,7 @@ ausschließlich über `google.rpc.ErrorInfo` (`domain`, `reason`,
 | Lücke | Warum |
 |---|---|
 | `GET /v1/receipts/stream` | Kernel-`SubscribeReceipts` Unimplemented. |
-| Blossom (`/blossom/*`) | Kein Blossom-Pfad im node; Recovery nicht implementiert. |
+| Blossom `ReplicaReceiptV1` | §4.6 Dual-Commit (Blob + Delivery-Event) fehlt; Upload antwortet ehrlich nur mit `{ blob_id }` — kein `receipt`. |
 | Feature-Gate `404 feature_disabled` | Bootstrap/Publish/Job/Attest-Fläche ist in dieser Stufe always-on; Gate folgt mit den optionalen Rollen. |
 
 ---
@@ -209,3 +210,11 @@ ausschließlich über `google.rpc.ErrorInfo` (`domain`, `reason`,
 | `ZKCOINS_KERNEL_ADDR` | Adresse des Kernel-gRPC (z. B. `http://127.0.0.1:50051`). **Kein Default.** Pflicht, auch wenn dieser Scaffold den Kanal noch nicht öffnet — Start ohne konfigurierte Kernel-Adresse ist unzulässig. |
 | `ZKCOINS_FEATURES` | Komma-separierte Teilmenge von `{wallet,explorer,publisher,lightning_bridge,mail_bridge}`. Darf leer sein (alle Features off). Unbekannter Token → **Startfehler**. Variable selbst ist Pflicht (explizit leer = absichtlich nichts freigeschaltet). |
 | `ZKCOINS_PUBLIC_HOST` | Komma-separierte autoritative Hostnamen für §5.1 `chan_bind` (lowercase, trailing-dot gestrichen). **Nie** aus `Host`-Header. Darf leer sein (dann schlägt OwnershipProof-Auth laut fehl). Variable selbst ist Pflicht. |
+
+### Optionale Blossom-Fläche (§7.4)
+
+| Variable | Bedeutung |
+|---|---|
+| `ZKCOINS_BLOSSOM_STORE` | Wurzelverzeichnis des inhaltsadressierten Blob-Stores. **Abwesend** ⇒ die vier Blossom-Keys bleiben unbeworben und unmontiert. **Kein Default-Pfad**, kein `/tmp`-Rückfall. Leer gesetzt → Startfehler. |
+| `ZKCOINS_BLOSSOM_MAX_BLOB_BYTES` | Pflicht-Begleiter wenn der Store gesetzt ist: ausgewiesene Upload-Obergrenze (`> 0`). Body darüber → `413 payload_too_large`. |
+| `ZKCOINS_BLOSSOM_ALLOWED_OPS` | Pflicht-Begleiter wenn der Store gesetzt ist: komma-separierte lowercase-hex-32B-`op`-Pubkeys (gepaarte Konten + Replikations-Peers). Darf leer sein (dann ist jeder Upload `403`). |

@@ -40,7 +40,7 @@ The API layer sits **outward** of the node. It consumes the node's internal **ke
 - **`GET /` discovery follows registration** via `ServedSurface` — only served keys are advertised. The 29-key catalogue stays as inventory.
 - Kernel contract: carried `proto/kernel/v1/kernel.proto` with SHA-256 identity pin (`src/proto_identity.rs`); REST errors from `ErrorInfo.metadata["http_status"]` only (API-local auth failures use §7.5 `401 unauthorized` directly).
 - Codegen lives in the workspace member **`kernel-proto`** (tonic client stubs only). Workspace `default-members = ["."]` keeps default `cargo clippy` / `cargo test` on the **api** package so generated code is not linted.
-- Fail-closed env: `ZKCOINS_BIND_ADDR`, `ZKCOINS_KERNEL_ADDR`, `ZKCOINS_FEATURES`, `ZKCOINS_PUBLIC_HOST` (see the inventory doc).
+- Fail-closed env: `ZKCOINS_BIND_ADDR`, `ZKCOINS_KERNEL_ADDR`, `ZKCOINS_FEATURES`, `ZKCOINS_PUBLIC_HOST` (see the inventory doc). Optional Blossom store: `ZKCOINS_BLOSSOM_STORE` (+ max bytes / allowed ops companions).
 
 ## License
 

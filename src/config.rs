@@ -8,11 +8,22 @@
 //! - `ZKCOINS_PUBLIC_HOST` — comma-separated authoritative hostnames for
 //!   §5.1 `chan_bind` (may be empty string; empty ⇒ OwnershipProof auth fails
 //!   loud with no silent localhost). Never taken from a `Host` header.
+//!
+//! Optional Blossom surface (§7.4) — all-or-nothing:
+//! - `ZKCOINS_BLOSSOM_STORE` — filesystem root for the content-addressed store.
+//!   **Absent** ⇒ Blossom routes are not mounted and the four discovery keys
+//!   are not advertised. **No default path**, no `/tmp` fallback.
+//! - When the store is set, these companions are required (fail-closed boot):
+//!   - `ZKCOINS_BLOSSOM_MAX_BLOB_BYTES` — advertised upload size limit (`> 0`)
+//!   - `ZKCOINS_BLOSSOM_ALLOWED_OPS` — comma-separated lowercase-hex 32-byte
+//!     `op` pubkeys allowed to upload (paired accounts + replication peers;
+//!     may be empty ⇒ every upload is `403`)
 
 use std::collections::BTreeSet;
 use std::env;
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 /// Closed API feature set from specification §6.1.
@@ -60,6 +71,21 @@ impl FromStr for Feature {
     }
 }
 
+/// Optional §7.4 Blossom store configuration.
+///
+/// Present only when `ZKCOINS_BLOSSOM_STORE` is set. Absence means the four
+/// Blossom discovery keys stay unadvertised and the routes stay unmounted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlossomConfig {
+    /// Content-addressed store root on the local filesystem.
+    pub store_root: PathBuf,
+    /// Advertised maximum upload body size in bytes (`> 0`).
+    pub max_blob_bytes: u64,
+    /// `op` pubkeys (32 raw bytes) allowed to PUT/POST — paired accounts and
+    /// configured replication peers. Empty set ⇒ every upload is `403`.
+    pub allowed_upload_ops: BTreeSet<[u8; 32]>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// HTTP bind address. Parsed as `SocketAddr` so empty/garbage fails loudly.
@@ -71,6 +97,8 @@ pub struct Config {
     /// Authoritative public hostnames for §5.1 `chan_bind` (canonical form).
     /// Derived only from `ZKCOINS_PUBLIC_HOST` — never from request headers.
     pub public_hosts: Vec<String>,
+    /// §7.4 Blossom surface. `None` when `ZKCOINS_BLOSSOM_STORE` is unset.
+    pub blossom: Option<BlossomConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +107,8 @@ pub enum ConfigError {
     EmptyEnv(&'static str),
     InvalidBindAddr { value: String, reason: String },
     UnknownFeature(String),
+    InvalidBlossomMaxBlobBytes { value: String, reason: String },
+    InvalidBlossomAllowedOp { value: String, reason: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -102,6 +132,18 @@ impl fmt::Display for ConfigError {
                     "unknown feature {name:?}; allowed values are wallet, explorer, publisher, lightning_bridge, mail_bridge"
                 )
             }
+            ConfigError::InvalidBlossomMaxBlobBytes { value, reason } => {
+                write!(
+                    f,
+                    "ZKCOINS_BLOSSOM_MAX_BLOB_BYTES value {value:?} is invalid: {reason}"
+                )
+            }
+            ConfigError::InvalidBlossomAllowedOp { value, reason } => {
+                write!(
+                    f,
+                    "ZKCOINS_BLOSSOM_ALLOWED_OPS entry {value:?} is invalid: {reason}"
+                )
+            }
         }
     }
 }
@@ -112,6 +154,12 @@ const ENV_BIND: &str = "ZKCOINS_BIND_ADDR";
 const ENV_KERNEL: &str = "ZKCOINS_KERNEL_ADDR";
 const ENV_FEATURES: &str = "ZKCOINS_FEATURES";
 const ENV_PUBLIC_HOST: &str = "ZKCOINS_PUBLIC_HOST";
+/// Optional gate for the §7.4 Blossom surface. Absent ⇒ not advertised.
+const ENV_BLOSSOM_STORE: &str = "ZKCOINS_BLOSSOM_STORE";
+/// Required companion when `ZKCOINS_BLOSSOM_STORE` is set.
+const ENV_BLOSSOM_MAX_BLOB_BYTES: &str = "ZKCOINS_BLOSSOM_MAX_BLOB_BYTES";
+/// Required companion when `ZKCOINS_BLOSSOM_STORE` is set (may be empty).
+const ENV_BLOSSOM_ALLOWED_OPS: &str = "ZKCOINS_BLOSSOM_ALLOWED_OPS";
 
 impl Config {
     /// Load configuration from process environment. Fail-closed: every required
@@ -151,12 +199,14 @@ impl Config {
 
         let features = parse_features(&features_raw)?;
         let public_hosts = parse_public_hosts(&public_host_raw);
+        let blossom = parse_blossom_config(&mut get)?;
 
         Ok(Config {
             bind_addr,
             kernel_addr: kernel_raw,
             features,
             public_hosts,
+            blossom,
         })
     }
 }
@@ -192,6 +242,111 @@ fn parse_public_hosts(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Optional Blossom surface. `None` only when `ZKCOINS_BLOSSOM_STORE` is
+/// **unset**. Present-but-empty store is an error (no silent `/tmp` default).
+/// When the store is set, max-blob and allowed-ops companions are required.
+fn parse_blossom_config<F>(get: &mut F) -> Result<Option<BlossomConfig>, ConfigError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let store_raw = match get(ENV_BLOSSOM_STORE) {
+        None => return Ok(None),
+        Some(v) => v,
+    };
+    if store_raw.is_empty() {
+        return Err(ConfigError::EmptyEnv(ENV_BLOSSOM_STORE));
+    }
+
+    let max_raw = require_present(get, ENV_BLOSSOM_MAX_BLOB_BYTES)?;
+    if max_raw.is_empty() {
+        return Err(ConfigError::EmptyEnv(ENV_BLOSSOM_MAX_BLOB_BYTES));
+    }
+    let max_blob_bytes = parse_max_blob_bytes(&max_raw)?;
+
+    let ops_raw = require_present(get, ENV_BLOSSOM_ALLOWED_OPS)?;
+    // Empty string is allowed: surface is up, but every upload is 403.
+    let allowed_upload_ops = parse_allowed_ops(&ops_raw)?;
+
+    Ok(Some(BlossomConfig {
+        store_root: PathBuf::from(store_raw),
+        max_blob_bytes,
+        allowed_upload_ops,
+    }))
+}
+
+fn parse_max_blob_bytes(raw: &str) -> Result<u64, ConfigError> {
+    // Strict decimal u64, no leading zeros except "0" itself — but 0 is
+    // invalid (limit must be > 0). No clamping, no silent default.
+    if raw == "0" {
+        return Err(ConfigError::InvalidBlossomMaxBlobBytes {
+            value: raw.to_string(),
+            reason: "must be strictly greater than zero".to_string(),
+        });
+    }
+    if raw.is_empty() || raw.as_bytes()[0] == b'0' {
+        return Err(ConfigError::InvalidBlossomMaxBlobBytes {
+            value: raw.to_string(),
+            reason: "must be a canonical decimal u64 with no leading zeros".to_string(),
+        });
+    }
+    if !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ConfigError::InvalidBlossomMaxBlobBytes {
+            value: raw.to_string(),
+            reason: "must contain only ASCII digits".to_string(),
+        });
+    }
+    raw.parse::<u64>()
+        .map_err(|_| ConfigError::InvalidBlossomMaxBlobBytes {
+            value: raw.to_string(),
+            reason: "out of u64 range".to_string(),
+        })
+}
+
+fn parse_allowed_ops(raw: &str) -> Result<BTreeSet<[u8; 32]>, ConfigError> {
+    let mut out = BTreeSet::new();
+    for part in raw.split(',') {
+        let token = part.trim();
+        if token.is_empty() {
+            continue;
+        }
+        // Lowercase hex only — uppercase is rejected (no silent fold).
+        if token.len() != 64 {
+            return Err(ConfigError::InvalidBlossomAllowedOp {
+                value: token.to_string(),
+                reason: format!(
+                    "must be exactly 64 lowercase hex characters, got {}",
+                    token.len()
+                ),
+            });
+        }
+        if !token
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(ConfigError::InvalidBlossomAllowedOp {
+                value: token.to_string(),
+                reason: "must be lowercase hex [0-9a-f] only".to_string(),
+            });
+        }
+        let mut key = [0u8; 32];
+        for (i, chunk) in token.as_bytes().chunks(2).enumerate() {
+            let hi = hex_nibble(chunk[0]);
+            let lo = hex_nibble(chunk[1]);
+            key[i] = (hi << 4) | lo;
+        }
+        out.insert(key);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        _ => unreachable!("caller validated lowercase hex"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +369,92 @@ mod tests {
         assert_eq!(cfg.kernel_addr, "http://127.0.0.1:50051");
         assert!(cfg.features.is_empty());
         assert!(cfg.public_hosts.is_empty());
+        assert!(
+            cfg.blossom.is_none(),
+            "unset ZKCOINS_BLOSSOM_STORE must leave blossom unconfigured"
+        );
+    }
+
+    #[test]
+    fn blossom_store_absent_is_not_configured() {
+        let mut get = getter(HashMap::from([
+            (ENV_BIND, "127.0.0.1:8080"),
+            (ENV_KERNEL, "http://127.0.0.1:50051"),
+            (ENV_FEATURES, ""),
+            (ENV_PUBLIC_HOST, ""),
+        ]));
+        let cfg = Config::from_getter(&mut get).expect("valid config");
+        assert!(cfg.blossom.is_none());
+    }
+
+    #[test]
+    fn blossom_store_empty_is_error_not_default() {
+        let mut get = getter(HashMap::from([
+            (ENV_BIND, "127.0.0.1:8080"),
+            (ENV_KERNEL, "http://127.0.0.1:50051"),
+            (ENV_FEATURES, ""),
+            (ENV_PUBLIC_HOST, ""),
+            (ENV_BLOSSOM_STORE, ""),
+        ]));
+        let err = Config::from_getter(&mut get).expect_err("empty store");
+        assert_eq!(err, ConfigError::EmptyEnv(ENV_BLOSSOM_STORE));
+    }
+
+    #[test]
+    fn blossom_store_requires_companions() {
+        let mut get = getter(HashMap::from([
+            (ENV_BIND, "127.0.0.1:8080"),
+            (ENV_KERNEL, "http://127.0.0.1:50051"),
+            (ENV_FEATURES, ""),
+            (ENV_PUBLIC_HOST, ""),
+            (ENV_BLOSSOM_STORE, "/var/lib/zkcoins/blossom"),
+        ]));
+        let err = Config::from_getter(&mut get).expect_err("missing max");
+        assert_eq!(err, ConfigError::MissingEnv(ENV_BLOSSOM_MAX_BLOB_BYTES));
+    }
+
+    #[test]
+    fn blossom_store_configured_with_companions() {
+        let mut get = getter(HashMap::from([
+            (ENV_BIND, "127.0.0.1:8080"),
+            (ENV_KERNEL, "http://127.0.0.1:50051"),
+            (ENV_FEATURES, ""),
+            (ENV_PUBLIC_HOST, ""),
+            (ENV_BLOSSOM_STORE, "/var/lib/zkcoins/blossom"),
+            (ENV_BLOSSOM_MAX_BLOB_BYTES, "1048576"),
+            (
+                ENV_BLOSSOM_ALLOWED_OPS,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        ]));
+        let cfg = Config::from_getter(&mut get).expect("valid blossom");
+        let blossom = cfg.blossom.expect("configured");
+        assert_eq!(
+            blossom.store_root,
+            PathBuf::from("/var/lib/zkcoins/blossom")
+        );
+        assert_eq!(blossom.max_blob_bytes, 1_048_576);
+        assert_eq!(blossom.allowed_upload_ops.len(), 1);
+    }
+
+    #[test]
+    fn blossom_max_blob_zero_is_error() {
+        let mut get = getter(HashMap::from([
+            (ENV_BIND, "127.0.0.1:8080"),
+            (ENV_KERNEL, "http://127.0.0.1:50051"),
+            (ENV_FEATURES, ""),
+            (ENV_PUBLIC_HOST, ""),
+            (ENV_BLOSSOM_STORE, "/var/lib/zkcoins/blossom"),
+            (ENV_BLOSSOM_MAX_BLOB_BYTES, "0"),
+            (ENV_BLOSSOM_ALLOWED_OPS, ""),
+        ]));
+        let err = Config::from_getter(&mut get).expect_err("zero max");
+        match err {
+            ConfigError::InvalidBlossomMaxBlobBytes { value, .. } => {
+                assert_eq!(value, "0");
+            }
+            other => panic!("expected InvalidBlossomMaxBlobBytes, got {other:?}"),
+        }
     }
 
     #[test]

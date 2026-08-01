@@ -2,14 +2,16 @@
 //!
 //! Route registration and the `GET /` discovery document share one source:
 //! [`ServedSurface`]. The closed §7.5 inventory ([`CLOSED_ENDPOINT_KEYS`]) is
-//! the full key catalogue for surfaces not yet built; only keys present in
-//! `ServedSurface::ALL` are registered and advertised.
+//! the full key catalogue for surfaces not yet built; only keys in the active
+//! surface set (always-on plus Blossom when configured) are registered and
+//! advertised.
 //!
 //! Inventory paths are the **advertised** §7.5 form (`<name>` placeholders).
 //! Axum registration uses a derived **matcher** form (`:name`); see
 //! [`advertised_path_to_axum_matcher`].
 
 use crate::attest;
+use crate::blossom;
 use crate::bootstrap;
 use crate::chain;
 use crate::config::Config;
@@ -20,9 +22,10 @@ use crate::kernel::KernelHandle;
 use crate::publish;
 use crate::pull;
 use crate::state::AppState;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, head, post, put};
 use axum::{Json, Router};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -95,19 +98,20 @@ pub const CLOSED_ENDPOINT_KEYS: &[(&str, &str)] = &[
 /// handlers land, registration will filter `ServedSurface` by
 /// `Config::features`.
 ///
-/// Surfaces intentionally **not** registered (and therefore omitted from
-/// `GET /`), with the reason each stays off the map:
+/// Surfaces intentionally **not** always registered (and therefore omitted from
+/// `GET /` when inactive), with the reason each stays off the map:
 ///
 /// - `receipts_stream` — kernel `SubscribeReceipts` is Unimplemented; the node
 ///   names the missing push/source prerequisite. A REST shell would only 501.
 /// - `blossom_get` / `blossom_head` / `blossom_upload` / `blossom_delete` —
-///   §7.4 Blossom surface. The node exposes no Blossom path and recovery is
-///   not implemented; inventing REST routes without a store is a map of
-///   streets that do not exist.
+///   §7.4 Blossom surface. Mounted **only** when `ZKCOINS_BLOSSOM_STORE` is
+///   configured (content-addressed filesystem store). No default path; absent
+///   store ⇒ keys unadvertised and routes unmounted.
 ///
 /// Inventory keys remain in [`CLOSED_ENDPOINT_KEYS`]; advertisement tracks
-/// [`ServedSurface::ALL`] only. `chain_inscriptions` is registered once the
-/// node inscription catalog backs `ListInscriptions`.
+/// the always-on set plus optional Blossom when configured.
+/// `chain_inscriptions` is registered once the node inscription catalog
+/// backs `ListInscriptions`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServedSurface {
     Health,
@@ -134,11 +138,15 @@ enum ServedSurface {
     BootstrapChallenge,
     BootstrapEntrust,
     BootstrapRevoke,
+    BlossomGet,
+    BlossomHead,
+    BlossomUpload,
+    BlossomDelete,
 }
 
 impl ServedSurface {
-    /// Every surface this binary currently serves.
-    const ALL: &[ServedSurface] = &[
+    /// Always-on surfaces (independent of Blossom store configuration).
+    const ALWAYS_ON: &[ServedSurface] = &[
         ServedSurface::Health,
         ServedSurface::HealthReady,
         ServedSurface::Info,
@@ -164,6 +172,23 @@ impl ServedSurface {
         ServedSurface::BootstrapEntrust,
         ServedSurface::BootstrapRevoke,
     ];
+
+    /// Blossom surfaces — registered only when the store is configured.
+    const BLOSSOM: &[ServedSurface] = &[
+        ServedSurface::BlossomGet,
+        ServedSurface::BlossomHead,
+        ServedSurface::BlossomUpload,
+        ServedSurface::BlossomDelete,
+    ];
+
+    /// Surfaces active for this process given whether Blossom is configured.
+    fn active(blossom_configured: bool) -> Vec<ServedSurface> {
+        let mut out = Self::ALWAYS_ON.to_vec();
+        if blossom_configured {
+            out.extend_from_slice(Self::BLOSSOM);
+        }
+        out
+    }
 
     /// Closed §7.5 discovery key for this surface.
     fn discovery_key(self) -> &'static str {
@@ -192,6 +217,10 @@ impl ServedSurface {
             ServedSurface::BootstrapChallenge => "bootstrap_challenge",
             ServedSurface::BootstrapEntrust => "bootstrap_entrust",
             ServedSurface::BootstrapRevoke => "bootstrap_revoke",
+            ServedSurface::BlossomGet => "blossom_get",
+            ServedSurface::BlossomHead => "blossom_head",
+            ServedSurface::BlossomUpload => "blossom_upload",
+            ServedSurface::BlossomDelete => "blossom_delete",
         }
     }
 
@@ -199,7 +228,7 @@ impl ServedSurface {
     ///
     /// Discovery still advertises the inventory (Spec) form; only the route
     /// table sees the rewritten matcher.
-    fn register(self, router: Router<AppState>) -> Router<AppState> {
+    fn register(self, router: Router<AppState>, max_blob_bytes: Option<u64>) -> Router<AppState> {
         let path = advertised_path_to_axum_matcher(closed_path(self.discovery_key()));
         match self {
             ServedSurface::Health => router.route(&path, get(health)),
@@ -237,6 +266,22 @@ impl ServedSurface {
             }
             ServedSurface::BootstrapRevoke => {
                 router.route(&path, post(bootstrap::post_bootstrap_revoke))
+            }
+            // GET / HEAD / DELETE share `/blossom/:sha256`; axum merges methods.
+            ServedSurface::BlossomGet => router.route(&path, get(blossom::get_blob)),
+            ServedSurface::BlossomHead => router.route(&path, head(blossom::head_blob)),
+            ServedSurface::BlossomDelete => router.route(&path, delete(blossom::delete_blob)),
+            ServedSurface::BlossomUpload => {
+                // Disable axum's default 2 MiB body limit so the handler can
+                // enforce the configured max and return the §7.5 machine code.
+                let limit = max_blob_bytes.unwrap_or(0).saturating_add(1);
+                let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+                router.route(
+                    &path,
+                    put(blossom::upload_blob)
+                        .post(blossom::upload_blob)
+                        .layer(DefaultBodyLimit::max(limit)),
+                )
             }
         }
     }
@@ -299,10 +344,10 @@ fn advertised_path_to_axum_matcher(advertised: &str) -> String {
     out
 }
 
-/// Build the `endpoints` map for `GET /` from the served set only.
-fn discovery_endpoints() -> BTreeMap<&'static str, &'static str> {
+/// Build the `endpoints` map for `GET /` from the active surface set.
+fn discovery_endpoints(blossom_configured: bool) -> BTreeMap<&'static str, &'static str> {
     let mut endpoints = BTreeMap::new();
-    for surface in ServedSurface::ALL {
+    for surface in ServedSurface::active(blossom_configured) {
         let key = surface.discovery_key();
         let path = closed_path(key);
         endpoints.insert(key, path);
@@ -320,36 +365,54 @@ struct RootResponse {
 /// Build the axum router for the given configuration and kernel handle.
 ///
 /// `config.features` is stored in [`AppState`] for `GET /v1/info` (API-owned
-/// advertisement). Route registration is still the always-on
-/// [`ServedSurface::ALL`] set; §6.1 feature gating of optional roles lands
-/// with those handlers.
+/// advertisement). Route registration is the always-on set plus the Blossom
+/// surface when `config.blossom` is `Some`. §6.1 feature gating of optional
+/// roles lands with those handlers.
 ///
 /// Returns a fully state-bound router (`Router` / `Router<()>`). Only that
 /// form implements `tower::Service` and is ready for `axum::serve` and test
 /// `oneshot` calls. Handlers extract `State<AppState>` or
 /// `State<KernelHandle>` (via [`axum::extract::FromRef`]); the concrete
 /// state is supplied once at the end.
+///
+/// # Panics
+///
+/// Panics if Blossom is configured but the store root cannot be opened —
+/// that is a boot-time misconfiguration, not a per-request failure.
 pub fn build_router(config: Config, kernel: KernelHandle) -> Router {
     let Config {
         bind_addr: _,
         kernel_addr: _,
         features,
         public_hosts,
+        blossom,
     } = config;
+
+    let max_blob_bytes = blossom.as_ref().map(|b| b.max_blob_bytes);
+    let blossom_state = blossom.map(|cfg| {
+        blossom::BlossomState::from_config(&cfg).unwrap_or_else(|e| {
+            panic!(
+                "blossom store open failed (boot misconfiguration): {}",
+                e.body.message
+            )
+        })
+    });
+    let blossom_configured = blossom_state.is_some();
 
     let state = AppState {
         kernel,
         features,
         public_hosts: Arc::new(public_hosts),
+        blossom: blossom_state,
     };
 
-    // Register every surface as `Router<AppState>`, then bind state so the
-    // returned tree is `Router<()>` and implements `Service`. Binding earlier
-    // while still returning `Router<AppState>` leaves the tree "missing"
-    // state and breaks both `axum::serve` and `oneshot`.
+    // Register every active surface as `Router<AppState>`, then bind state so
+    // the returned tree is `Router<()>` and implements `Service`. Binding
+    // earlier while still returning `Router<AppState>` leaves the tree
+    // "missing" state and breaks both `axum::serve` and `oneshot`.
     let mut router = Router::new().route("/", get(root));
-    for surface in ServedSurface::ALL {
-        router = surface.register(router);
+    for surface in ServedSurface::active(blossom_configured) {
+        router = surface.register(router, max_blob_bytes);
     }
     router.with_state(state)
 }
@@ -358,11 +421,12 @@ async fn health() -> Response {
     (StatusCode::OK, "ok").into_response()
 }
 
-async fn root() -> Json<RootResponse> {
+async fn root(State(state): State<AppState>) -> Json<RootResponse> {
+    let blossom_configured = state.blossom.is_some();
     Json(RootResponse {
         name: "zkcoins-api",
         version: env!("CARGO_PKG_VERSION"),
-        endpoints: discovery_endpoints(),
+        endpoints: discovery_endpoints(blossom_configured),
     })
 }
 
@@ -401,6 +465,7 @@ mod tests {
             kernel_addr: "http://127.0.0.1:50051".to_string(),
             features: BTreeSet::new(),
             public_hosts: vec!["node.example.com".to_string()],
+            blossom: None,
         }
     }
 
@@ -592,7 +657,8 @@ mod tests {
 
     #[test]
     fn every_served_surface_is_in_closed_inventory() {
-        for surface in ServedSurface::ALL {
+        // Always-on + Blossom (when configured) must each map to inventory.
+        for surface in ServedSurface::active(true) {
             let key = surface.discovery_key();
             let path = closed_path(key);
             assert!(
@@ -640,7 +706,7 @@ mod tests {
 
         let endpoints = json["endpoints"].as_object().expect("endpoints object");
 
-        let expected_keys: BTreeSet<&str> = ServedSurface::ALL
+        let expected_keys: BTreeSet<&str> = ServedSurface::active(false)
             .iter()
             .map(|s| s.discovery_key())
             .collect();
@@ -1001,6 +1067,7 @@ mod tests {
             kernel_addr: "http://kernel:1".to_string(),
             features,
             public_hosts: vec!["node.example.com".to_string()],
+            blossom: None,
         };
         let app = build_router(cfg, Arc::new(UnreachableKernel));
         let res = app
@@ -1022,6 +1089,7 @@ mod tests {
                 kernel_addr: "http://kernel:1".to_string(),
                 features: BTreeSet::from([Feature::Wallet]),
                 public_hosts: vec!["node.example.com".to_string()],
+                blossom: None,
             },
             Arc::new(UnreachableKernel),
         );
@@ -1777,6 +1845,7 @@ mod tests {
             kernel_addr: "http://127.0.0.1:50051".to_string(),
             features,
             public_hosts: vec!["node.example.com".to_string()],
+            blossom: None,
         };
         let app = build_router(cfg, Arc::new(kernel));
         let res = app
@@ -4040,7 +4109,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unbuilt_surfaces_remain_404_and_absent_from_discovery() {
+    async fn unbuilt_and_unconfigured_surfaces_remain_404_and_absent_from_discovery() {
+        // test_config has blossom: None — Blossom must stay off the map.
         let app = test_app();
         for path in [
             "/v1/receipts/stream",
@@ -4055,7 +4125,7 @@ mod tests {
             assert_eq!(
                 res.status(),
                 StatusCode::NOT_FOUND,
-                "unbuilt surface {path} must not be registered"
+                "unconfigured/unbuilt surface {path} must not be registered"
             );
         }
         let res = app
@@ -4314,5 +4384,579 @@ mod tests {
         assert_eq!(req.from_vin_index, Some(0));
         // PAGE_LOOKAHEAD: default rest limit 100 → kernel limit 101
         assert_eq!(req.limit, Some(101));
+    }
+
+    // -----------------------------------------------------------------------
+    // §7.4 Blossom surface (configured store only)
+    // -----------------------------------------------------------------------
+
+    fn blossom_temp_root(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "zkcoins-blossom-rt-{}-{}-{}",
+            label,
+            std::process::id(),
+            nanos
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    fn blossom_app(root: std::path::PathBuf, max: u64, ops: BTreeSet<[u8; 32]>) -> Router {
+        let cfg = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            kernel_addr: "http://127.0.0.1:50051".to_string(),
+            features: BTreeSet::new(),
+            public_hosts: vec!["node.example.com".to_string()],
+            blossom: Some(crate::config::BlossomConfig {
+                store_root: root,
+                max_blob_bytes: max,
+                allowed_upload_ops: ops,
+            }),
+        };
+        build_router(cfg, Arc::new(UnreachableKernel))
+    }
+
+    fn blossom_sk_pk() -> (bitcoin::secp256k1::SecretKey, [u8; 32]) {
+        use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[0x7au8; 32]).expect("secret");
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        let (xonly, _) = kp.x_only_public_key();
+        (sk, xonly.serialize())
+    }
+
+    fn blossom_auth(
+        sk: &bitcoin::secp256k1::SecretKey,
+        pk: &[u8; 32],
+        action: crate::blossom::AuthAction,
+        x: &[u8; 32],
+    ) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let b64 = crate::blossom::sign_auth_event_base64(sk, pk, action, x, now, now + 120);
+        format!("Nostr {b64}")
+    }
+
+    #[tokio::test]
+    async fn blossom_upload_get_head_roundtrip_bit_equal() {
+        let root = blossom_temp_root("roundtrip");
+        let (sk, pk) = blossom_sk_pk();
+        let mut ops = BTreeSet::new();
+        ops.insert(pk);
+        let app = blossom_app(root.clone(), 1_048_576, ops);
+        let body = b"ciphertext-bytes-for-roundtrip".to_vec();
+        let x = crate::blossom::blob_id_of(&body);
+        let auth = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Upload, &x);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/blossom/upload")
+                    .header("content-type", "application/octet-stream")
+                    .header("authorization", &auth)
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["blob_id"], crate::hexutil::encode_hex(&x));
+        assert!(
+            json.get("receipt").is_none(),
+            "receipt must be absent without §4.6, got {json}"
+        );
+
+        let get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/blossom/{}", crate::hexutil::encode_hex(&x)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(
+            body_bytes(get).await,
+            body,
+            "GET must return bit-equal body"
+        );
+
+        let head = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri(format!("/blossom/{}", crate::hexutil::encode_hex(&x)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        let len = head
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .unwrap();
+        assert_eq!(len, body.len().to_string());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn blossom_second_upload_same_bytes_is_idempotent() {
+        let root = blossom_temp_root("idempotent");
+        let (sk, pk) = blossom_sk_pk();
+        let mut ops = BTreeSet::new();
+        ops.insert(pk);
+        let app = blossom_app(root.clone(), 1024, ops);
+        let body = b"same-bytes-twice";
+        let x = crate::blossom::blob_id_of(body);
+        for _ in 0..2 {
+            let auth = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Upload, &x);
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/blossom/upload")
+                        .header("content-type", "application/octet-stream")
+                        .header("authorization", &auth)
+                        .body(Body::from(body.to_vec()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+            assert_eq!(json["blob_id"], crate::hexutil::encode_hex(&x));
+        }
+        let store = crate::blossom::BlobStore::open(&root).unwrap();
+        let names = store.list_root_names().unwrap();
+        let blob_files: Vec<_> = names
+            .iter()
+            .filter(|n| n.len() == 64 && !n.contains('.'))
+            .collect();
+        assert_eq!(blob_files.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn blossom_path_traversal_is_400_and_does_not_touch_outside() {
+        let root = blossom_temp_root("traversal");
+        let outside = root
+            .parent()
+            .unwrap()
+            .join(format!("zkcoins-blossom-outside-{}", std::process::id()));
+        std::fs::write(&outside, b"sentinel").unwrap();
+        let outside_before = std::fs::read(&outside).unwrap();
+        let app = blossom_app(root.clone(), 1024, BTreeSet::new());
+        let store_before = crate::blossom::BlobStore::open(&root)
+            .unwrap()
+            .list_root_names()
+            .unwrap();
+
+        for bad in [
+            format!("/blossom/{}", "A".repeat(64)),
+            format!("/blossom/{}", "a".repeat(63)),
+            format!("/blossom/{}", "a".repeat(65)),
+            "/blossom/../etc/passwd".to_string(),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(Request::builder().uri(&bad).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert!(
+                res.status() == StatusCode::BAD_REQUEST || res.status() == StatusCode::NOT_FOUND,
+                "path {bad} → {}",
+                res.status()
+            );
+            if res.status() == StatusCode::BAD_REQUEST {
+                let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+                assert_eq!(json["error"], "malformed_request");
+            }
+        }
+
+        let store_after = crate::blossom::BlobStore::open(&root)
+            .unwrap()
+            .list_root_names()
+            .unwrap();
+        assert_eq!(store_before, store_after);
+        assert_eq!(std::fs::read(&outside).unwrap(), outside_before);
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn blossom_upload_rejects_non_peer_op_with_403() {
+        let root = blossom_temp_root("nonpeer");
+        let (sk, pk) = blossom_sk_pk();
+        let app = blossom_app(root.clone(), 1024, BTreeSet::new());
+        let body = b"not-a-peer";
+        let x = crate::blossom::blob_id_of(body);
+        let auth = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Upload, &x);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/blossom/upload")
+                    .header("content-type", "application/octet-stream")
+                    .header("authorization", &auth)
+                    .body(Body::from(body.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "scope_exceeded");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn blossom_upload_rejects_oversize_with_413() {
+        let root = blossom_temp_root("oversize");
+        let (sk, pk) = blossom_sk_pk();
+        let mut ops = BTreeSet::new();
+        ops.insert(pk);
+        let app = blossom_app(root.clone(), 4, ops);
+        let body = b"12345";
+        let x = crate::blossom::blob_id_of(body);
+        let auth = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Upload, &x);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/blossom/upload")
+                    .header("content-type", "application/octet-stream")
+                    .header("authorization", &auth)
+                    .body(Body::from(body.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "payload_too_large");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn blossom_upload_rejects_json_content_type_with_415() {
+        let root = blossom_temp_root("jsonct");
+        let (sk, pk) = blossom_sk_pk();
+        let mut ops = BTreeSet::new();
+        ops.insert(pk);
+        let app = blossom_app(root.clone(), 1024, ops);
+        let body = b"{}";
+        let x = crate::blossom::blob_id_of(body);
+        let auth = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Upload, &x);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/blossom/upload")
+                    .header("content-type", "application/json")
+                    .header("authorization", &auth)
+                    .body(Body::from(body.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unsupported_media_type");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn blossom_partial_binding_headers_are_400() {
+        let root = blossom_temp_root("partialhdr");
+        let (sk, pk) = blossom_sk_pk();
+        let mut ops = BTreeSet::new();
+        ops.insert(pk);
+        let app = blossom_app(root.clone(), 1024, ops);
+        let body = b"with-partial-headers";
+        let x = crate::blossom::blob_id_of(body);
+        let auth = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Upload, &x);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/blossom/upload")
+                    .header("content-type", "application/octet-stream")
+                    .header("authorization", &auth)
+                    .header(
+                        "x-zkcoins-event-id",
+                        crate::hexutil::encode_hex(&[0x11; 32]),
+                    )
+                    .body(Body::from(body.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+        assert!(
+            json["message"].as_str().unwrap().contains("all together"),
+            "{}",
+            json["message"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn blossom_invalid_retention_is_400() {
+        let root = blossom_temp_root("badret");
+        let (sk, pk) = blossom_sk_pk();
+        let mut ops = BTreeSet::new();
+        ops.insert(pk);
+        let app = blossom_app(root.clone(), 1024, ops);
+        let body = b"bad-retention";
+        let x = crate::blossom::blob_id_of(body);
+        let auth = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Upload, &x);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/blossom/upload")
+                    .header("content-type", "application/octet-stream")
+                    .header("authorization", &auth)
+                    .header(
+                        "x-zkcoins-event-id",
+                        crate::hexutil::encode_hex(&[0x11; 32]),
+                    )
+                    .header(
+                        "x-zkcoins-attempt-nonce",
+                        crate::hexutil::encode_hex(&[0x22; 32]),
+                    )
+                    .header("x-zkcoins-retention", "forever")
+                    .body(Body::from(body.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+        assert!(
+            json["message"].as_str().unwrap().contains("Retention"),
+            "{}",
+            json["message"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn blossom_delete_by_original_uploader_succeeds() {
+        let root = blossom_temp_root("delok");
+        let (sk, pk) = blossom_sk_pk();
+        let mut ops = BTreeSet::new();
+        ops.insert(pk);
+        let app = blossom_app(root.clone(), 1024, ops);
+        let body = b"to-be-deleted";
+        let x = crate::blossom::blob_id_of(body);
+        let auth_up = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Upload, &x);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/blossom/upload")
+                    .header("content-type", "application/octet-stream")
+                    .header("authorization", &auth_up)
+                    .body(Body::from(body.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let auth_del = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Delete, &x);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/blossom/{}", crate::hexutil::encode_hex(&x)))
+                    .header("authorization", &auth_del)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(body_bytes(res).await.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn blossom_delete_by_foreign_op_is_403() {
+        use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
+        let root = blossom_temp_root("delforeign");
+        let (sk, pk) = blossom_sk_pk();
+        let mut ops = BTreeSet::new();
+        ops.insert(pk);
+        let secp = Secp256k1::new();
+        let sk2 = SecretKey::from_slice(&[0x8bu8; 32]).unwrap();
+        let kp2 = Keypair::from_secret_key(&secp, &sk2);
+        let (xonly2, _) = kp2.x_only_public_key();
+        let pk2 = xonly2.serialize();
+
+        let app = blossom_app(root.clone(), 1024, ops);
+        let body = b"owned-by-pk";
+        let x = crate::blossom::blob_id_of(body);
+        let auth_up = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Upload, &x);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/blossom/upload")
+                    .header("content-type", "application/octet-stream")
+                    .header("authorization", &auth_up)
+                    .body(Body::from(body.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let auth_del = blossom_auth(&sk2, &pk2, crate::blossom::AuthAction::Delete, &x);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/blossom/{}", crate::hexutil::encode_hex(&x)))
+                    .header("authorization", &auth_del)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "scope_exceeded");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn blossom_delete_without_uploader_note_is_403() {
+        let root = blossom_temp_root("delnonote");
+        let (sk, pk) = blossom_sk_pk();
+        let mut ops = BTreeSet::new();
+        ops.insert(pk);
+        let store = crate::blossom::BlobStore::open(&root).unwrap();
+        let body = b"orphan";
+        let id = store.put(body, &pk).unwrap();
+        std::fs::remove_file(root.join(format!("{}.uploader", crate::hexutil::encode_hex(&id))))
+            .unwrap();
+
+        let app = blossom_app(root.clone(), 1024, ops);
+        let auth_del = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Delete, &id);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/blossom/{}", crate::hexutil::encode_hex(&id)))
+                    .header("authorization", &auth_del)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "scope_exceeded");
+        assert!(
+            json["message"].as_str().unwrap().contains("uploader note"),
+            "{}",
+            json["message"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn blossom_discovery_keys_bound_to_configuration() {
+        // Without store (test_config): absent.
+        let app = test_app();
+        let res = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        let endpoints = json["endpoints"].as_object().unwrap();
+        for k in [
+            "blossom_get",
+            "blossom_head",
+            "blossom_upload",
+            "blossom_delete",
+        ] {
+            assert!(!endpoints.contains_key(k), "{k} unadvertised without store");
+        }
+
+        // With store: present.
+        let root = blossom_temp_root("disc");
+        let app = blossom_app(root.clone(), 1024, BTreeSet::new());
+        let res = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        let endpoints = json["endpoints"].as_object().unwrap();
+        assert_eq!(endpoints["blossom_get"], "/blossom/<sha256>");
+        assert_eq!(endpoints["blossom_head"], "/blossom/<sha256>");
+        assert_eq!(endpoints["blossom_upload"], "/blossom/upload");
+        assert_eq!(endpoints["blossom_delete"], "/blossom/<sha256>");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn blossom_binding_headers_valid_still_omit_receipt() {
+        let root = blossom_temp_root("bindok");
+        let (sk, pk) = blossom_sk_pk();
+        let mut ops = BTreeSet::new();
+        ops.insert(pk);
+        let app = blossom_app(root.clone(), 1024, ops);
+        let body = b"with-valid-binding";
+        let x = crate::blossom::blob_id_of(body);
+        let auth = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Upload, &x);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/blossom/upload")
+                    .header("content-type", "application/octet-stream")
+                    .header("authorization", &auth)
+                    .header(
+                        "x-zkcoins-event-id",
+                        crate::hexutil::encode_hex(&[0xaa; 32]),
+                    )
+                    .header(
+                        "x-zkcoins-attempt-nonce",
+                        crate::hexutil::encode_hex(&[0xbb; 32]),
+                    )
+                    .header("x-zkcoins-retention", "indefinite")
+                    .body(Body::from(body.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["blob_id"], crate::hexutil::encode_hex(&x));
+        assert!(json.get("receipt").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
