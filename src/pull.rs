@@ -1,4 +1,4 @@
-//! Capability-gated pull REST surface (§7.5 L3039–L3043).
+//! Capability-gated pull REST surface (§7.5 L3039–L3044).
 //!
 //! | Method | Path | Kernel |
 //! |---|---|---|
@@ -7,16 +7,23 @@
 //! | `GET`  | `/v1/record/<record_id>` | `GetRecord` |
 //! | `GET`  | `/v1/proof/<coin_id>` | `GetCoinProof` |
 //! | `GET`  | `/v1/account/state` | `GetAccountState` (ownership session only) |
+//! | `GET`  | `/v1/receipts/stream` | `SubscribeReceipts` (ownership **or** grant session) |
 //!
 //! The API holds **no** session store: the bearer token is forwarded to the
 //! kernel. Session authority is taken solely from the verified proof kind and
 //! sent as interim metadata `x-zkcoins-session-authority` (never defaulted).
+//!
+//! `GET /v1/receipts/stream` admits **any** still-valid ownership **or** grant
+//! pull session (§7.5 L2953) — unlike `GET /v1/account/state`, which is
+//! ownership-only. Subject and resolved scope come from server-side session
+//! state; the request carries no `subject` field.
 
 use crate::error::ApiError;
 use crate::hexutil::{decode_hex_exact, encode_hex};
 use crate::kernel::kernel_v1::{
     AccountStateRequest, AccountStateResult, CoinProofBlob, CoinProofRequest, PullChallengeRequest,
-    PullRequest, PullResult as ProtoPullResult, RecordBlob, RecordRef, RecordRequest, Scope,
+    PullRequest, PullResult as ProtoPullResult, Receipt, RecordBlob, RecordRef, RecordRequest,
+    Scope, SubscribeReceiptsRequest,
 };
 use crate::ownership::{
     chan_bind_for_host, decode_zk_address, parse_u64_decimal, reject_grant_proof,
@@ -26,10 +33,14 @@ use crate::ownership::{
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures_util::stream::Stream;
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::convert::Infallible;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -602,4 +613,123 @@ pub async fn get_account_state(
     }
 
     Ok((StatusCode::OK, Json(Value::Object(body))).into_response())
+}
+
+/// `GET /v1/receipts/stream` → `SubscribeReceipts` as SSE (§7.5 L2953–L2955).
+///
+/// Auth split (fail-closed, same as `GET /v1/proof/<coin_id>`):
+/// - missing / malformed bearer → `401 unauthorized` (API edge, no kernel)
+/// - unknown / expired / `chan_bind`-mismatch session → `410 session_expired`
+///   (kernel `ErrorInfo`, before the SSE upgrade)
+///
+/// Ownership **or** grant sessions are both admissible. Subject and resolved
+/// scope are **not** taken from the request — the kernel looks them up from
+/// the session record. No recovery buffer, no sequence numbers: reconnect and
+/// catch-up via ordinary pull are client-side (§4.9).
+///
+/// Pattern matches `GET /v1/jobs/<job_id>/stream`: handshake errors return as
+/// HTTP status + JSON; only a successful kernel stream becomes
+/// `text/event-stream`. Dropping the SSE consumer drops the gRPC stream and
+/// ends the subscription.
+pub async fn stream_receipts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + Send + 'static>, ApiError> {
+    let session = bearer_token(&headers)?;
+    let chan_bind = session_chan_bind(state.public_hosts.as_slice())?;
+
+    // Await the kernel stream handshake first. On `Err`, axum maps `ApiError`
+    // to a normal HTTP response (status + JSON body) and never enters SSE.
+    let stream = state
+        .kernel
+        .subscribe_receipts(SubscribeReceiptsRequest {
+            session,
+            chan_bind: chan_bind.to_vec(),
+        })
+        .await?;
+
+    let sse_stream = receipt_event_sse_stream(stream);
+    Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
+}
+
+// ---------------------------------------------------------------------------
+// Receipts SSE
+// ---------------------------------------------------------------------------
+
+fn receipt_event_sse_stream<S>(stream: S) -> impl Stream<Item = Result<Event, Infallible>> + Send
+where
+    S: Stream<Item = Result<Receipt, ApiError>> + Send + 'static,
+{
+    // Map each kernel receipt to one SSE frame. On stream break, emit a single
+    // recognizable `error` frame then end — never hang open with silence.
+    // Clean end (`None`) closes without a terminal frame (open-ended push).
+    //
+    // Dropping this unfold (client disconnect) drops `stream`, which drops the
+    // tonic gRPC subscription — same cleanup pattern as the job stream.
+    futures_util::stream::unfold((Box::pin(stream), false), |(mut stream, done)| async move {
+        if done {
+            return None;
+        }
+        match stream.next().await {
+            None => None,
+            Some(Ok(receipt)) => match receipt_to_sse(&receipt) {
+                Ok(frame) => Some((Ok(frame), (stream, false))),
+                Err(api_err) => {
+                    let frame = receipt_stream_break_event(&api_err);
+                    Some((Ok(frame), (stream, true)))
+                }
+            },
+            Some(Err(api_err)) => {
+                let frame = receipt_stream_break_event(&api_err);
+                Some((Ok(frame), (stream, true)))
+            }
+        }
+    })
+}
+
+fn receipt_stream_break_event(err: &ApiError) -> Event {
+    let data = json!({
+        "error": err.body.error,
+        "message": err.body.message,
+    });
+    Event::default().event("error").data(data.to_string())
+}
+
+fn receipt_to_sse(r: &Receipt) -> Result<Event, ApiError> {
+    let data = receipt_to_json(r)?;
+    Ok(Event::default().event("receipt").data(data.to_string()))
+}
+
+/// §7.8 `Receipt` as public JSON: hex32 digests, decimal strings for
+/// `amount` / `credited_at` (§7.1).
+fn receipt_to_json(r: &Receipt) -> Result<Value, ApiError> {
+    if r.coin_id.len() != 32 {
+        return Err(ApiError::internal(format!(
+            "kernel Receipt.coin_id must be 32 bytes, got {}",
+            r.coin_id.len()
+        )));
+    }
+    if r.asset_id.len() != 32 {
+        return Err(ApiError::internal(format!(
+            "kernel Receipt.asset_id must be 32 bytes, got {}",
+            r.asset_id.len()
+        )));
+    }
+    if r.amount.is_empty() {
+        return Err(ApiError::internal(
+            "kernel Receipt.amount is empty on SubscribeReceipts success",
+        ));
+    }
+    if r.state.is_empty() {
+        return Err(ApiError::internal(
+            "kernel Receipt.state is empty on SubscribeReceipts success",
+        ));
+    }
+    Ok(json!({
+        "coin_id": encode_hex(&r.coin_id),
+        "asset_id": encode_hex(&r.asset_id),
+        "amount": r.amount,
+        "state": r.state,
+        "credited_at": r.credited_at.to_string(),
+    }))
 }

@@ -101,17 +101,14 @@ pub const CLOSED_ENDPOINT_KEYS: &[(&str, &str)] = &[
 /// Surfaces intentionally **not** always registered (and therefore omitted from
 /// `GET /` when inactive), with the reason each stays off the map:
 ///
-/// - `receipts_stream` — kernel `SubscribeReceipts` is Unimplemented; the node
-///   names the missing push/source prerequisite. A REST shell would only 501.
 /// - `blossom_get` / `blossom_head` / `blossom_upload` / `blossom_delete` —
 ///   §7.4 Blossom surface. Mounted **only** when `ZKCOINS_BLOSSOM_STORE` is
 ///   configured (content-addressed filesystem store). No default path; absent
 ///   store ⇒ keys unadvertised and routes unmounted.
 ///
 /// Inventory keys remain in [`CLOSED_ENDPOINT_KEYS`]; advertisement tracks
-/// the always-on set plus optional Blossom when configured.
-/// `chain_inscriptions` is registered once the node inscription catalog
-/// backs `ListInscriptions`.
+/// the always-on set (25 keys, including `receipts_stream`) plus optional
+/// Blossom (4 keys) when configured — all 29 when the store is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServedSurface {
     Health,
@@ -134,6 +131,7 @@ enum ServedSurface {
     Record,
     Proof,
     AccountState,
+    ReceiptsStream,
     PublishSpendrecord,
     BootstrapChallenge,
     BootstrapEntrust,
@@ -167,6 +165,7 @@ impl ServedSurface {
         ServedSurface::Record,
         ServedSurface::Proof,
         ServedSurface::AccountState,
+        ServedSurface::ReceiptsStream,
         ServedSurface::PublishSpendrecord,
         ServedSurface::BootstrapChallenge,
         ServedSurface::BootstrapEntrust,
@@ -213,6 +212,7 @@ impl ServedSurface {
             ServedSurface::Record => "record",
             ServedSurface::Proof => "proof",
             ServedSurface::AccountState => "account_state",
+            ServedSurface::ReceiptsStream => "receipts_stream",
             ServedSurface::PublishSpendrecord => "publish_spendrecord",
             ServedSurface::BootstrapChallenge => "bootstrap_challenge",
             ServedSurface::BootstrapEntrust => "bootstrap_entrust",
@@ -255,6 +255,7 @@ impl ServedSurface {
             ServedSurface::Record => router.route(&path, get(pull::get_record)),
             ServedSurface::Proof => router.route(&path, get(pull::get_proof)),
             ServedSurface::AccountState => router.route(&path, get(pull::get_account_state)),
+            ServedSurface::ReceiptsStream => router.route(&path, get(pull::stream_receipts)),
             ServedSurface::PublishSpendrecord => {
                 router.route(&path, post(publish::post_publish_spendrecord))
             }
@@ -442,8 +443,8 @@ mod tests {
         GrantResult, Info, Inscription, Job, JobEvent, JobHandle, JobRequest,
         ListInscriptionsRequest, Nullifier as ProtoNullifier, NullifierPath, NullifierPathRequest,
         PublishRequest, PublishResult, PullChallengeRequest, PullRequest,
-        PullResult as ProtoPullResult, RecordBlob, RecordRequest, RevokeRequest, RevokeResult,
-        SignRequest, TransitionRequest,
+        PullResult as ProtoPullResult, Receipt, RecordBlob, RecordRequest, RevokeRequest,
+        RevokeResult, SignRequest, SubscribeReceiptsRequest, TransitionRequest,
     };
     use crate::kernel::KernelRpc;
     use crate::ownership::SessionAuthority;
@@ -454,7 +455,7 @@ mod tests {
     use http_body_util::BodyExt;
     use serde_json::Value;
     use std::collections::{BTreeSet, HashMap};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tonic::Code;
     use tower::ServiceExt;
@@ -555,6 +556,14 @@ mod tests {
         ) -> Result<AccountStateResult, ApiError> {
             Err(ApiError::internal(
                 "test double: get_account_state not configured",
+            ))
+        }
+        async fn subscribe_receipts(
+            &self,
+            _req: SubscribeReceiptsRequest,
+        ) -> Result<BoxStream<'static, Result<Receipt, ApiError>>, ApiError> {
+            Err(ApiError::internal(
+                "test double: subscribe_receipts not configured",
             ))
         }
         async fn entrust_operational_bundle(
@@ -738,12 +747,13 @@ mod tests {
                 "record",
                 "proof",
                 "account_state",
+                "receipts_stream",
                 "publish_spendrecord",
                 "bootstrap_challenge",
                 "bootstrap_entrust",
                 "bootstrap_revoke",
             ]),
-            "chain_inscriptions is served once ListInscriptions is catalog-backed"
+            "always-on surfaces include receipts_stream once SubscribeReceipts is wired"
         );
         assert_eq!(
             endpoints["bootstrap_challenge"].as_str(),
@@ -761,9 +771,8 @@ mod tests {
             endpoints["publish_spendrecord"].as_str(),
             Some("/v1/publish/spendrecord")
         );
-        // Unbuilt surfaces stay off discovery (documented in ServedSurface).
+        // Blossom stays off discovery without ZKCOINS_BLOSSOM_STORE.
         for absent in [
-            "receipts_stream",
             "blossom_get",
             "blossom_head",
             "blossom_upload",
@@ -771,9 +780,14 @@ mod tests {
         ] {
             assert!(
                 !endpoints.contains_key(absent),
-                "unbuilt surface {absent} must stay unadvertised"
+                "unconfigured Blossom surface {absent} must stay unadvertised"
             );
         }
+        assert_eq!(
+            endpoints["receipts_stream"].as_str(),
+            Some("/v1/receipts/stream"),
+            "receipts_stream must be advertised once SubscribeReceipts is wired"
+        );
         assert_eq!(
             endpoints["chain_inscriptions"].as_str(),
             Some("/v1/chain/inscriptions"),
@@ -802,6 +816,10 @@ mod tests {
         assert_eq!(
             endpoints["account_state"].as_str(),
             Some("/v1/account/state")
+        );
+        assert_eq!(
+            endpoints["receipts_stream"].as_str(),
+            Some("/v1/receipts/stream")
         );
         // chain_inscriptions is advertised — the node catalog backs ListInscriptions.
         assert!(
@@ -1109,14 +1127,44 @@ mod tests {
             "stage C2 advertises /v1/pull once the handler exists"
         );
         assert!(
-            !endpoints.contains_key("receipts_stream"),
-            "receipts_stream must stay unadvertised until SubscribeReceipts is wired"
+            endpoints.contains_key("receipts_stream"),
+            "receipts_stream is advertised once SubscribeReceipts is wired"
         );
     }
 
     // -----------------------------------------------------------------------
     // Job-surface handler tests against an honest in-trait kernel double
     // -----------------------------------------------------------------------
+
+    /// Yields scripted receipt items, then parks until dropped.
+    ///
+    /// Drop sets `dropped` so tests can prove client disconnect tears down the
+    /// kernel subscription (same pattern as job-stream body drop).
+    struct HangAfterReceipts {
+        items: std::vec::IntoIter<Result<Receipt, ApiError>>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for HangAfterReceipts {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl futures_util::Stream for HangAfterReceipts {
+        type Item = Result<Receipt, ApiError>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            match self.items.next() {
+                Some(item) => std::task::Poll::Ready(Some(item)),
+                // Park until the consumer drops this stream (client disconnect).
+                None => std::task::Poll::Pending,
+            }
+        }
+    }
 
     #[derive(Default)]
     struct ScriptedKernel {
@@ -1137,6 +1185,14 @@ mod tests {
         get_record: Option<Result<RecordBlob, ApiError>>,
         get_coin_proof: Option<Result<CoinProofBlob, ApiError>>,
         get_account_state: Option<Result<AccountStateResult, ApiError>>,
+        /// Receipts stream: handshake `Err` or a finite list of items (Ok/Err).
+        /// When `subscribe_receipts_hang` is true, the double yields the list
+        /// then parks until the stream is dropped (disconnect cleanup).
+        subscribe_receipts: Option<Result<Vec<Result<Receipt, ApiError>>, ApiError>>,
+        /// After scripted items, hang until drop (for cleanup tests).
+        subscribe_receipts_hang: bool,
+        /// Set true when a hanging receipts stream is dropped.
+        subscribe_receipts_dropped: Arc<AtomicBool>,
         entrust: Option<Result<EntrustResult, ApiError>>,
         revoke: Option<Result<RevokeResult, ApiError>>,
         publish: Option<Result<PublishResult, ApiError>>,
@@ -1148,6 +1204,7 @@ mod tests {
         get_record_calls: AtomicUsize,
         get_coin_proof_calls: AtomicUsize,
         get_account_state_calls: AtomicUsize,
+        subscribe_receipts_calls: AtomicUsize,
         entrust_calls: AtomicUsize,
         revoke_calls: AtomicUsize,
         publish_calls: AtomicUsize,
@@ -1162,6 +1219,8 @@ mod tests {
         last_publish: Mutex<Option<PublishRequest>>,
         /// Last ListInscriptions request (limit / cursor plumbing).
         last_list_inscriptions: Mutex<Option<ListInscriptionsRequest>>,
+        /// Last SubscribeReceipts request (session + chan_bind; never subject).
+        last_subscribe_receipts: Mutex<Option<SubscribeReceiptsRequest>>,
     }
 
     #[async_trait]
@@ -1338,6 +1397,32 @@ mod tests {
                 Some(Ok(r)) => Ok(r.clone()),
                 Some(Err(e)) => Err(e.clone()),
                 None => Err(ApiError::internal("get_account_state not scripted")),
+            }
+        }
+        async fn subscribe_receipts(
+            &self,
+            req: SubscribeReceiptsRequest,
+        ) -> Result<BoxStream<'static, Result<Receipt, ApiError>>, ApiError> {
+            self.subscribe_receipts_calls.fetch_add(1, Ordering::SeqCst);
+            *self
+                .last_subscribe_receipts
+                .lock()
+                .expect("subscribe_receipts mutex") = Some(req);
+            match &self.subscribe_receipts {
+                Some(Ok(events)) => {
+                    let events = events.clone();
+                    if self.subscribe_receipts_hang {
+                        let dropped = Arc::clone(&self.subscribe_receipts_dropped);
+                        Ok(Box::pin(HangAfterReceipts {
+                            items: events.into_iter(),
+                            dropped,
+                        }))
+                    } else {
+                        Ok(Box::pin(stream::iter(events)))
+                    }
+                }
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal("subscribe_receipts not scripted")),
             }
         }
         async fn entrust_operational_bundle(
@@ -3532,6 +3617,383 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Receipts stream — GET /v1/receipts/stream (§7.5 L2953–L2955)
+    // -----------------------------------------------------------------------
+
+    fn sample_receipt(coin_byte: u8, amount: &str, credited_at: u64) -> Receipt {
+        Receipt {
+            coin_id: vec![coin_byte; 32],
+            asset_id: vec![0xABu8; 32],
+            amount: amount.to_string(),
+            state: "completed".into(),
+            credited_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn receipts_stream_happy_path_two_frames() {
+        let r1 = sample_receipt(0x11, "1000", 1_700_000_100);
+        let r2 = sample_receipt(0x22, "250", 1_700_000_200);
+        let kernel = Arc::new(ScriptedKernel {
+            subscribe_receipts: Some(Ok(vec![Ok(r1.clone()), Ok(r2.clone())])),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/receipts/stream")
+                    .header("authorization", "Bearer sess-own-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let ct = match res.headers().get("content-type") {
+            Some(v) => match v.to_str() {
+                Ok(s) => s,
+                Err(e) => panic!("content-type is not ASCII: {e}"),
+            },
+            None => panic!("SSE response missing content-type header"),
+        };
+        assert!(
+            ct.starts_with("text/event-stream"),
+            "SSE content-type, got {ct:?}"
+        );
+        let body = String::from_utf8(body_bytes(res).await).expect("utf8");
+
+        // Frame form: event: receipt\ndata: <json>\n\n (axum SSE).
+        let event_count = body.matches("event: receipt").count();
+        assert_eq!(
+            event_count, 2,
+            "must emit exactly two receipt events, body={body}"
+        );
+        assert!(
+            body.contains("event: receipt\ndata:"),
+            "frame must be event then data, body={body}"
+        );
+
+        // Field encodings: hex32 digests, decimal strings for amount/credited_at.
+        let coin1 = encode_hex(&r1.coin_id);
+        let coin2 = encode_hex(&r2.coin_id);
+        let asset = encode_hex(&r1.asset_id);
+        assert!(
+            body.contains(&format!("\"coin_id\":\"{coin1}\"")),
+            "first coin_id hex, body={body}"
+        );
+        assert!(
+            body.contains(&format!("\"coin_id\":\"{coin2}\"")),
+            "second coin_id hex, body={body}"
+        );
+        assert!(
+            body.contains(&format!("\"asset_id\":\"{asset}\"")),
+            "asset_id hex, body={body}"
+        );
+        assert!(
+            body.contains("\"amount\":\"1000\""),
+            "amount decimal string, body={body}"
+        );
+        assert!(
+            body.contains("\"amount\":\"250\""),
+            "second amount decimal string, body={body}"
+        );
+        assert!(
+            body.contains("\"state\":\"completed\""),
+            "state literal, body={body}"
+        );
+        assert!(
+            body.contains("\"credited_at\":\"1700000100\""),
+            "credited_at decimal string, body={body}"
+        );
+        assert!(
+            body.contains("\"credited_at\":\"1700000200\""),
+            "second credited_at decimal string, body={body}"
+        );
+
+        // Kernel saw session + chan_bind only (no subject on the wire type).
+        let req = kernel
+            .last_subscribe_receipts
+            .lock()
+            .expect("mutex")
+            .clone()
+            .expect("subscribe_receipts must have been called");
+        assert_eq!(req.session, "sess-own-1");
+        let expected_cb = chan_bind_for_host("node.example.com");
+        assert_eq!(req.chan_bind, expected_cb.to_vec());
+        assert_eq!(kernel.subscribe_receipts_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn receipts_stream_grant_session_is_admitted() {
+        // §7.5 L2953: any still-valid ownership OR grant pull session is
+        // admissible — contrast with GET /v1/account/state (ownership only).
+        let r = sample_receipt(0x33, "42", 1_700_000_300);
+        let kernel = Arc::new(ScriptedKernel {
+            subscribe_receipts: Some(Ok(vec![Ok(r)])),
+            // Same grant token on account/state is rejected by the kernel.
+            get_account_state: Some(Err(crate::kernel::kernel_status_to_api_error(
+                &encode_kernel_error_status(
+                    Code::Unauthenticated,
+                    "grant session does not authorise GetAccountState",
+                    "unauthorized",
+                    401,
+                ),
+            ))),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/receipts/stream")
+                    .header("authorization", "Bearer grant-session-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "grant session must open the receipts stream"
+        );
+        let body = String::from_utf8(body_bytes(res).await).expect("utf8");
+        assert!(
+            body.contains("event: receipt"),
+            "grant session must receive receipt frames, body={body}"
+        );
+        assert_eq!(
+            kernel.subscribe_receipts_calls.load(Ordering::SeqCst),
+            1,
+            "kernel SubscribeReceipts must run for a grant session"
+        );
+
+        // Contrast: same grant token on account/state → 401 unauthorized.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/account/state")
+                    .header("authorization", "Bearer grant-session-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn receipts_stream_missing_bearer_is_401_not_kernel() {
+        let kernel = Arc::new(ScriptedKernel {
+            subscribe_receipts: Some(Ok(vec![Ok(sample_receipt(0x01, "1", 1))])),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/receipts/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+        assert_eq!(
+            kernel.subscribe_receipts_calls.load(Ordering::SeqCst),
+            0,
+            "missing bearer must fail at the API edge before any kernel call"
+        );
+    }
+
+    #[tokio::test]
+    async fn receipts_stream_malformed_bearer_is_401_not_410() {
+        let kernel = Arc::new(ScriptedKernel {
+            subscribe_receipts: Some(Ok(vec![Ok(sample_receipt(0x01, "1", 1))])),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/receipts/stream")
+                    .header("authorization", "NotBearer xyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+        assert_eq!(kernel.subscribe_receipts_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn receipts_stream_unknown_session_is_410() {
+        // Unknown / expired / chan_bind-mismatch → session_expired / 410
+        // (same split as GET /v1/proof/<coin_id>; never collapse into 401).
+        let status = encode_kernel_error_status(
+            Code::Unauthenticated,
+            "pull session expired or channel mismatch",
+            "session_expired",
+            410,
+        );
+        let secret_token = "super-secret-session-token-never-echo";
+        let kernel = Arc::new(ScriptedKernel {
+            subscribe_receipts: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/receipts/stream")
+                    .header("authorization", format!("Bearer {secret_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::GONE);
+        let body = body_bytes(res).await;
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "session_expired");
+        assert_eq!(kernel.subscribe_receipts_calls.load(Ordering::SeqCst), 1);
+        // Token must not appear in the error body (no log/message leakage).
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            !body_str.contains(secret_token),
+            "session token must never appear in the error body: {body_str}"
+        );
+        assert!(
+            !json["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains(secret_token),
+            "session token must never appear in error message"
+        );
+    }
+
+    #[tokio::test]
+    async fn receipts_stream_chan_bind_mismatch_is_410() {
+        // Kernel maps chan_bind mismatch to the same 410 as unknown/expired.
+        let status = encode_kernel_error_status(
+            Code::Unauthenticated,
+            "pull session channel binding mismatch",
+            "session_expired",
+            410,
+        );
+        let kernel = Arc::new(ScriptedKernel {
+            subscribe_receipts: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/receipts/stream")
+                    .header("authorization", "Bearer sess-chan-mismatch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::GONE);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "session_expired");
+        // API still forwarded the authoritative config chan_bind (not Host).
+        let req = kernel
+            .last_subscribe_receipts
+            .lock()
+            .expect("mutex")
+            .clone()
+            .expect("subscribe must have been called");
+        assert_eq!(
+            req.chan_bind,
+            chan_bind_for_host("node.example.com").to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn receipts_stream_query_subject_is_ignored() {
+        // Request carries no subject field to the kernel; a client-supplied
+        // query subject must not change the SubscribeReceiptsRequest.
+        let r = sample_receipt(0x44, "7", 1_700_000_400);
+        let kernel = Arc::new(ScriptedKernel {
+            subscribe_receipts: Some(Ok(vec![Ok(r)])),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/receipts/stream?subject=zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq&subject=other")
+                    .header("authorization", "Bearer sess-ignore-subject")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let req = kernel
+            .last_subscribe_receipts
+            .lock()
+            .expect("mutex")
+            .clone()
+            .expect("subscribe must have been called");
+        assert_eq!(req.session, "sess-ignore-subject");
+        assert_eq!(
+            req.chan_bind,
+            chan_bind_for_host("node.example.com").to_vec()
+        );
+        // SubscribeReceiptsRequest has only session + chan_bind — no subject
+        // field exists to populate; the capture proves that is all that was sent.
+        let _ = req;
+    }
+
+    #[tokio::test]
+    async fn receipts_stream_client_disconnect_drops_subscription() {
+        let kernel = Arc::new(ScriptedKernel {
+            subscribe_receipts: Some(Ok(vec![])),
+            subscribe_receipts_hang: true,
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/receipts/stream")
+                    .header("authorization", "Bearer sess-drop")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(
+            !kernel.subscribe_receipts_dropped.load(Ordering::SeqCst),
+            "subscription must still be live while the response is held"
+        );
+        // Dropping the response body tears down the SSE consumer → gRPC stream.
+        drop(res);
+        // Allow the async drop path to run.
+        tokio::task::yield_now().await;
+        assert!(
+            kernel.subscribe_receipts_dropped.load(Ordering::SeqCst),
+            "client disconnect must drop the kernel SubscribeReceipts stream"
+        );
+        assert_eq!(kernel.subscribe_receipts_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // -----------------------------------------------------------------------
     // Stage D — Bootstrap + Publish
     // -----------------------------------------------------------------------
 
@@ -4109,11 +4571,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unbuilt_and_unconfigured_surfaces_remain_404_and_absent_from_discovery() {
+    async fn unconfigured_blossom_surfaces_remain_404_and_absent_from_discovery() {
         // test_config has blossom: None — Blossom must stay off the map.
+        // receipts_stream is always-on and must be registered (auth fails closed).
         let app = test_app();
         for path in [
-            "/v1/receipts/stream",
             "/blossom/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "/blossom/upload",
         ] {
@@ -4125,16 +4587,35 @@ mod tests {
             assert_eq!(
                 res.status(),
                 StatusCode::NOT_FOUND,
-                "unconfigured/unbuilt surface {path} must not be registered"
+                "unconfigured Blossom surface {path} must not be registered"
             );
         }
+        // Always-on receipts stream is registered: missing bearer → 401, not 404.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/receipts/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "receipts_stream must be registered; missing bearer is 401"
+        );
         let res = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
         let endpoints = json["endpoints"].as_object().unwrap();
-        assert!(!endpoints.contains_key("receipts_stream"));
+        assert!(
+            endpoints.contains_key("receipts_stream"),
+            "receipts_stream is always-on and must appear in discovery"
+        );
         assert!(!endpoints.contains_key("blossom_get"));
         assert!(!endpoints.contains_key("blossom_upload"));
         assert!(

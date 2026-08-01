@@ -168,6 +168,7 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Replica-/Blob-Pfad).
 | `GET /v1/record/<record_id>` | **implementiert** — `GetRecord` (Bearer-Session) |
 | `GET /v1/proof/<coin_id>` | **implementiert** — `GetCoinProof` (Bearer-Session) |
 | `GET /v1/account/state` | **implementiert** — `GetAccountState` (Ownership-Session) |
+| `GET /v1/receipts/stream` | **implementiert** — `SubscribeReceipts` als SSE (Ownership- **oder** Grant-Session; 401/410-Trennung wie Proof) |
 | `POST /v1/bootstrap/challenge` | **implementiert** — `OpenPullChallenge` (`action = entrust` \| `revoke`) |
 | `POST /v1/bootstrap/entrust` | **implementiert** — OwnershipProof (Entrust-Domain) + Bundle-Längenprüfung (161 B), dann `EntrustOperationalBundle`; Bundle wird nie geloggt |
 | `POST /v1/bootstrap/revoke` | **implementiert** — OwnershipProof (Revoke-Domain), dann `RevokeOperationalBundle` |
@@ -179,7 +180,6 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Replica-/Blob-Pfad).
 
 | Key | Warum |
 |---|---|
-| `receipts_stream` | Kernel-`SubscribeReceipts` Unimplemented; der node nennt die fehlende Push-/Quell-Voraussetzung. |
 | `blossom_*` (ohne `ZKCOINS_BLOSSOM_STORE`) | §7.4; die vier Schlüssel werden **nur** advertised, wenn der inhaltsadressierte Store konfiguriert ist. |
 
 Router und Discovery teilen eine Quelle (`ServedSurface` in `src/routes.rs`): eine neue
@@ -196,7 +196,6 @@ ausschließlich über `google.rpc.ErrorInfo` (`domain`, `reason`,
 
 | Lücke | Warum |
 |---|---|
-| `GET /v1/receipts/stream` | Kernel-`SubscribeReceipts` Unimplemented. |
 | Blossom `ReplicaReceiptV1` | §4.6 Dual-Commit (Blob + Delivery-Event) fehlt; Upload antwortet ehrlich nur mit `{ blob_id }` — kein `receipt`. |
 | Feature-Gate `404 feature_disabled` | Bootstrap/Publish/Job/Attest-Fläche ist in dieser Stufe always-on; Gate folgt mit den optionalen Rollen. |
 

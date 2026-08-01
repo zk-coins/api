@@ -35,7 +35,7 @@ The API layer sits **outward** of the node. It consumes the node's internal **ke
 ### Inventory and stage A (this branch)
 
 - Full §7.5 endpoint inventory (method, capability, feature, kernel RPC): [`docs/rest-surface.md`](docs/rest-surface.md).
-- Rust process (`axum` + `tonic 0.13.1` client): **`GET /`**, **`GET /health`**, info/chain reads, the job surface, and **attest/grants** (`POST /v1/attest/balance[/challenge]`, `POST /v1/grants[/challenge]`). No placeholder routes for unbuilt keys.
+- Rust process (`axum` + `tonic 0.13.1` client): **`GET /`**, **`GET /health`**, info/chain reads, the job surface, **attest/grants**, pull/records/account, **`GET /v1/receipts/stream`** (SSE over `SubscribeReceipts`), bootstrap/publish, and optional Blossom. No placeholder routes for unbuilt keys.
 - **OwnershipProof** for attest/grants is verified at the API edge (BIP-340, action-bound domain, `chan_bind`, `request_hash`) **before** any kernel call that would consume a challenge nonce.
 - **`GET /` discovery follows registration** via `ServedSurface` — only served keys are advertised. The 29-key catalogue stays as inventory.
 - Kernel contract: carried `proto/kernel/v1/kernel.proto` with SHA-256 identity pin (`src/proto_identity.rs`); REST errors from `ErrorInfo.metadata["http_status"]` only (API-local auth failures use §7.5 `401 unauthorized` directly).

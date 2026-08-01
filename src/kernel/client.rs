@@ -13,8 +13,9 @@ use crate::kernel::pb::kernel_v1::{
     CoinProofBlob, CoinProofRequest, EntrustRequest, EntrustResult, GetAccumulatorRequest,
     GetInfoRequest, GrantRequest, GrantResult, Info, Inscription, Job, JobEvent, JobHandle,
     JobRequest, ListInscriptionsRequest, NullifierPath, NullifierPathRequest, PublishRequest,
-    PublishResult, PullChallengeRequest, PullRequest, PullResult, RecordBlob, RecordRequest,
-    RevokeRequest, RevokeResult, SignRequest, TransitionRequest,
+    PublishResult, PullChallengeRequest, PullRequest, PullResult, Receipt, RecordBlob,
+    RecordRequest, RevokeRequest, RevokeResult, SignRequest, SubscribeReceiptsRequest,
+    TransitionRequest,
 };
 use crate::ownership::SessionAuthority;
 use async_trait::async_trait;
@@ -31,7 +32,8 @@ use tonic::Request;
 const SESSION_AUTHORITY_METADATA: &str = "x-zkcoins-session-authority";
 
 /// Subset of kernel procedures this stage consumes
-/// (job surface + info/chain + attest/grants + pull/records + bootstrap + publish).
+/// (job surface + info/chain + attest/grants + pull/records + receipts stream
+/// + bootstrap + publish).
 #[async_trait]
 pub trait KernelRpc: Send + Sync {
     async fn submit_transition(&self, req: TransitionRequest) -> Result<JobHandle, ApiError>;
@@ -84,6 +86,15 @@ pub trait KernelRpc: Send + Sync {
         &self,
         req: AccountStateRequest,
     ) -> Result<AccountStateResult, ApiError>;
+
+    /// Server-stream of verified receipts for a pull session (§7.8 / §4.9).
+    /// Handshake failures (unknown session, `chan_bind` mismatch, transport)
+    /// return `Err` before any frame; the REST handler maps those to the
+    /// pre-SSE HTTP status. Mid-stream breaks become `Err` items.
+    async fn subscribe_receipts(
+        &self,
+        req: SubscribeReceiptsRequest,
+    ) -> Result<BoxStream<'static, Result<Receipt, ApiError>>, ApiError>;
 
     async fn entrust_operational_bundle(
         &self,
@@ -341,6 +352,22 @@ impl KernelRpc for KernelClient {
             .await
             .map_err(map_status)?;
         Ok(response.into_inner())
+    }
+
+    async fn subscribe_receipts(
+        &self,
+        req: SubscribeReceiptsRequest,
+    ) -> Result<BoxStream<'static, Result<Receipt, ApiError>>, ApiError> {
+        let mut client = self.inner.clone();
+        let response = client
+            .subscribe_receipts(Request::new(req))
+            .await
+            .map_err(map_status)?;
+        let stream = response.into_inner().map(|item| match item {
+            Ok(receipt) => Ok(receipt),
+            Err(status) => Err(kernel_status_to_api_error(&status)),
+        });
+        Ok(Box::pin(stream))
     }
 
     async fn entrust_operational_bundle(

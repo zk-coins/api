@@ -896,6 +896,13 @@ mod tests {
         ) -> Result<crate::kernel::kernel_v1::AccountStateResult, ApiError> {
             Err(ApiError::internal("not used"))
         }
+        async fn subscribe_receipts(
+            &self,
+            _req: crate::kernel::kernel_v1::SubscribeReceiptsRequest,
+        ) -> Result<BoxStream<'static, Result<crate::kernel::kernel_v1::Receipt, ApiError>>, ApiError>
+        {
+            Err(ApiError::internal("not used"))
+        }
         async fn entrust_operational_bundle(
             &self,
             _req: crate::kernel::kernel_v1::EntrustRequest,
