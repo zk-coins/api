@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  # ---------------------------------------------------------------------
+  # PAUSED — manual dispatch only, on purpose.
+  #
+  # The v1 rebuild is being developed and verified locally; hosted CI is
+  # deliberately out of the loop until the rebuild is finished, and is then
+  # switched back on as the last step before the branch is offered for
+  # review. Running it in between spends runner time on a tree that is
+  # known to be mid-flight, and its red/green says nothing anyone acts on.
+  #
+  # To bring it back: delete this block down to the marker below and
+  # restore the `pull_request:` trigger that follows it, which is left
+  # commented out verbatim so re-enabling is a deletion, not a rewrite.
+  # Nothing else in this file was changed for the pause — every job, guard
+  # and gate is untouched, so the first run after re-enabling exercises
+  # exactly what it did before.
+  #
+  # `workflow_dispatch` stays available: a run can still be started by
+  # hand from the Actions tab when a specific answer is wanted.
+  workflow_dispatch:
+
+  # --- restore from here ------------------------------------------------
+  # CI runs on every pull request regardless of target branch. This
+  # makes the default safe for stacked PRs (PR-A → PR-B → PR-C where
+  # each PR's base is the previous PR's branch) and any other workflow
+  # that opens a PR against a non-`develop` branch — previously such
+  # PRs were silently skipped because `branches: [develop]` filtered
+  # them out, and the only fix was to hand-edit ci.yaml on each new
+  # feature stack.
+  #
+  # `push: develop` is intentionally absent. Every commit reaching
+  # `develop` is already covered by an open PR's `synchronize` event;
+  # adding `on: push: branches: [develop]` would queue a second
+  # workflow instance on the same SHA. (Under the PR-number grouping
+  # in the concurrency block below the two runs would land in
+  # DIFFERENT groups — push keyed by `refs/heads/develop`, PR keyed
+  # by the PR's number — so the block would not deduplicate them.)
+  #
+  # `ready_for_review` is added so the workflow fires the moment a
+  # draft PR is marked ready — drafts themselves skip CI via the
+  # `if:` guard on the job (saves runner time while work is still in
+  # progress).
+  # pull_request:
+  #   types: [opened, synchronize, reopened, ready_for_review]
+  # --- restore to here --------------------------------------------------
+
+concurrency:
+  # Group by PR number so a new push to the same PR cancels the
+  # in-flight run on the outdated commit. Grouping by SHA would put
+  # every commit in its own group, so `cancel-in-progress: true`
+  # never fired and back-to-back pushes queued sequentially.
+  # Falls back to `github.ref` for push/dispatch events (where there
+  # is no `pull_request.number`), so e.g. a `workflow_dispatch` on
+  # the same ref serializes too.
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Single job on GitHub-hosted Linux: fmt, clippy, build, test.
+# No Postgres/testcontainers, no Plonky2 prover, no llvm-cov coverage
+# gate, no self-hosted runner — this tree is small enough that the
+# four local gates (192 tests) fit on `ubuntu-latest` in one job.
+#
+# No `notify-failure` job: this repository does not hold the Telegram
+# bot secrets (`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`). Add one —
+# modelled on the node's `notify-failure` job — once those secrets
+# are provisioned here.
+jobs:
+  lint-and-build:
+    name: Lint & Build
+    # Skip on draft PRs. Non-PR events (push, workflow_dispatch) always
+    # run: `github.event.pull_request` is absent there, so the
+    # `event_name != 'pull_request'` arm keeps them enabled.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The repo pins its toolchain in `rust-toolchain` (a dated nightly,
+      # with `rustfmt` and `clippy` in `components`). Installing that pin
+      # keeps a single compiler for format, lint, build and test — nothing
+      # to drift against a second, explicit channel install. Chosen over
+      # `dtolnay/rust-toolchain@stable` because the pin file is present;
+      # without it this step would use the stable action instead of
+      # inventing a pin.
+      - name: Install the pinned toolchain (rust-toolchain)
+        run: |
+          # `rustup show active-toolchain` installs the pin when the
+          # directory has a `rust-toolchain` file and no matching
+          # toolchain is present yet. The `|| rustup toolchain install`
+          # arm covers the cold case where show exits non-zero before
+          # the pin is available — install is idempotent; a real failure
+          # in the subsequent version checks still fails the step.
+          rustup show active-toolchain || rustup toolchain install
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # `--all-targets` is intentional: without it clippy lints library
+      # targets only, so tests and fixture modules are never linted.
+      # `--all-features` matches the local green suite.
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build
+
+      - name: Test
+        run: cargo test --all-features
