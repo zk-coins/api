@@ -42,6 +42,11 @@ const CLOSED_JOB_STATUSES: &[&str] = &[
 ];
 
 /// Closed terminal `JobError.error` machine codes (§7.5 jobs-family table).
+///
+/// Includes `dependency_not_final`: the productive node stores a typed
+/// `DependencyNotFinal` finalise failure as this terminal machine code
+/// (see node `job_dispatcher` / `v1::signature` encode path). Omitting it
+/// would turn a normative terminal job failure into API `500 internal_error`.
 const CLOSED_JOB_ERROR_CODES: &[&str] = &[
     "invalid_input_coin",
     "insufficient_balance",
@@ -53,6 +58,7 @@ const CLOSED_JOB_ERROR_CODES: &[&str] = &[
     "publish_rejected",
     "circuit_digest_mismatch",
     "idempotency_conflict",
+    "dependency_not_final",
     "malformed_request",
     "internal_error",
 ];
@@ -1596,6 +1602,30 @@ mod tests {
                 || err.cause().unwrap_or("").contains("closed"),
             "cause must name the foreign code, got {:?}",
             err.cause()
+        );
+    }
+
+    /// Node finalise path stores typed `DependencyNotFinal` as terminal
+    /// `JobError.error = "dependency_not_final"`. Poll and SSE must project
+    /// that code, not fail-closed as `500 internal_error`.
+    #[test]
+    fn validate_job_and_poll_accept_dependency_not_final() {
+        let mut job = sample_job("failed");
+        job.error = Some(crate::kernel::kernel_v1::JobError {
+            error: "dependency_not_final".into(),
+            message: "predecessor nullifier not covered by size_final".into(),
+        });
+        validate_job(&job).expect("dependency_not_final is a closed terminal code");
+        assert!(
+            validate_sse_event_status("error", &job).is_ok(),
+            "SSE error event must accept dependency_not_final terminal job"
+        );
+        let json = job_to_json(&job).expect("poll projection");
+        assert_eq!(json["status"], "failed");
+        assert_eq!(json["error"]["error"], "dependency_not_final");
+        assert_eq!(
+            json["error"]["message"],
+            "predecessor nullifier not covered by size_final"
         );
     }
 

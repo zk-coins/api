@@ -18,9 +18,15 @@
 //! check out `zk-coins/node` next to this tree, so a silent `return` on
 //! absence would always be green without testing anything. The test below
 //! therefore **names** that absence (`eprintln` + early return) and keeps
-//! the pin-vs-file assertion as the real, always-on gate. Do not "fix"
-//! the early return into a hard failure unless CI starts checking out the
-//! node contract at a fixed ref.
+//! the pin-vs-file assertion as the real, always-on gate.
+//!
+//! ## PROTO_IDENTITY_CI_BOUNDARY (named follow-up; not fixed here)
+//!
+//! Pin-vs-file alone does not prove identity with the node contract: a PR can
+//! change both the carried proto and the pin together. Closing that gap needs
+//! CI to check out node at a fixed ref (or consume an externally versioned
+//! proto artefact) and fail closed when the reference is missing — cross-repo
+//! CI-checkout follow-up block, not this change.
 //!
 //! Lives in the **api** package (not `kernel-proto`) so `cargo test -p api`
 //! always runs the pin; codegen isolation is a separate concern.

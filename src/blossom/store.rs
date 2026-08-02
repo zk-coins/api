@@ -32,16 +32,21 @@
 //!   take a read lock so recovery cannot run while mutations are in flight.
 //! - **Per-blob `Mutex`:** put and delete_if_uploader for the same content
 //!   address are serialised. Parallel idempotent uploads of the same bytes
-//!   all succeed (loser waits for the complete pair).
+//!   all succeed (loser waits for the complete pair). Lock map entries are
+//!   removed when no waiter holds the Arc anymore — so DELETE/`NotFound` on
+//!   unboundedly many ids cannot grow process memory without bound.
 //!
-//! ## BLOSSOM_MULTI_INSTANCE_BOUNDARY
+//! ## BLOSSOM_MULTI_INSTANCE_BOUNDARY (named follow-up; not fixed here)
 //!
 //! The locks above are **process-local** only. Multiple API processes sharing
 //! one store root are **not** coordinated by this implementation: recovery on
-//! one instance can race a put on another, and `delete_if_uploader` is not
-//! cross-process atomic. Safe multi-instance deployment requires either
-//! single-writer affinity to the store root or an external shared lock
-//! manager — do not scale out against a shared filesystem without that.
+//! one instance can race a put on another (e.g. A installs blob before note,
+//! B's recovery deletes the orphan, A then installs the note and reports
+//! success), and `delete_if_uploader` is not cross-process atomic. Safe
+//! multi-instance deployment requires either single-writer affinity to the
+//! store root or an external shared lock manager / atomic blob+note
+//! publication — do not scale out against a shared filesystem without that.
+//! Tracking: deployment-topology follow-up block, not this PR.
 
 use crate::error::ApiError;
 use crate::hexutil::encode_hex;
@@ -77,6 +82,10 @@ pub struct BlobStore {
     /// See module docs — recovery (write) vs put/delete (read).
     root_lock: RwLock<()>,
     /// Per-blob serialisation of put / delete_if_uploader.
+    ///
+    /// Entries are created on demand and **removed** when the last holder
+    /// finishes (`release_blob_lock`), so the map cannot grow unboundedly
+    /// from DELETE-on-missing or other one-shot id touches.
     blob_locks: Mutex<HashMap<[u8; 32], Arc<Mutex<()>>>>,
 }
 
@@ -162,11 +171,52 @@ impl BlobStore {
             .join(format!("{}.uploader", Self::blob_id_hex(id)))
     }
 
-    fn blob_lock(&self, id: &[u8; 32]) -> Arc<Mutex<()>> {
+    /// Acquire the per-blob serialisation lock (creates the map entry if needed).
+    fn acquire_blob_lock(&self, id: &[u8; 32]) -> Arc<Mutex<()>> {
         let mut map = self.blob_locks.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(*id)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// Drop the caller's Arc and remove the map entry when no other holder
+    /// remains. Must be called **after** the per-blob `Mutex` guard is dropped.
+    ///
+    /// Under the map lock, `strong_count == 2` means only the map entry and
+    /// `held` reference this Arc (any concurrent acquirer would have bumped
+    /// the count while holding the map lock). Removal is then race-free.
+    fn release_blob_lock(&self, id: &[u8; 32], held: Arc<Mutex<()>>) {
+        let mut map = self.blob_locks.lock().unwrap_or_else(|e| e.into_inner());
+        if Arc::strong_count(&held) == 2 {
+            if let Some(current) = map.get(id) {
+                if Arc::ptr_eq(current, &held) {
+                    map.remove(id);
+                }
+            }
+        }
+        // `held` drops at end of scope; after a successful remove the map no
+        // longer retains the Arc.
+        drop(held);
+    }
+
+    /// Run `f` under the per-blob lock, then clean up the map entry if unused.
+    fn with_blob_lock<R>(&self, id: &[u8; 32], f: impl FnOnce() -> R) -> R {
+        let arc = self.acquire_blob_lock(id);
+        let result = {
+            let _guard = arc.lock().unwrap_or_else(|e| e.into_inner());
+            f()
+        };
+        self.release_blob_lock(id, arc);
+        result
+    }
+
+    /// Test/diagnostic: number of live per-blob lock map entries.
+    #[cfg(test)]
+    fn blob_lock_entry_count(&self) -> usize {
+        self.blob_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// `true` when a **complete** durable pair (blob + note) exists.
@@ -246,10 +296,7 @@ impl BlobStore {
 
         // Root read lock: recovery (write) cannot run while put is active.
         let _root = self.root_lock.read().unwrap_or_else(|e| e.into_inner());
-        let blob_mu = self.blob_lock(&id);
-        let _blob = blob_mu.lock().unwrap_or_else(|e| e.into_inner());
-
-        self.put_locked(body, uploader_op, &id)
+        self.with_blob_lock(&id, || self.put_locked(body, uploader_op, &id))
     }
 
     fn put_locked(
@@ -353,34 +400,33 @@ impl BlobStore {
         expected_uploader: &[u8; 32],
     ) -> Result<DeleteIfUploader, ApiError> {
         let _root = self.root_lock.read().unwrap_or_else(|e| e.into_inner());
-        let blob_mu = self.blob_lock(id);
-        let _blob = blob_mu.lock().unwrap_or_else(|e| e.into_inner());
-
-        if !self.exists(id) {
-            return Ok(DeleteIfUploader::NotFound);
-        }
-        let Some(actual) = self.read_uploader(id)? else {
-            // Incomplete: refuse as not found for DELETE surface (fail-closed
-            // at handler if note missing is preferred as scope_exceeded —
-            // without a complete pair there is nothing to authorise).
-            return Ok(DeleteIfUploader::NotFound);
-        };
-        if &actual != expected_uploader {
-            return Ok(DeleteIfUploader::WrongUploader);
-        }
-        self.delete_pair_locked(id)?;
-        Ok(DeleteIfUploader::Deleted)
+        self.with_blob_lock(id, || {
+            if !self.exists(id) {
+                return Ok(DeleteIfUploader::NotFound);
+            }
+            let Some(actual) = self.read_uploader(id)? else {
+                // Incomplete: refuse as not found for DELETE surface (fail-closed
+                // at handler if note missing is preferred as scope_exceeded —
+                // without a complete pair there is nothing to authorise).
+                return Ok(DeleteIfUploader::NotFound);
+            };
+            if &actual != expected_uploader {
+                return Ok(DeleteIfUploader::WrongUploader);
+            }
+            self.delete_pair_locked(id)?;
+            Ok(DeleteIfUploader::Deleted)
+        })
     }
 
     /// Delete blob and uploader note. Returns `true` if the blob existed.
     /// Prefer [`delete_if_uploader`] for authorised DELETE.
     pub fn delete(&self, id: &[u8; 32]) -> Result<bool, ApiError> {
         let _root = self.root_lock.read().unwrap_or_else(|e| e.into_inner());
-        let blob_mu = self.blob_lock(id);
-        let _blob = blob_mu.lock().unwrap_or_else(|e| e.into_inner());
-        let existed = self.exists(id);
-        self.delete_pair_locked(id)?;
-        Ok(existed)
+        self.with_blob_lock(id, || {
+            let existed = self.exists(id);
+            self.delete_pair_locked(id)?;
+            Ok(existed)
+        })
     }
 
     fn delete_pair_locked(&self, id: &[u8; 32]) -> Result<(), ApiError> {
@@ -656,6 +702,38 @@ mod tests {
             store.delete_if_uploader(&id, &owner).unwrap(),
             DeleteIfUploader::NotFound
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// DELETE/`NotFound` on distinct missing ids must not retain per-id lock
+    /// map entries (unbounded memory growth / external DoS surface).
+    #[test]
+    fn delete_not_found_does_not_retain_blob_lock_entries() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let op = [0x66u8; 32];
+        assert_eq!(store.blob_lock_entry_count(), 0);
+        for i in 0..128u32 {
+            let mut id = [0u8; 32];
+            id[0..4].copy_from_slice(&i.to_le_bytes());
+            assert_eq!(
+                store.delete_if_uploader(&id, &op).unwrap(),
+                DeleteIfUploader::NotFound
+            );
+        }
+        assert_eq!(
+            store.blob_lock_entry_count(),
+            0,
+            "NotFound must release per-blob lock map entries"
+        );
+        // put + delete of a real blob must also leave the map empty.
+        let id = store.put(b"cleanup-after-real-blob", &op).expect("put");
+        assert_eq!(store.blob_lock_entry_count(), 0);
+        assert_eq!(
+            store.delete_if_uploader(&id, &op).unwrap(),
+            DeleteIfUploader::Deleted
+        );
+        assert_eq!(store.blob_lock_entry_count(), 0);
         let _ = fs::remove_dir_all(&root);
     }
 
