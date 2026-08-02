@@ -3,7 +3,7 @@
 //! | Method | Path | Kernel |
 //! |---|---|---|
 //! | `POST` | `/v1/pull/challenge` | `OpenPullChallenge` action=`pull` |
-//! | `POST` | `/v1/pull` | `Pull` (after OwnershipProof; GrantProof rejected) |
+//! | `POST` | `/v1/pull` | `Pull` (after OwnershipProof **or** GrantProof) |
 //! | `GET`  | `/v1/record/<record_id>` | `GetRecord` |
 //! | `GET`  | `/v1/proof/<coin_id>` | `GetCoinProof` |
 //! | `GET`  | `/v1/account/state` | `GetAccountState` (ownership session only) |
@@ -12,6 +12,8 @@
 //! The API holds **no** session store: the bearer token is forwarded to the
 //! kernel. Session authority is taken solely from the verified proof kind and
 //! sent as interim metadata `x-zkcoins-session-authority` (never defaulted).
+//! The **resolved (intersected) scope** is computed here and sent on `Pull`;
+//! the kernel records it into the session and never widens it.
 //!
 //! `GET /v1/receipts/stream` admits **any** still-valid ownership **or** grant
 //! pull session (§7.5 L2953) — unlike `GET /v1/account/state`, which is
@@ -26,9 +28,9 @@ use crate::kernel::kernel_v1::{
     Scope, SubscribeReceiptsRequest,
 };
 use crate::ownership::{
-    chan_bind_for_host, decode_zk_address, parse_u64_decimal, reject_grant_proof,
-    verify_pull_ownership_proof, GrantProofJson, OwnershipProofJson, SessionAuthority,
-    PULL_CHALLENGE_DOMAIN, SCOPE_NOT_AFTER_UNBOUNDED,
+    chan_bind_for_host, decode_zk_address, parse_u64_decimal, verify_grant_proof,
+    verify_pull_ownership_proof, GrantProofJson, GrantVerificationContext, OwnershipProofJson,
+    ResolvedScope, SessionAuthority, PULL_CHALLENGE_DOMAIN, SCOPE_NOT_AFTER_UNBOUNDED,
 };
 use crate::state::AppState;
 use axum::extract::{Path, State};
@@ -41,6 +43,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -63,8 +66,12 @@ pub struct PullScopeJson {
     pub not_after: Option<String>,
 }
 
-/// Redeem body: top-level `{ nonce, expiry, proof }` (Redeem-body `expiry`
-/// normative — not nested under `challenge`).
+/// Redeem body: top-level `{ nonce, expiry, proof, scope? }`.
+///
+/// Redeem-body `expiry` is normative (bound into signed `chal`). Optional
+/// `scope` re-echoes the requested scope so a **stateless** API edge can
+/// compute `requested ∩ capability` without a challenge store (§5.1). Omitted
+/// scope normalises to the unbounded sentinel pair before intersection.
 #[derive(Debug, Deserialize)]
 pub struct PullBody {
     pub nonce: String,
@@ -72,6 +79,9 @@ pub struct PullBody {
     /// trusted as a clock source — a forged value fails BIP-340).
     pub expiry: String,
     pub proof: PullProofJson,
+    /// Requested scope re-echo (same shape as challenge). Omitted ⇒ unbounded.
+    #[serde(default)]
+    pub scope: Option<PullScopeJson>,
 }
 
 /// Closed proof discriminator for `POST /v1/pull`.
@@ -97,26 +107,9 @@ pub enum PullProofJson {
 // Scope normalisation (§5.1 / §7.5)
 // ---------------------------------------------------------------------------
 
-struct NormalisedScope {
-    all_assets: bool,
-    asset_ids: Vec<[u8; 32]>,
-    not_before: u64,
-    not_after: u64,
-}
-
-/// Unbounded scope: `asset_ids = "*"`, `not_before = 0`, `not_after = 2⁶³−1`.
-fn unbounded_scope() -> NormalisedScope {
-    NormalisedScope {
-        all_assets: true,
-        asset_ids: Vec::new(),
-        not_before: 0,
-        not_after: SCOPE_NOT_AFTER_UNBOUNDED,
-    }
-}
-
 /// Normalise REST scope to the single unbounded-sentinel pair **before**
-/// the kernel RPC (§5.1 L1918).
-fn normalise_scope(scope: &PullScopeJson) -> Result<NormalisedScope, ApiError> {
+/// the kernel RPC and any scope intersection (§5.1 L1918).
+fn normalise_scope(scope: &PullScopeJson) -> Result<ResolvedScope, ApiError> {
     let (all_assets, asset_ids) = match &scope.asset_ids {
         Value::String(s) if s == "*" => (true, Vec::new()),
         Value::String(s) => {
@@ -161,7 +154,7 @@ fn normalise_scope(scope: &PullScopeJson) -> Result<NormalisedScope, ApiError> {
             .map_err(|e| ApiError::malformed(format!("scope.not_after: {}", e.body.message)))?,
     };
 
-    Ok(NormalisedScope {
+    Ok(ResolvedScope {
         all_assets,
         asset_ids,
         not_before,
@@ -169,13 +162,20 @@ fn normalise_scope(scope: &PullScopeJson) -> Result<NormalisedScope, ApiError> {
     })
 }
 
-fn scope_to_proto(scope: &NormalisedScope) -> Scope {
+fn scope_to_proto(scope: &ResolvedScope) -> Scope {
     Scope {
         asset_ids: scope.asset_ids.iter().map(|a| a.to_vec()).collect(),
         all_assets: scope.all_assets,
         not_before: scope.not_before,
         not_after: scope.not_after,
     }
+}
+
+fn unix_now() -> Result<u64, ApiError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| ApiError::internal("system clock is before Unix epoch"))
 }
 
 // ---------------------------------------------------------------------------
@@ -281,9 +281,29 @@ fn bearer_token(headers: &HeaderMap) -> Result<String, ApiError> {
 
 /// Authoritative `chan_bind` for session-bound follow-ups.
 ///
-/// Exactly one configured public host is required: with several hosts the API
-/// cannot re-select the original binding without reading the request `Host`
-/// (forbidden by §5.1 / §7.8). Multi-host session routing is a documented GAP.
+/// # Single host (this stage)
+///
+/// Exactly one configured public host is required here. Proof verification on
+/// `POST /v1/pull` already accepts **any** of the configured hosts (try each
+/// `chan_bind` until BIP-340 verifies — §5.1). Session follow-ups are different:
+/// the session record stores **one** `chan_bind` from the accepting proof, and
+/// the API must recompute that same value for the current connection so the
+/// kernel can equality-check it.
+///
+/// # Why multi-host is refused (not silently left open)
+///
+/// Spec §5.1 forbids deriving `host` from attacker-influenceable request
+/// metadata such as a forwarded `Host` header. With several authoritative
+/// names the API therefore cannot know which host the client dialed on this
+/// TCP/TLS connection without a **trusted** side channel (e.g. TLS SNI as
+/// observed by a co-located terminator, or a single front-end name). Until
+/// that path exists, multi-host session re-bind fails closed with 500 rather
+/// than guessing — guessing would either reject legitimate clients or accept
+/// a captured token against the wrong name.
+///
+/// What would close the GAP: a trusted connection-identity input (SNI /
+/// local socket metadata) that selects exactly one entry of
+/// `ZKCOINS_PUBLIC_HOST` per request, still never the client `Host` header.
 fn session_chan_bind(public_hosts: &[String]) -> Result<[u8; 32], ApiError> {
     match public_hosts {
         [] => Err(ApiError::internal(
@@ -291,9 +311,10 @@ fn session_chan_bind(public_hosts: &[String]) -> Result<[u8; 32], ApiError> {
         )),
         [only] => Ok(chan_bind_for_host(only)),
         _ => Err(ApiError::internal(
-            "session channel binding requires exactly one ZKCOINS_PUBLIC_HOST \
-             in this stage (multi-host re-bind would need a trusted SNI path, \
-             not the client Host header)",
+            "session channel binding requires exactly one ZKCOINS_PUBLIC_HOST: \
+             multi-host re-bind needs a trusted SNI/connection-identity path \
+             (not the client Host header; §5.1). Proof verification already \
+             accepts any configured host; only follow-up session routes are restricted",
         )),
     }
 }
@@ -349,15 +370,23 @@ pub async fn post_pull_challenge(
 
 /// `POST /v1/pull` → verify proof, then `Pull`.
 ///
-/// OwnershipProof is verified pure (no kernel) so a bad signature cannot
-/// consume the single-use nonce. GrantProof is rejected fail-closed (no
-/// op_pubkey lookup — see [`reject_grant_proof`]).
+/// OwnershipProof and GrantProof are verified **pure** (no kernel) so a bad
+/// signature cannot consume the single-use nonce. The resolved scope passed
+/// to the kernel is exactly what the capability authorises after intersection
+/// with the requested scope — never widened, never defaulted to unbounded
+/// under a scoped grant.
 pub async fn post_pull(
     State(state): State<AppState>,
     Json(body): Json<PullBody>,
 ) -> Result<Response, ApiError> {
+    // Requested scope: re-echo on redeem, or unbounded sentinels when omitted.
+    let requested_scope = match &body.scope {
+        None => ResolvedScope::unbounded(),
+        Some(s) => normalise_scope(s)?,
+    };
+
     // ---- pure validation + capability gate (no kernel) ----
-    let (verified, authority) = match body.proof {
+    let (subject_bech32, nonce, chan_bind, resolved, authority) = match body.proof {
         PullProofJson::Ownership {
             subject,
             public_key,
@@ -378,7 +407,15 @@ pub async fn post_pull(
                 &proof,
                 state.public_hosts.as_slice(),
             )?;
-            (v, SessionAuthority::Ownership)
+            // Ownership authorises the full account: resolved = requested
+            // (requester may narrow; omitted/`*` ⇒ whole account). §5.1(a).
+            (
+                v.subject_bech32,
+                v.nonce,
+                v.chan_bind,
+                requested_scope,
+                SessionAuthority::Ownership,
+            )
         }
         PullProofJson::Grant {
             grant,
@@ -387,33 +424,62 @@ pub async fn post_pull(
         } => {
             let proof = GrantProofJson {
                 proof_type: "grant".into(),
-                grant,
+                grant: grant.clone(),
                 grantee_pk,
                 signature,
             };
-            // Structural fail-closed: never half-check a grant.
-            return Err(reject_grant_proof(&proof));
+            // Decode first so we know which subject's published op to load.
+            let decoded = crate::ownership::decode_view_grant(&grant)?;
+            let op_pubkey = match state.subject_ops.get(&decoded.subject) {
+                Some(pk) => pk,
+                None => {
+                    return Err(ApiError::unauthorized(
+                        "GrantProof rejected: subject's published op_pubkey is not available \
+                         (Nostr kind-30420 profile resolution with §4.3 address binding is \
+                         not wired; subject_ops directory has no entry). Half-checked grants \
+                         are forbidden (§5.1(b) step 1)",
+                    ));
+                }
+            };
+            let now = unix_now()?;
+            let v = verify_grant_proof(
+                &body.nonce,
+                &body.expiry,
+                &proof,
+                &op_pubkey,
+                &requested_scope,
+                &GrantVerificationContext {
+                    public_hosts: state.public_hosts.as_slice(),
+                    now,
+                    revoked: state.revoked_grants.as_ref(),
+                },
+            )?;
+            // Fail-closed belt: a grant session must never carry a fully
+            // unbounded scope when the grant itself was scoped.
+            if v.resolved_scope.is_fully_unbounded() && !v.grant_scope.is_fully_unbounded() {
+                return Err(ApiError::internal(
+                    "grant resolved_scope is fully unbounded while grant.scope is not — refuse",
+                ));
+            }
+            (
+                v.subject_bech32,
+                v.nonce,
+                v.chan_bind,
+                v.resolved_scope,
+                SessionAuthority::Grant,
+            )
         }
     };
-
-    // Ownership authorises the full account; resolved scope is the unbounded
-    // sentinel pair. A narrower scope requested at challenge time is enforced
-    // by the kernel (`resolved ⊆ requested`). Clients that open a narrow
-    // challenge and then pull with unbounded resolved_scope get
-    // `scope_exceeded` from the kernel — fail-closed, not silently widened.
-    // GAP: a stateless API cannot recompute the exact requested scope without
-    // a challenge store or a client re-echo of scope on redeem.
-    let resolved = unbounded_scope();
 
     // ---- only now: kernel (nonce consumption lives here) ----
     let result: ProtoPullResult = state
         .kernel
         .pull(
             PullRequest {
-                nonce: verified.nonce.to_vec(),
-                subject: verified.subject_bech32,
+                nonce: nonce.to_vec(),
+                subject: subject_bech32,
                 resolved_scope: Some(scope_to_proto(&resolved)),
-                chan_bind: verified.chan_bind.to_vec(),
+                chan_bind: chan_bind.to_vec(),
             },
             authority,
         )

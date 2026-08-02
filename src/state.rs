@@ -8,6 +8,7 @@
 use crate::blossom::BlossomState;
 use crate::config::Feature;
 use crate::kernel::KernelHandle;
+use crate::ownership::{RevokedGrantSet, SubjectOpDirectory};
 use axum::extract::FromRef;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -25,6 +26,11 @@ pub struct AppState {
     /// §7.4 Blossom surface. `None` when `ZKCOINS_BLOSSOM_STORE` is unset —
     /// routes are not mounted and discovery keys are not advertised.
     pub blossom: Option<BlossomState>,
+    /// Published `op_pubkey` by subject for GrantProof step 1 (§5.1(b)).
+    /// Starts empty — see [`SubjectOpDirectory`].
+    pub subject_ops: Arc<SubjectOpDirectory>,
+    /// Forward-only grant revocation set (§5.2).
+    pub revoked_grants: Arc<RevokedGrantSet>,
 }
 
 impl FromRef<AppState> for KernelHandle {

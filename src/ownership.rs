@@ -26,6 +26,8 @@ use bitcoin::secp256k1::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::sync::RwLock;
 
 // ---------------------------------------------------------------------------
 // Domain tags — taken from node `ChallengeAction::domain()` (sole definition
@@ -64,8 +66,20 @@ pub const PULL_HOST_DOMAIN: &str = "zkCoins/v1/PullHost";
 /// Bech32m HRP for a zkCoins address (§1.7.7).
 pub const ADDRESS_HRP: &str = "zk";
 
+/// Bech32m HRP for a serialised view grant (§5.2 / §1.7.7).
+pub const GRANT_HRP: &str = "zkgrant";
+
+/// §5.2 `grant_message` domain tag (Foundations `Grant` context).
+pub const GRANT_MESSAGE_TAG: &str = "zkCoins/v1/Grant";
+
+/// §5.2 grant version byte (currently always `0x01`).
+pub const GRANT_VERSION: u8 = 0x01;
+
 /// Unbounded `not_after` sentinel: `2⁶³−1` (§5.1).
 pub const SCOPE_NOT_AFTER_UNBOUNDED: u64 = 9_223_372_036_854_775_807;
+
+// Lock the §5.1 bit-pattern: unbounded not_after is exactly i64::MAX as u64.
+const _: () = assert!(SCOPE_NOT_AFTER_UNBOUNDED == i64::MAX as u64);
 
 // Goldilocks field order — nk_commit limbs on the wire must be strictly `< p`
 // (same fail-loud rule as node `digest_from_bytes`).
@@ -410,23 +424,41 @@ fn address_from_pk0_nk_commit(pk0: &[u8; 32], nk_commit: &[u8; 32]) -> [u8; 32] 
 /// Verify BIP-340 Schnorr over a 32-byte message digest under an x-only key.
 ///
 /// Uses `bitcoin::secp256k1` — the same stack as zk-coins/node.
+/// `fail_message` is returned on cryptographic mismatch (wrong key, bad sig,
+/// wrong preimage) so callers can name OwnershipProof vs GrantProof context.
 pub fn verify_bip340(
-    pk0: &[u8; 32],
+    pk: &[u8; 32],
     signature: &[u8; 64],
     message_digest: &[u8; 32],
 ) -> Result<(), ApiError> {
-    let xonly = XOnlyPublicKey::from_slice(pk0).map_err(|_| {
-        ApiError::unauthorized("ownership_proof.public_key is not a valid x-only pubkey")
-    })?;
-    let sig = SchnorrSignature::from_slice(signature).map_err(|_| {
-        ApiError::unauthorized("ownership_proof.signature is not a valid BIP-340 signature")
-    })?;
+    verify_bip340_with_message(
+        pk,
+        signature,
+        message_digest,
+        "public key is not a valid x-only pubkey",
+        "signature is not a valid BIP-340 signature",
+        "BIP-340 signature invalid (key, preimage, or chan_bind/domain mismatch)",
+    )
+}
+
+/// BIP-340 verify with caller-chosen unauthorized messages (grant vs ownership).
+pub fn verify_bip340_with_message(
+    pk: &[u8; 32],
+    signature: &[u8; 64],
+    message_digest: &[u8; 32],
+    bad_pk_message: &str,
+    bad_sig_encoding_message: &str,
+    verify_fail_message: &str,
+) -> Result<(), ApiError> {
+    let xonly = XOnlyPublicKey::from_slice(pk)
+        .map_err(|_| ApiError::unauthorized(bad_pk_message.to_string()))?;
+    let sig = SchnorrSignature::from_slice(signature)
+        .map_err(|_| ApiError::unauthorized(bad_sig_encoding_message.to_string()))?;
     let msg = Message::from_digest_slice(message_digest)
         .map_err(|_| ApiError::internal("BIP-340 message digest must be 32 bytes"))?;
     let secp = Secp256k1::verification_only();
-    secp.verify_schnorr(&sig, &msg, &xonly).map_err(|_| {
-        ApiError::unauthorized("OwnershipProof signature invalid or chan_bind/domain mismatch")
-    })
+    secp.verify_schnorr(&sig, &msg, &xonly)
+        .map_err(|_| ApiError::unauthorized(verify_fail_message.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -562,10 +594,6 @@ pub fn verify_ownership_proof(
 }
 
 /// §7.5 `GrantProofJson` on the wire (pull path only).
-///
-/// Present so the pull handler can discriminate proof kinds without treating
-/// an unknown shape as ownership. Full §5.1(b) verification is **not**
-/// implemented here — see [`reject_grant_proof`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct GrantProofJson {
     #[serde(rename = "type")]
@@ -594,6 +622,134 @@ impl SessionAuthority {
             SessionAuthority::Ownership => "ownership",
             SessionAuthority::Grant => "grant",
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resolved scope (§5.1) — intersection of request and capability
+// ---------------------------------------------------------------------------
+
+/// Normalised pull/grant scope after unbounded-sentinel normalisation.
+///
+/// Shape matches `ViewGrant.scope` minus grant-only `expiry`: assets × time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedScope {
+    pub all_assets: bool,
+    /// Empty iff `all_assets`. Strictly ascending when non-empty.
+    pub asset_ids: Vec<[u8; 32]>,
+    pub not_before: u64,
+    pub not_after: u64,
+}
+
+impl ResolvedScope {
+    /// Unbounded sentinel pair: `asset_ids = "*"`, `not_before = 0`,
+    /// `not_after = 2⁶³−1` (§5.1).
+    pub fn unbounded() -> Self {
+        Self {
+            all_assets: true,
+            asset_ids: Vec::new(),
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        }
+    }
+
+    /// True only when every dimension uses its unbounded sentinel.
+    pub fn is_fully_unbounded(&self) -> bool {
+        self.all_assets && self.not_before == 0 && self.not_after == SCOPE_NOT_AFTER_UNBOUNDED
+    }
+}
+
+/// Decoded §5.2 `ViewGrant` (payload fields; signature checked separately).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedViewGrant {
+    pub version: u8,
+    pub subject: [u8; 32],
+    pub grantee: [u8; 32],
+    pub scope: ResolvedScope,
+    /// Grant usability deadline (unix seconds) — not part of pull scope.
+    pub expiry: u64,
+    pub nonce: [u8; 16],
+    pub op_signature: [u8; 64],
+    /// `grant_id = H(grant_message)` (§5.2).
+    pub grant_id: [u8; 32],
+    /// Preimage of `grant_message` after the domain tag (version…nonce).
+    pub message_prefix: Vec<u8>,
+}
+
+/// Outcome of a successful GrantProof verification (§5.1(b)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedGrant {
+    pub subject_bech32: String,
+    pub subject_raw: [u8; 32],
+    pub grantee_pk: [u8; 32],
+    pub nonce: [u8; 32],
+    pub challenge_expiry: u64,
+    pub chan_bind: [u8; 32],
+    /// Capability-only scope from the grant (before request intersection).
+    pub grant_scope: ResolvedScope,
+    /// `requested ∩ grant.scope` — what the pull session must record.
+    pub resolved_scope: ResolvedScope,
+    pub grant_id: [u8; 32],
+}
+
+/// Process-local map of subject address → published `op_pubkey`.
+///
+/// §5.1(b) step 1 requires the subject's **published** op. Until Nostr
+/// kind-30420 profile resolution (with the §4.3 address binding) is wired,
+/// this directory is the sole API-edge source. It starts **empty**: every
+/// GrantProof fails closed at the op-signature step. Entries may be installed
+/// only after an authenticated path has bound `op_pubkey` to the subject
+/// (tests install fixtures; a future profile-resolution worker writes here).
+///
+/// Not a config default and not an operator free-form setting for foreign
+/// subjects — a forged entry would make grants verify under an attacker's
+/// key (see the §4.3 binding threat).
+#[derive(Debug, Default)]
+pub struct SubjectOpDirectory {
+    inner: RwLock<HashMap<[u8; 32], [u8; 32]>>,
+}
+
+impl SubjectOpDirectory {
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Install a published op for `subject`. Overwrites any prior entry.
+    pub fn insert(&self, subject: [u8; 32], op_pubkey: [u8; 32]) {
+        let mut guard = self.inner.write().expect("subject_ops lock poisoned");
+        guard.insert(subject, op_pubkey);
+    }
+
+    /// Look up the published op. `None` is fail-closed (never a zero key).
+    pub fn get(&self, subject: &[u8; 32]) -> Option<[u8; 32]> {
+        let guard = self.inner.read().expect("subject_ops lock poisoned");
+        guard.get(subject).copied()
+    }
+}
+
+/// Node-local revocation set for `grant_id` (§5.2 — forward-only).
+#[derive(Debug, Default)]
+pub struct RevokedGrantSet {
+    inner: RwLock<HashSet<[u8; 32]>>,
+}
+
+impl RevokedGrantSet {
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(HashSet::new()),
+        }
+    }
+
+    pub fn revoke(&self, grant_id: [u8; 32]) {
+        let mut guard = self.inner.write().expect("revoked_grants lock poisoned");
+        guard.insert(grant_id);
+    }
+
+    pub fn contains(&self, grant_id: &[u8; 32]) -> bool {
+        let guard = self.inner.read().expect("revoked_grants lock poisoned");
+        guard.contains(grant_id)
     }
 }
 
@@ -702,39 +858,459 @@ pub fn verify_pull_ownership_proof(
     )
 }
 
-/// Reject a GrantProof on the pull path (fail-closed, not half-checked).
+// ---------------------------------------------------------------------------
+// View grant decode + grant_message (§5.2)
+// ---------------------------------------------------------------------------
+
+/// `grant_message = H("zkCoins/v1/Grant" ‖ version ‖ subject ‖ grantee
+/// ‖ asset_ids ‖ not_before ‖ not_after ‖ expiry ‖ nonce)`.
 ///
-/// §5.1(b) requires verifying the grant's `op` signature against the subject's
-/// **published** `op` pubkey. A half-checked grant (structural + grantee chal
-/// only) would authorise disclosure under a forged `op` signature — worse than
-/// a loud reject. All grant pull attempts therefore fail with `401 unauthorized`.
+/// Field order is the **formula**, not a struct layout. `asset_enc` is the
+/// discriminator encoding from [`encode_grant_asset_ids`].
 ///
-/// # The missing prerequisite is Nostr, not a config field
+/// The eight parameters mirror the normative field concatenation of
+/// `grant_message` (§5.2). Bundling them into a struct would invite treating
+/// that struct's field order as authoritative — the same confusion the spec
+/// warns against for `invoice_message` (§4.3). The formula is normative; keep
+/// the parameters flat so the call site cannot drift from the byte order.
+#[allow(clippy::too_many_arguments)]
+pub fn grant_message_digest(
+    version: u8,
+    subject: &[u8; 32],
+    grantee: &[u8; 32],
+    asset_enc: &[u8],
+    not_before: u64,
+    not_after: u64,
+    expiry: u64,
+    grant_nonce: &[u8; 16],
+) -> ([u8; 32], Vec<u8>) {
+    let mut prefix = Vec::with_capacity(1 + 32 + 32 + asset_enc.len() + 8 + 8 + 8 + 16);
+    prefix.push(version);
+    prefix.extend_from_slice(subject);
+    prefix.extend_from_slice(grantee);
+    prefix.extend_from_slice(asset_enc);
+    prefix.extend_from_slice(&not_before.to_be_bytes());
+    prefix.extend_from_slice(&not_after.to_be_bytes());
+    prefix.extend_from_slice(&expiry.to_be_bytes());
+    prefix.extend_from_slice(grant_nonce);
+
+    let mut pre = Vec::with_capacity(GRANT_MESSAGE_TAG.len() + prefix.len());
+    pre.extend_from_slice(GRANT_MESSAGE_TAG.as_bytes());
+    pre.extend_from_slice(&prefix);
+    (sha256(&pre), prefix)
+}
+
+/// Decode Bech32m `zkgrant` payload per §5.2.
 ///
-/// `op` is **node-held** (§1.2 key-custody table) and is published as the author
-/// of the subject's kind-0 profile (§7.3, §4.3). A node the subject does not
-/// control therefore cannot be handed `op_pubkey` as an operator setting, and no
-/// kernel RPC can supply it either — the kernel knows its **own** `op`, not a
-/// foreign subject's. Obtaining it means resolving that profile and running the
-/// §4.3 address binding on the result: `H(pk0 ‖ nk_commit) == subject`, `addr_sig`
-/// under `pk0`, and the event signature under the author `op_pubkey`. Without all
-/// three, an attacker who knows the subject's public `pk0` / `nk_commit` publishes
-/// a profile naming their own `op_pubkey` and the grant check verifies against the
-/// forger's key.
+/// Rejects wrong HRP, unknown version, non-ascending asset lists, truncated
+/// or trailing bytes. Does **not** verify the op signature.
+pub fn decode_view_grant(bech32m: &str) -> Result<DecodedViewGrant, ApiError> {
+    let checked = CheckedHrpstring::new::<Bech32m>(bech32m)
+        .map_err(|e| ApiError::malformed(format!("grant: invalid Bech32m zkgrant: {e}")))?;
+    if checked.hrp().as_str() != GRANT_HRP {
+        return Err(ApiError::malformed(format!(
+            "grant: expected HRP {GRANT_HRP:?}, got {:?}",
+            checked.hrp().as_str()
+        )));
+    }
+    let data: Vec<u8> = checked.byte_iter().collect();
+    // Minimum: version(1)+subject(32)+grantee(32)+asset disc(1)+times(24)+nonce(16)+sig(64)
+    // = 170 for wildcard assets.
+    if data.len() < 170 {
+        return Err(ApiError::malformed(format!(
+            "grant: payload too short ({} bytes)",
+            data.len()
+        )));
+    }
+
+    let mut cur = 0usize;
+    let version = data[cur];
+    cur += 1;
+    if version != GRANT_VERSION {
+        return Err(ApiError::malformed(format!(
+            "grant: unknown version byte 0x{version:02x}; expected 0x{GRANT_VERSION:02x}"
+        )));
+    }
+
+    let mut subject = [0u8; 32];
+    subject.copy_from_slice(&data[cur..cur + 32]);
+    cur += 32;
+    let mut grantee = [0u8; 32];
+    grantee.copy_from_slice(&data[cur..cur + 32]);
+    cur += 32;
+
+    if cur >= data.len() {
+        return Err(ApiError::malformed("grant: truncated at asset_ids"));
+    }
+    let asset_disc = data[cur];
+    cur += 1;
+    let (all_assets, asset_ids) = match asset_disc {
+        0x00 => (true, Vec::new()),
+        0x01 => {
+            if cur + 4 > data.len() {
+                return Err(ApiError::malformed("grant: truncated asset_ids count"));
+            }
+            let mut count_buf = [0u8; 4];
+            count_buf.copy_from_slice(&data[cur..cur + 4]);
+            cur += 4;
+            let count = u32::from_be_bytes(count_buf) as usize;
+            if count == 0 {
+                return Err(ApiError::malformed(
+                    "grant: asset_ids list must be non-empty when not \"*\"",
+                ));
+            }
+            let need = count.checked_mul(32).ok_or_else(|| {
+                ApiError::malformed("grant: asset_ids count overflows size calculation")
+            })?;
+            if cur + need > data.len() {
+                return Err(ApiError::malformed("grant: truncated asset_ids list"));
+            }
+            let mut ids = Vec::with_capacity(count);
+            for _ in 0..count {
+                let mut id = [0u8; 32];
+                id.copy_from_slice(&data[cur..cur + 32]);
+                cur += 32;
+                ids.push(id);
+            }
+            for w in ids.windows(2) {
+                if w[0] >= w[1] {
+                    return Err(ApiError::malformed(
+                        "grant: asset_ids must be strictly ascending",
+                    ));
+                }
+            }
+            (false, ids)
+        }
+        other => {
+            return Err(ApiError::malformed(format!(
+                "grant: unknown asset_ids discriminator 0x{other:02x}"
+            )));
+        }
+    };
+
+    // Fixed tail after assets: not_before + not_after + expiry + nonce + sig.
+    const TAIL_LEN: usize = 8 + 8 + 8 + 16 + 64;
+    let remaining = data.len().saturating_sub(cur);
+    if remaining < TAIL_LEN {
+        return Err(ApiError::malformed("grant: truncated time/nonce/signature"));
+    }
+    if remaining > TAIL_LEN {
+        return Err(ApiError::malformed("grant: trailing bytes after signature"));
+    }
+
+    let mut not_before_buf = [0u8; 8];
+    not_before_buf.copy_from_slice(&data[cur..cur + 8]);
+    cur += 8;
+    let not_before = u64::from_be_bytes(not_before_buf);
+    let mut not_after_buf = [0u8; 8];
+    not_after_buf.copy_from_slice(&data[cur..cur + 8]);
+    cur += 8;
+    let not_after = u64::from_be_bytes(not_after_buf);
+    let mut expiry_buf = [0u8; 8];
+    expiry_buf.copy_from_slice(&data[cur..cur + 8]);
+    cur += 8;
+    let expiry = u64::from_be_bytes(expiry_buf);
+
+    let mut nonce = [0u8; 16];
+    nonce.copy_from_slice(&data[cur..cur + 16]);
+    cur += 16;
+    let mut op_signature = [0u8; 64];
+    op_signature.copy_from_slice(&data[cur..cur + 64]);
+
+    let asset_enc = encode_grant_asset_ids(all_assets, &asset_ids)
+        .map_err(|e| ApiError::malformed(format!("grant asset_ids: {}", e.body.message)))?;
+    let (grant_message, message_prefix) = grant_message_digest(
+        version, &subject, &grantee, &asset_enc, not_before, not_after, expiry, &nonce,
+    );
+    let grant_id = sha256(&grant_message);
+
+    // message_prefix must be byte-identical to the version…nonce payload slice.
+    let expected_prefix_len = data.len() - 64;
+    if message_prefix.as_slice() != &data[..expected_prefix_len] {
+        return Err(ApiError::internal(
+            "grant message_prefix recompute diverged from decoded payload",
+        ));
+    }
+
+    Ok(DecodedViewGrant {
+        version,
+        subject,
+        grantee,
+        scope: ResolvedScope {
+            all_assets,
+            asset_ids,
+            not_before,
+            not_after,
+        },
+        expiry,
+        nonce,
+        op_signature,
+        grant_id,
+        message_prefix,
+    })
+}
+
+/// Encode a view grant as Bech32m `zkgrant` (tests / helpers).
+#[cfg(test)]
+pub fn encode_view_grant(
+    subject: &[u8; 32],
+    grantee: &[u8; 32],
+    scope: &ResolvedScope,
+    expiry: u64,
+    grant_nonce: &[u8; 16],
+    op_signature: &[u8; 64],
+) -> Result<String, ApiError> {
+    let asset_enc = encode_grant_asset_ids(scope.all_assets, &scope.asset_ids)?;
+    let (_msg, prefix) = grant_message_digest(
+        GRANT_VERSION,
+        subject,
+        grantee,
+        &asset_enc,
+        scope.not_before,
+        scope.not_after,
+        expiry,
+        grant_nonce,
+    );
+    let mut payload = prefix;
+    payload.extend_from_slice(op_signature);
+    let hrp = bech32::Hrp::parse(GRANT_HRP).expect("constant HRP");
+    bech32::encode::<Bech32m>(hrp, &payload)
+        .map_err(|e| ApiError::internal(format!("zkgrant encode failed: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// Scope intersection (§5.1)
+// ---------------------------------------------------------------------------
+
+/// Resolve `requested_scope ∩ grant.scope` per §5.1.
 ///
-/// So the prerequisite is a **Nostr profile-resolution path** — the same one the
-/// bundle delivery (§4.2) and recovery (§4.5) wait on — not a lookup that could be
-/// bolted onto this process.
+/// - Time windows always intersect (`max` lower / `min` upper, inclusive).
+/// - `asset_ids = "*"` against a narrower grant is **clamped** (silent).
+/// - An **explicit** requested `asset_id` not in the grant → `403 scope_exceeded`
+///   (not silent removal of the foreign id).
+/// - Empty intersection (empty assets after clamp, or `not_before > not_after`)
+///   → `403 scope_exceeded`.
+pub fn intersect_scopes(
+    requested: &ResolvedScope,
+    grant: &ResolvedScope,
+) -> Result<ResolvedScope, ApiError> {
+    let not_before = requested.not_before.max(grant.not_before);
+    let not_after = requested.not_after.min(grant.not_after);
+    if not_before > not_after {
+        return Err(ApiError::scope_exceeded(
+            "resolved scope time window is empty (requested ∩ grant)",
+        ));
+    }
+
+    let (all_assets, asset_ids) = match (requested.all_assets, grant.all_assets) {
+        (true, true) => (true, Vec::new()),
+        (true, false) => {
+            // Clamp * to the grant's explicit set.
+            if grant.asset_ids.is_empty() {
+                return Err(ApiError::scope_exceeded(
+                    "resolved scope asset intersection is empty",
+                ));
+            }
+            (false, grant.asset_ids.clone())
+        }
+        (false, true) => {
+            if requested.asset_ids.is_empty() {
+                return Err(ApiError::scope_exceeded(
+                    "resolved scope asset intersection is empty",
+                ));
+            }
+            (false, requested.asset_ids.clone())
+        }
+        (false, false) => {
+            // Every explicitly named requested id must be in the grant.
+            for id in &requested.asset_ids {
+                if !grant.asset_ids.iter().any(|g| g == id) {
+                    return Err(ApiError::scope_exceeded(
+                        "request names an asset_id outside grant.scope.asset_ids",
+                    ));
+                }
+            }
+            if requested.asset_ids.is_empty() {
+                return Err(ApiError::scope_exceeded(
+                    "resolved scope asset intersection is empty",
+                ));
+            }
+            (false, requested.asset_ids.clone())
+        }
+    };
+
+    Ok(ResolvedScope {
+        all_assets,
+        asset_ids,
+        not_before,
+        not_after,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// GrantProof verification (§5.1(b) + §5.2)
+// ---------------------------------------------------------------------------
+
+/// Environment / policy inputs for GrantProof verification.
 ///
-/// Takes the proof so the call site cannot "forget" to name the grant shape
-/// (and so tests can assert the reject path against a concrete body).
-pub fn reject_grant_proof(_proof: &GrantProofJson) -> ApiError {
-    ApiError::unauthorized(
-        "GrantProof is not accepted: verifying the grant's op signature needs the subject's \
-         published op_pubkey, which is the author of its kind-0 Nostr profile (§7.3) and is \
-         reachable only through profile resolution plus the §4.3 address binding — not built; \
-         half-checked grants are forbidden (§5.1(b))",
-    )
+/// These are **not** part of the proof under examination: they are the node's
+/// authoritative host list, wall-clock for grant expiry, and local revocation
+/// set. Proof-carrying fields stay as distinct parameters on
+/// [`verify_grant_proof`].
+#[derive(Debug, Clone, Copy)]
+pub struct GrantVerificationContext<'a> {
+    /// Authoritative public hosts for §5.1 `chan_bind` (config only).
+    pub public_hosts: &'a [String],
+    /// Unix seconds used for grant `expiry` (inclusive upper bound).
+    pub now: u64,
+    /// Node-local revocation set (`grant_id` → refuse).
+    pub revoked: &'a RevokedGrantSet,
+}
+
+/// Verify a pull-domain GrantProof **without** calling the kernel.
+///
+/// Normative order (§5.1(b)):
+/// 1. Decode `zkgrant`; recompute `grant_message` (fixed field concatenation);
+///    verify BIP-340 under the subject's **published** `op_pubkey`.
+/// 2. `grantee_pk == grant.grantee` and BIP-340 over `chal` under grantee `D`.
+/// 3. Grant not expired (`now ≤ grant.expiry`) and not revoked.
+/// 4. Resolve `requested ∩ grant.scope` (empty / explicit foreign asset → 403).
+///
+/// Pure: a failed check never dials the kernel and cannot burn the nonce.
+pub fn verify_grant_proof(
+    nonce_hex: &str,
+    expiry_decimal: &str,
+    proof: &GrantProofJson,
+    op_pubkey: &[u8; 32],
+    requested_scope: &ResolvedScope,
+    ctx: &GrantVerificationContext<'_>,
+) -> Result<VerifiedGrant, ApiError> {
+    if proof.proof_type != "grant" {
+        return Err(ApiError::unauthorized(format!(
+            "GrantProof type must be \"grant\", got {:?}",
+            proof.proof_type
+        )));
+    }
+
+    // ---- decode grant (structural) ----
+    let grant = decode_view_grant(&proof.grant)?;
+
+    // ---- (1) op signature over grant_message ----
+    let asset_enc = encode_grant_asset_ids(grant.scope.all_assets, &grant.scope.asset_ids)?;
+    let (grant_message, _) = grant_message_digest(
+        grant.version,
+        &grant.subject,
+        &grant.grantee,
+        &asset_enc,
+        grant.scope.not_before,
+        grant.scope.not_after,
+        grant.expiry,
+        &grant.nonce,
+    );
+    verify_bip340_with_message(
+        op_pubkey,
+        &grant.op_signature,
+        &grant_message,
+        "grant op_pubkey is not a valid x-only pubkey",
+        "grant op_signature is not a valid BIP-340 signature",
+        "grant op signature invalid (wrong signer, manipulated signature, or grant_message field order)",
+    )?;
+
+    // ---- (2) grantee identity + chal signature ----
+    let grantee_pk = parse_hex32_field(&proof.grantee_pk, "grant_proof.grantee_pk")?;
+    if grantee_pk != grant.grantee {
+        return Err(ApiError::unauthorized(
+            "grant_proof.grantee_pk does not equal grant.grantee",
+        ));
+    }
+
+    let challenge_nonce = parse_hex32_field(nonce_hex, "challenge.nonce")?;
+    let challenge_expiry = parse_u64_decimal(expiry_decimal)
+        .map_err(|e| ApiError::malformed(format!("challenge.expiry: {}", e.body.message)))?;
+
+    if ctx.public_hosts.is_empty() {
+        return Err(ApiError::internal(
+            "no authoritative public hosts configured for chan_bind (ZKCOINS_PUBLIC_HOST)",
+        ));
+    }
+    let allowed: Vec<[u8; 32]> = ctx
+        .public_hosts
+        .iter()
+        .map(|h| chan_bind_for_host(h))
+        .collect();
+    let grantee_sig = parse_hex64_field(&proof.signature, "grant_proof.signature")?;
+
+    let domain_str = ChallengeDomain::Pull.as_str();
+    let mut accepted_bind: Option<[u8; 32]> = None;
+    for cb in &allowed {
+        let chal = pull_challenge_message(
+            domain_str,
+            &challenge_nonce,
+            cb,
+            &grant.subject,
+            challenge_expiry,
+        );
+        if verify_bip340_with_message(
+            &grantee_pk,
+            &grantee_sig,
+            &chal,
+            "grant_proof.grantee_pk is not a valid x-only pubkey",
+            "grant_proof.signature is not a valid BIP-340 signature",
+            "GrantProof grantee signature invalid or chan_bind/domain mismatch",
+        )
+        .is_ok()
+        {
+            accepted_bind = Some(*cb);
+            break;
+        }
+    }
+    let chan_bind = match accepted_bind {
+        Some(b) => b,
+        None => {
+            return Err(ApiError::unauthorized(
+                "GrantProof grantee signature invalid or chan_bind/domain mismatch",
+            ));
+        }
+    };
+
+    // ---- (3) expiry + revocation ----
+    // `now > expiry` is unusable. Equality at the exact second remains valid
+    // (inclusive upper bound on usability).
+    if ctx.now > grant.expiry {
+        return Err(ApiError::unauthorized(
+            "view grant has expired (scope.expiry is in the past)",
+        ));
+    }
+    if ctx.revoked.contains(&grant.grant_id) {
+        return Err(ApiError::unauthorized(
+            "view grant has been revoked (grant_id is in the node revocation set)",
+        ));
+    }
+
+    // ---- (4) scope intersection ----
+    let resolved_scope = intersect_scopes(requested_scope, &grant.scope)?;
+
+    let subject_bech32 = encode_zk_address_public(&grant.subject)?;
+
+    Ok(VerifiedGrant {
+        subject_bech32,
+        subject_raw: grant.subject,
+        grantee_pk,
+        nonce: challenge_nonce,
+        challenge_expiry,
+        chan_bind,
+        grant_scope: grant.scope,
+        resolved_scope,
+        grant_id: grant.grant_id,
+    })
+}
+
+/// Encode 32 raw address bytes as Bech32m `zk` (public helper for grant path).
+pub fn encode_zk_address_public(raw: &[u8; 32]) -> Result<String, ApiError> {
+    let hrp = bech32::Hrp::parse(ADDRESS_HRP)
+        .map_err(|e| ApiError::internal(format!("address HRP parse: {e}")))?;
+    bech32::encode::<Bech32m>(hrp, raw)
+        .map_err(|e| ApiError::internal(format!("address encode failed: {e}")))
 }
 
 /// Hex-encode a 32-byte digest (re-export convenience for handlers).
@@ -961,22 +1537,6 @@ mod tests {
     }
 
     #[test]
-    fn grant_proof_is_rejected_not_half_checked() {
-        let err = reject_grant_proof(&GrantProofJson {
-            proof_type: "grant".into(),
-            grant: "zkgrant1qq".into(),
-            grantee_pk: encode_hex(&[0u8; 32]),
-            signature: encode_hex(&[0u8; 64]),
-        });
-        assert_eq!(err.body.error, "unauthorized");
-        assert!(
-            err.body.message.contains("op_pubkey") || err.body.message.contains("op signature"),
-            "message must name the missing op check: {}",
-            err.body.message
-        );
-    }
-
-    #[test]
     fn session_authority_wire_tokens_match_node_metadata() {
         // node `parse_session_authority`: "ownership" | "grant" only.
         assert_eq!(SessionAuthority::Ownership.as_str(), "ownership");
@@ -1190,5 +1750,569 @@ mod tests {
     #[test]
     fn scope_not_after_unbounded_is_i64_max_bit_pattern() {
         assert_eq!(SCOPE_NOT_AFTER_UNBOUNDED, i64::MAX as u64);
+    }
+
+    // -----------------------------------------------------------------------
+    // GrantProof verification (§5.1(b) / §5.2) — pure, real BIP-340
+    // -----------------------------------------------------------------------
+
+    fn sample_op_sk_pk() -> (SecretKey, [u8; 32]) {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[0x55u8; 32]).expect("op secret");
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        let (xonly, _) = kp.x_only_public_key();
+        (sk, xonly.serialize())
+    }
+
+    fn sample_grantee_sk_pk() -> (SecretKey, [u8; 32]) {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[0x66u8; 32]).expect("grantee secret");
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        let (xonly, _) = kp.x_only_public_key();
+        (sk, xonly.serialize())
+    }
+
+    /// Build a valid signed zkgrant for tests.
+    fn signed_grant(
+        op_sk: &SecretKey,
+        subject: &[u8; 32],
+        grantee: &[u8; 32],
+        scope: &ResolvedScope,
+        expiry: u64,
+        grant_nonce: &[u8; 16],
+    ) -> (String, [u8; 32], [u8; 32]) {
+        let asset_enc = encode_grant_asset_ids(scope.all_assets, &scope.asset_ids).unwrap();
+        let (grant_message, _prefix) = grant_message_digest(
+            GRANT_VERSION,
+            subject,
+            grantee,
+            &asset_enc,
+            scope.not_before,
+            scope.not_after,
+            expiry,
+            grant_nonce,
+        );
+        let grant_id = sha256(&grant_message);
+        let op_sig = sign_chal(op_sk, &grant_message);
+        let bech =
+            encode_view_grant(subject, grantee, scope, expiry, grant_nonce, &op_sig).unwrap();
+        (bech, grant_message, grant_id)
+    }
+
+    fn grant_fixture() -> GrantFixture {
+        let (op_sk, op_pk) = sample_op_sk_pk();
+        let (grantee_sk, grantee_pk) = sample_grantee_sk_pk();
+        // Subject is an independent address digest (not derived from op).
+        let subject = [0x10u8; 32];
+        let scope = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![[0x01u8; 32], [0x02u8; 32]],
+            not_before: 1_000,
+            not_after: 2_000_000_000,
+        };
+        let grant_expiry = 1_800_000_000u64;
+        let grant_nonce = [0x77u8; 16];
+        let (bech, grant_message, grant_id) = signed_grant(
+            &op_sk,
+            &subject,
+            &grantee_pk,
+            &scope,
+            grant_expiry,
+            &grant_nonce,
+        );
+        GrantFixture {
+            op_sk,
+            op_pk,
+            grantee_sk,
+            grantee_pk,
+            subject,
+            scope,
+            grant_expiry,
+            grant_nonce,
+            bech,
+            grant_message,
+            grant_id,
+        }
+    }
+
+    struct GrantFixture {
+        op_sk: SecretKey,
+        op_pk: [u8; 32],
+        grantee_sk: SecretKey,
+        grantee_pk: [u8; 32],
+        subject: [u8; 32],
+        scope: ResolvedScope,
+        grant_expiry: u64,
+        grant_nonce: [u8; 16],
+        bech: String,
+        grant_message: [u8; 32],
+        grant_id: [u8; 32],
+    }
+
+    fn sign_grantee_chal(
+        f: &GrantFixture,
+        host: &str,
+        nonce: &[u8; 32],
+        chal_expiry: u64,
+    ) -> [u8; 64] {
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            ChallengeDomain::Pull.as_str(),
+            nonce,
+            &cb,
+            &f.subject,
+            chal_expiry,
+        );
+        sign_chal(&f.grantee_sk, &chal)
+    }
+
+    fn grant_ctx<'a>(
+        hosts: &'a [String],
+        now: u64,
+        revoked: &'a RevokedGrantSet,
+    ) -> GrantVerificationContext<'a> {
+        GrantVerificationContext {
+            public_hosts: hosts,
+            now,
+            revoked,
+        }
+    }
+
+    #[test]
+    fn grant_proof_valid_verifies_and_intersects_scope() {
+        let f = grant_fixture();
+        let host = "node.example.com";
+        let hosts = [host.to_string()];
+        let nonce = [0xAAu8; 32];
+        let chal_expiry = 1_700_000_060u64;
+        let now = 1_700_000_000u64;
+        let revoked = RevokedGrantSet::new();
+        let grantee_sig = sign_grantee_chal(&f, host, &nonce, chal_expiry);
+
+        // Request asks for more assets + wider time than the grant.
+        let requested = ResolvedScope {
+            all_assets: true,
+            asset_ids: Vec::new(),
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        let verified = verify_grant_proof(
+            &encode_hex(&nonce),
+            &chal_expiry.to_string(),
+            &GrantProofJson {
+                proof_type: "grant".into(),
+                grant: f.bech.clone(),
+                grantee_pk: encode_hex(&f.grantee_pk),
+                signature: encode_hex(&grantee_sig),
+            },
+            &f.op_pk,
+            &requested,
+            &grant_ctx(&hosts, now, &revoked),
+        )
+        .expect("valid grant proof");
+        assert_eq!(verified.subject_raw, f.subject);
+        assert_eq!(verified.grant_id, f.grant_id);
+        assert_eq!(verified.resolved_scope, f.scope);
+        assert!(
+            !verified.resolved_scope.is_fully_unbounded(),
+            "grant session must not receive unbounded scope when grant is scoped"
+        );
+    }
+
+    #[test]
+    fn grant_proof_manipulated_op_signature_is_unauthorized() {
+        let f = grant_fixture();
+        let host = "node.example.com";
+        let hosts = [host.to_string()];
+        let nonce = [0xBBu8; 32];
+        let chal_expiry = 1_700_000_060u64;
+        let revoked = RevokedGrantSet::new();
+        let grantee_sig = sign_grantee_chal(&f, host, &nonce, chal_expiry);
+        // Flip one byte of the trailing op signature inside the bech payload.
+        let mut bad_sig = {
+            let decoded = decode_view_grant(&f.bech).unwrap();
+            decoded.op_signature
+        };
+        bad_sig[0] ^= 0x01;
+        let bad_bech = encode_view_grant(
+            &f.subject,
+            &f.grantee_pk,
+            &f.scope,
+            f.grant_expiry,
+            &f.grant_nonce,
+            &bad_sig,
+        )
+        .unwrap();
+        let err = verify_grant_proof(
+            &encode_hex(&nonce),
+            &chal_expiry.to_string(),
+            &GrantProofJson {
+                proof_type: "grant".into(),
+                grant: bad_bech,
+                grantee_pk: encode_hex(&f.grantee_pk),
+                signature: encode_hex(&grantee_sig),
+            },
+            &f.op_pk,
+            &ResolvedScope::unbounded(),
+            &grant_ctx(&hosts, 1_700_000_000, &revoked),
+        )
+        .expect_err("manipulated op signature");
+        assert_eq!(err.body.error, "unauthorized");
+    }
+
+    #[test]
+    fn grant_proof_wrong_op_signer_is_unauthorized() {
+        let f = grant_fixture();
+        let host = "node.example.com";
+        let hosts = [host.to_string()];
+        let nonce = [0xCCu8; 32];
+        let chal_expiry = 1_700_000_060u64;
+        let revoked = RevokedGrantSet::new();
+        let grantee_sig = sign_grantee_chal(&f, host, &nonce, chal_expiry);
+        // Present a different published op_pubkey than the one that signed.
+        let (_other_sk, other_op_pk) = {
+            let secp = Secp256k1::new();
+            let sk = SecretKey::from_slice(&[0x99u8; 32]).unwrap();
+            let kp = Keypair::from_secret_key(&secp, &sk);
+            let (xonly, _) = kp.x_only_public_key();
+            (sk, xonly.serialize())
+        };
+        let err = verify_grant_proof(
+            &encode_hex(&nonce),
+            &chal_expiry.to_string(),
+            &GrantProofJson {
+                proof_type: "grant".into(),
+                grant: f.bech.clone(),
+                grantee_pk: encode_hex(&f.grantee_pk),
+                signature: encode_hex(&grantee_sig),
+            },
+            &other_op_pk,
+            &ResolvedScope::unbounded(),
+            &grant_ctx(&hosts, 1_700_000_000, &revoked),
+        )
+        .expect_err("wrong op signer");
+        assert_eq!(err.body.error, "unauthorized");
+    }
+
+    #[test]
+    fn grant_message_swapped_field_order_fails_op_verify() {
+        // Normative formula is version‖subject‖grantee‖assets‖… — not struct order.
+        // Sign under swapped subject/grantee in the preimage; verify with correct order.
+        let f = grant_fixture();
+        let asset_enc = encode_grant_asset_ids(f.scope.all_assets, &f.scope.asset_ids).unwrap();
+        // Swapped: grantee before subject in the tagged preimage.
+        let mut wrong_pre = Vec::new();
+        wrong_pre.extend_from_slice(GRANT_MESSAGE_TAG.as_bytes());
+        wrong_pre.push(GRANT_VERSION);
+        wrong_pre.extend_from_slice(&f.grantee_pk); // swapped
+        wrong_pre.extend_from_slice(&f.subject); // swapped
+        wrong_pre.extend_from_slice(&asset_enc);
+        wrong_pre.extend_from_slice(&f.scope.not_before.to_be_bytes());
+        wrong_pre.extend_from_slice(&f.scope.not_after.to_be_bytes());
+        wrong_pre.extend_from_slice(&f.grant_expiry.to_be_bytes());
+        wrong_pre.extend_from_slice(&f.grant_nonce);
+        let wrong_msg: [u8; 32] = sha256(&wrong_pre);
+        let wrong_sig = sign_chal(&f.op_sk, &wrong_msg);
+        // Encode a payload whose prefix is the **correct** order (as a real grant
+        // wire would carry) but signature was over the swapped preimage.
+        let bad_bech = encode_view_grant(
+            &f.subject,
+            &f.grantee_pk,
+            &f.scope,
+            f.grant_expiry,
+            &f.grant_nonce,
+            &wrong_sig,
+        )
+        .unwrap();
+        let host = "node.example.com";
+        let hosts = [host.to_string()];
+        let nonce = [0xDDu8; 32];
+        let chal_expiry = 1_700_000_060u64;
+        let revoked = RevokedGrantSet::new();
+        let grantee_sig = sign_grantee_chal(&f, host, &nonce, chal_expiry);
+        let err = verify_grant_proof(
+            &encode_hex(&nonce),
+            &chal_expiry.to_string(),
+            &GrantProofJson {
+                proof_type: "grant".into(),
+                grant: bad_bech,
+                grantee_pk: encode_hex(&f.grantee_pk),
+                signature: encode_hex(&grantee_sig),
+            },
+            &f.op_pk,
+            &ResolvedScope::unbounded(),
+            &grant_ctx(&hosts, 1_700_000_000, &revoked),
+        )
+        .expect_err("swapped grant_message field order");
+        assert_eq!(err.body.error, "unauthorized");
+        // Correct-order signature still verifies against the normative digest.
+        assert_ne!(wrong_msg, f.grant_message);
+    }
+
+    #[test]
+    fn grant_proof_expired_is_unauthorized() {
+        let f = grant_fixture();
+        let host = "node.example.com";
+        let hosts = [host.to_string()];
+        let nonce = [0xEEu8; 32];
+        let chal_expiry = 1_700_000_060u64;
+        let revoked = RevokedGrantSet::new();
+        let grantee_sig = sign_grantee_chal(&f, host, &nonce, chal_expiry);
+        // now strictly after grant.expiry
+        let now = f.grant_expiry + 1;
+        let err = verify_grant_proof(
+            &encode_hex(&nonce),
+            &chal_expiry.to_string(),
+            &GrantProofJson {
+                proof_type: "grant".into(),
+                grant: f.bech.clone(),
+                grantee_pk: encode_hex(&f.grantee_pk),
+                signature: encode_hex(&grantee_sig),
+            },
+            &f.op_pk,
+            &ResolvedScope::unbounded(),
+            &grant_ctx(&hosts, now, &revoked),
+        )
+        .expect_err("expired grant");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("expired"),
+            "message: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn grant_proof_explicit_asset_outside_grant_is_scope_exceeded() {
+        let f = grant_fixture();
+        let host = "node.example.com";
+        let hosts = [host.to_string()];
+        let nonce = [0xF1u8; 32];
+        let chal_expiry = 1_700_000_060u64;
+        let revoked = RevokedGrantSet::new();
+        let grantee_sig = sign_grantee_chal(&f, host, &nonce, chal_expiry);
+        let foreign_asset = [0xFFu8; 32];
+        let requested = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![foreign_asset],
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        let err = verify_grant_proof(
+            &encode_hex(&nonce),
+            &chal_expiry.to_string(),
+            &GrantProofJson {
+                proof_type: "grant".into(),
+                grant: f.bech.clone(),
+                grantee_pk: encode_hex(&f.grantee_pk),
+                signature: encode_hex(&grantee_sig),
+            },
+            &f.op_pk,
+            &requested,
+            &grant_ctx(&hosts, 1_700_000_000, &revoked),
+        )
+        .expect_err("asset outside grant");
+        assert_eq!(err.body.error, "scope_exceeded");
+        assert_eq!(err.status, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn scope_request_wider_than_grant_is_clamped_to_intersection() {
+        let grant = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![[0x01u8; 32]],
+            not_before: 100,
+            not_after: 200,
+        };
+        let requested = ResolvedScope {
+            all_assets: true,
+            asset_ids: Vec::new(),
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        let resolved = intersect_scopes(&requested, &grant).unwrap();
+        assert_eq!(resolved, grant);
+        assert!(!resolved.is_fully_unbounded());
+    }
+
+    #[test]
+    fn scope_request_narrower_than_grant_keeps_request() {
+        let grant = ResolvedScope {
+            all_assets: true,
+            asset_ids: Vec::new(),
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        let requested = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![[0xAAu8; 32]],
+            not_before: 50,
+            not_after: 60,
+        };
+        let resolved = intersect_scopes(&requested, &grant).unwrap();
+        assert_eq!(resolved, requested);
+    }
+
+    #[test]
+    fn scope_partial_time_overlap_intersects() {
+        let grant = ResolvedScope {
+            all_assets: true,
+            asset_ids: Vec::new(),
+            not_before: 100,
+            not_after: 200,
+        };
+        let requested = ResolvedScope {
+            all_assets: true,
+            asset_ids: Vec::new(),
+            not_before: 150,
+            not_after: 250,
+        };
+        let resolved = intersect_scopes(&requested, &grant).unwrap();
+        assert_eq!(resolved.not_before, 150);
+        assert_eq!(resolved.not_after, 200);
+    }
+
+    #[test]
+    fn scope_disjoint_time_is_scope_exceeded() {
+        let grant = ResolvedScope {
+            all_assets: true,
+            asset_ids: Vec::new(),
+            not_before: 100,
+            not_after: 200,
+        };
+        let requested = ResolvedScope {
+            all_assets: true,
+            asset_ids: Vec::new(),
+            not_before: 201,
+            not_after: 300,
+        };
+        let err = intersect_scopes(&requested, &grant).expect_err("disjoint");
+        assert_eq!(err.body.error, "scope_exceeded");
+    }
+
+    #[test]
+    fn grant_based_resolved_scope_never_unbounded_when_grant_is_scoped() {
+        let grant = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![[0x01u8; 32]],
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        let requested = ResolvedScope::unbounded();
+        let resolved = intersect_scopes(&requested, &grant).unwrap();
+        assert!(
+            !resolved.is_fully_unbounded(),
+            "intersection with a scoped grant must not be fully unbounded"
+        );
+        assert!(!resolved.all_assets);
+    }
+
+    #[test]
+    fn grant_proof_revoked_is_unauthorized() {
+        let f = grant_fixture();
+        let host = "node.example.com";
+        let hosts = [host.to_string()];
+        let nonce = [0xF2u8; 32];
+        let chal_expiry = 1_700_000_060u64;
+        let grantee_sig = sign_grantee_chal(&f, host, &nonce, chal_expiry);
+        let revoked = RevokedGrantSet::new();
+        revoked.revoke(f.grant_id);
+        let err = verify_grant_proof(
+            &encode_hex(&nonce),
+            &chal_expiry.to_string(),
+            &GrantProofJson {
+                proof_type: "grant".into(),
+                grant: f.bech.clone(),
+                grantee_pk: encode_hex(&f.grantee_pk),
+                signature: encode_hex(&grantee_sig),
+            },
+            &f.op_pk,
+            &ResolvedScope::unbounded(),
+            &grant_ctx(&hosts, 1_700_000_000, &revoked),
+        )
+        .expect_err("revoked");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(err.body.message.contains("revoked"));
+    }
+
+    #[test]
+    fn grant_proof_grantee_mismatch_is_unauthorized() {
+        let f = grant_fixture();
+        let host = "node.example.com";
+        let hosts = [host.to_string()];
+        let nonce = [0xF3u8; 32];
+        let chal_expiry = 1_700_000_060u64;
+        let revoked = RevokedGrantSet::new();
+        let grantee_sig = sign_grantee_chal(&f, host, &nonce, chal_expiry);
+        let other_pk = [0x88u8; 32];
+        let err = verify_grant_proof(
+            &encode_hex(&nonce),
+            &chal_expiry.to_string(),
+            &GrantProofJson {
+                proof_type: "grant".into(),
+                grant: f.bech.clone(),
+                grantee_pk: encode_hex(&other_pk),
+                signature: encode_hex(&grantee_sig),
+            },
+            &f.op_pk,
+            &ResolvedScope::unbounded(),
+            &grant_ctx(&hosts, 1_700_000_000, &revoked),
+        )
+        .expect_err("grantee mismatch");
+        assert_eq!(err.body.error, "unauthorized");
+    }
+
+    #[test]
+    fn grant_proof_manipulated_grantee_signature_is_unauthorized() {
+        let f = grant_fixture();
+        let host = "node.example.com";
+        let hosts = [host.to_string()];
+        let nonce = [0xF4u8; 32];
+        let chal_expiry = 1_700_000_060u64;
+        let revoked = RevokedGrantSet::new();
+        let mut bad_sig = sign_grantee_chal(&f, host, &nonce, chal_expiry);
+        bad_sig[0] ^= 0x01;
+        let err = verify_grant_proof(
+            &encode_hex(&nonce),
+            &chal_expiry.to_string(),
+            &GrantProofJson {
+                proof_type: "grant".into(),
+                grant: f.bech.clone(),
+                grantee_pk: encode_hex(&f.grantee_pk),
+                signature: encode_hex(&bad_sig),
+            },
+            &f.op_pk,
+            &ResolvedScope::unbounded(),
+            &grant_ctx(&hosts, 1_700_000_000, &revoked),
+        )
+        .expect_err("manipulated grantee signature");
+        assert_eq!(err.body.error, "unauthorized");
+    }
+
+    #[test]
+    fn grant_proof_wrong_chan_bind_is_unauthorized() {
+        // Grantee signs under a different host than the authoritative set.
+        let f = grant_fixture();
+        let signed_host = "other.example.com";
+        let served_hosts = ["node.example.com".to_string()];
+        let nonce = [0xF5u8; 32];
+        let chal_expiry = 1_700_000_060u64;
+        let revoked = RevokedGrantSet::new();
+        let grantee_sig = sign_grantee_chal(&f, signed_host, &nonce, chal_expiry);
+        let err = verify_grant_proof(
+            &encode_hex(&nonce),
+            &chal_expiry.to_string(),
+            &GrantProofJson {
+                proof_type: "grant".into(),
+                grant: f.bech.clone(),
+                grantee_pk: encode_hex(&f.grantee_pk),
+                signature: encode_hex(&grantee_sig),
+            },
+            &f.op_pk,
+            &ResolvedScope::unbounded(),
+            &grant_ctx(&served_hosts, 1_700_000_000, &revoked),
+        )
+        .expect_err("wrong chan_bind");
+        assert_eq!(err.body.error, "unauthorized");
     }
 }

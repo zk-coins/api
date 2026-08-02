@@ -405,6 +405,8 @@ pub fn build_router(config: Config, kernel: KernelHandle) -> Router {
         features,
         public_hosts: Arc::new(public_hosts),
         blossom: blossom_state,
+        subject_ops: Arc::new(crate::ownership::SubjectOpDirectory::new()),
+        revoked_grants: Arc::new(crate::ownership::RevokedGrantSet::new()),
     };
 
     // Register every active surface as `Router<AppState>`, then bind state so
@@ -1211,6 +1213,8 @@ mod tests {
         list_inscriptions_calls: AtomicUsize,
         /// Last pull authority observed (for grant/ownership plumbing asserts).
         last_pull_authority: Mutex<Option<SessionAuthority>>,
+        /// Last PullRequest observed (resolved_scope / subject plumbing).
+        last_pull: Mutex<Option<PullRequest>>,
         /// Last OpenPullChallenge.action observed (bootstrap domain plumbing).
         last_open_challenge_action: Mutex<Option<String>>,
         /// Last entrust request (bundle length / subject checks — never log bundle).
@@ -1361,11 +1365,12 @@ mod tests {
         }
         async fn pull(
             &self,
-            _req: PullRequest,
+            req: PullRequest,
             authority: SessionAuthority,
         ) -> Result<ProtoPullResult, ApiError> {
             self.pull_calls.fetch_add(1, Ordering::SeqCst);
             *self.last_pull_authority.lock().expect("authority mutex") = Some(authority);
+            *self.last_pull.lock().expect("pull mutex") = Some(req);
             match &self.pull {
                 Some(Ok(r)) => Ok(r.clone()),
                 Some(Err(e)) => Err(e.clone()),
@@ -3078,22 +3083,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_grant_proof_is_rejected_without_kernel_call() {
-        // Befund: the subject's published op_pubkey lives in its kind-0 Nostr
-        // profile (§7.3) and there is no profile-resolution path → GrantProof
-        // always 401, never half-checked. See `reject_grant_proof`.
+    async fn pull_grant_without_published_op_is_rejected_without_kernel_call() {
+        // Without a published op_pubkey for the subject (empty subject_ops /
+        // no Nostr profile resolution) GrantProof fails at §5.1(b) step 1 —
+        // never half-checked, never a kernel call. Uses a structurally valid,
+        // op-signed zkgrant whose subject is deliberately absent from
+        // subject_ops so the missing-op arm is the one that fires.
+        use crate::ownership::{
+            encode_grant_asset_ids, encode_view_grant, grant_message_digest, ResolvedScope,
+            GRANT_VERSION,
+        };
+        use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
+
+        let secp = Secp256k1::new();
+        let op_sk = SecretKey::from_slice(&[0x55u8; 32]).unwrap();
+        let op_kp = Keypair::from_secret_key(&secp, &op_sk);
+        let grantee_sk = SecretKey::from_slice(&[0x66u8; 32]).unwrap();
+        let grantee_kp = Keypair::from_secret_key(&secp, &grantee_sk);
+        let (grantee_xonly, _) = grantee_kp.x_only_public_key();
+        let grantee_pk = grantee_xonly.serialize();
+        let subject = [0x10u8; 32];
+        let grant_scope = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![[0x01u8; 32]],
+            not_before: 100,
+            not_after: 9_000_000_000,
+        };
+        let grant_expiry = 4_000_000_000u64;
+        let grant_nonce = [0x77u8; 16];
+        let asset_enc =
+            encode_grant_asset_ids(grant_scope.all_assets, &grant_scope.asset_ids).unwrap();
+        let (grant_message, _) = grant_message_digest(
+            GRANT_VERSION,
+            &subject,
+            &grantee_pk,
+            &asset_enc,
+            grant_scope.not_before,
+            grant_scope.not_after,
+            grant_expiry,
+            &grant_nonce,
+        );
+        let msg = Message::from_digest_slice(&grant_message).unwrap();
+        let op_sig = secp.sign_schnorr_no_aux_rand(&msg, &op_kp);
+        let mut op_sig_bytes = [0u8; 64];
+        op_sig_bytes.copy_from_slice(op_sig.as_ref());
+        let grant_bech = encode_view_grant(
+            &subject,
+            &grantee_pk,
+            &grant_scope,
+            grant_expiry,
+            &grant_nonce,
+            &op_sig_bytes,
+        )
+        .unwrap();
+
         let kernel = Arc::new(ScriptedKernel {
             pull: Some(Ok(sample_pull_result())),
             ..Default::default()
         });
+        // build_router installs an empty subject_ops — subject has no published op.
         let app = build_router(test_config(), kernel.clone());
         let body = serde_json::json!({
             "nonce": encode_hex(&[0x11u8; 32]),
             "expiry": "1700000060",
             "proof": {
                 "type": "grant",
-                "grant": "zkgrant1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
-                "grantee_pk": encode_hex(&[0x33u8; 32]),
+                "grant": grant_bech,
+                "grantee_pk": encode_hex(&grantee_pk),
                 "signature": encode_hex(&[0x44u8; 64]),
             }
         });
@@ -3113,8 +3169,8 @@ mod tests {
         assert_eq!(json["error"], "unauthorized");
         assert!(
             json["message"].as_str().unwrap().contains("op_pubkey")
-                || json["message"].as_str().unwrap().contains("op signature"),
-            "message must name the missing op check: {}",
+                || json["message"].as_str().unwrap().contains("published"),
+            "message must name the missing published op check: {}",
             json["message"]
         );
         assert_eq!(
@@ -3122,6 +3178,195 @@ mod tests {
             0,
             "rejected grant must not consume the challenge nonce"
         );
+    }
+
+    #[tokio::test]
+    async fn pull_valid_grant_opens_session_with_grant_authority_and_clamped_scope() {
+        use crate::ownership::{
+            encode_grant_asset_ids, encode_view_grant, grant_message_digest, ResolvedScope,
+            RevokedGrantSet, SubjectOpDirectory, GRANT_VERSION, SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
+        use sha2::{Digest, Sha256};
+
+        let host = "node.example.com";
+        let secp = Secp256k1::new();
+        let op_sk = SecretKey::from_slice(&[0x55u8; 32]).unwrap();
+        let op_kp = Keypair::from_secret_key(&secp, &op_sk);
+        let (op_xonly, _) = op_kp.x_only_public_key();
+        let op_pk = op_xonly.serialize();
+        let grantee_sk = SecretKey::from_slice(&[0x66u8; 32]).unwrap();
+        let grantee_kp = Keypair::from_secret_key(&secp, &grantee_sk);
+        let (grantee_xonly, _) = grantee_kp.x_only_public_key();
+        let grantee_pk = grantee_xonly.serialize();
+        let subject = [0x10u8; 32];
+        let grant_scope = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![[0x01u8; 32]],
+            not_before: 100,
+            not_after: 9_000_000_000,
+        };
+        // Expiry far in the future so wall-clock `unix_now` in the handler passes.
+        let grant_expiry = 4_000_000_000u64;
+        let grant_nonce = [0x77u8; 16];
+        let asset_enc =
+            encode_grant_asset_ids(grant_scope.all_assets, &grant_scope.asset_ids).unwrap();
+        let (grant_message, _) = grant_message_digest(
+            GRANT_VERSION,
+            &subject,
+            &grantee_pk,
+            &asset_enc,
+            grant_scope.not_before,
+            grant_scope.not_after,
+            grant_expiry,
+            &grant_nonce,
+        );
+        let msg = Message::from_digest_slice(&grant_message).unwrap();
+        let op_sig = secp.sign_schnorr_no_aux_rand(&msg, &op_kp);
+        let mut op_sig_bytes = [0u8; 64];
+        op_sig_bytes.copy_from_slice(op_sig.as_ref());
+        let grant_bech = encode_view_grant(
+            &subject,
+            &grantee_pk,
+            &grant_scope,
+            grant_expiry,
+            &grant_nonce,
+            &op_sig_bytes,
+        )
+        .unwrap();
+
+        let challenge_nonce = [0x11u8; 32];
+        let chal_expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        let mut chal_pre = Vec::new();
+        chal_pre.extend_from_slice(PULL_CHALLENGE_DOMAIN.as_bytes());
+        chal_pre.extend_from_slice(&challenge_nonce);
+        chal_pre.extend_from_slice(&cb);
+        chal_pre.extend_from_slice(&subject);
+        chal_pre.extend_from_slice(&chal_expiry.to_be_bytes());
+        let chal: [u8; 32] = Sha256::digest(&chal_pre).into();
+        let chal_msg = Message::from_digest_slice(&chal).unwrap();
+        let grantee_sig = secp.sign_schnorr_no_aux_rand(&chal_msg, &grantee_kp);
+        let mut grantee_sig_bytes = [0u8; 64];
+        grantee_sig_bytes.copy_from_slice(grantee_sig.as_ref());
+
+        let subject_ops = Arc::new(SubjectOpDirectory::new());
+        subject_ops.insert(subject, op_pk);
+
+        let kernel = Arc::new(ScriptedKernel {
+            pull: Some(Ok(sample_pull_result())),
+            ..Default::default()
+        });
+        let config = test_config();
+        let state = AppState {
+            kernel: kernel.clone(),
+            features: BTreeSet::new(),
+            public_hosts: Arc::new(config.public_hosts.clone()),
+            blossom: None,
+            subject_ops,
+            revoked_grants: Arc::new(RevokedGrantSet::new()),
+        };
+        let app = {
+            let mut router = Router::new().route("/", get(root));
+            for surface in ServedSurface::active(false) {
+                router = surface.register(router, None);
+            }
+            router.with_state(state)
+        };
+
+        let body = serde_json::json!({
+            "nonce": encode_hex(&challenge_nonce),
+            "expiry": chal_expiry.to_string(),
+            // Request wider than the grant → must clamp to grant scope.
+            "scope": {
+                "asset_ids": "*",
+            },
+            "proof": {
+                "type": "grant",
+                "grant": grant_bech,
+                "grantee_pk": encode_hex(&grantee_pk),
+                "signature": encode_hex(&grantee_sig_bytes),
+            }
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let resp_body = body_bytes(res).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body={}",
+            String::from_utf8_lossy(&resp_body)
+        );
+        assert_eq!(kernel.pull_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *kernel.last_pull_authority.lock().unwrap(),
+            Some(SessionAuthority::Grant)
+        );
+        let last = kernel.last_pull.lock().unwrap().clone().expect("pull req");
+        let scope = last.resolved_scope.expect("resolved_scope");
+        assert!(!scope.all_assets, "grant session must not be all_assets=*");
+        assert_eq!(scope.asset_ids, vec![vec![0x01u8; 32]]);
+        assert_eq!(scope.not_before, 100);
+        assert_eq!(scope.not_after, 9_000_000_000);
+        // Must not be the unbounded sentinel pair.
+        assert_ne!(scope.not_after, SCOPE_NOT_AFTER_UNBOUNDED);
+    }
+
+    #[tokio::test]
+    async fn pull_ownership_passes_requested_scope_not_forced_unbounded() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x19u8; 32];
+        let expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            ChallengeDomain::Pull.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        let kernel = Arc::new(ScriptedKernel {
+            pull: Some(Ok(sample_pull_result())),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let asset = [0xABu8; 32];
+        let mut body = pull_body_ownership(&subject_bech, &pk0, &nkc, &nonce, expiry, &sig);
+        body["scope"] = serde_json::json!({
+            "asset_ids": [encode_hex(&asset)],
+            "not_before": "10",
+            "not_after": "20",
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let last = kernel.last_pull.lock().unwrap().clone().expect("pull req");
+        let scope = last.resolved_scope.expect("resolved_scope");
+        assert!(!scope.all_assets);
+        assert_eq!(scope.asset_ids, vec![asset.to_vec()]);
+        assert_eq!(scope.not_before, 10);
+        assert_eq!(scope.not_after, 20);
     }
 
     #[tokio::test]
