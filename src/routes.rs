@@ -2,9 +2,10 @@
 //!
 //! Route registration and the `GET /` discovery document share one source:
 //! [`ServedSurface`]. The closed §7.5 inventory ([`CLOSED_ENDPOINT_KEYS`]) is
-//! the full key catalogue for surfaces not yet built; only keys in the active
-//! surface set (always-on plus Blossom when configured) are registered and
-//! advertised.
+//! the full key catalogue; only keys in the **active** surface set — derived
+//! from `Config::features` and Blossom store configuration — are registered
+//! and advertised. A disabled feature is not served (`404`) and is omitted
+//! from `GET /` (§7.5 / §6.1 fail-closed gating).
 //!
 //! Inventory paths are the **advertised** §7.5 form (`<name>` placeholders).
 //! Axum registration uses a derived **matcher** form (`:name`); see
@@ -14,7 +15,7 @@ use crate::attest;
 use crate::blossom;
 use crate::bootstrap;
 use crate::chain;
-use crate::config::Config;
+use crate::config::{Config, Feature};
 use crate::grants;
 use crate::info;
 use crate::jobs;
@@ -28,7 +29,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, head, post, put};
 use axum::{Json, Router};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Closed `endpoints` key set from specification §7.5 (`GET /` row).
@@ -91,24 +92,27 @@ pub const CLOSED_ENDPOINT_KEYS: &[(&str, &str)] = &[
 /// `GET /` itself is the discovery document and has **no** closed key in
 /// §7.5; it is registered beside this set, never as a member of it.
 ///
-/// Feature gating (§6.1): further inventory keys belong to `wallet` /
-/// `explorer` / `publisher`. This stage's job surface and the info/chain
-/// read surface are always-on once the handlers exist — the operator still
-/// must set `ZKCOINS_KERNEL_ADDR`. When capability-gated or role-optional
-/// handlers land, registration will filter `ServedSurface` by
-/// `Config::features`.
+/// ## Feature gating (§6.1 / §7.5)
 ///
-/// Surfaces intentionally **not** always registered (and therefore omitted from
-/// `GET /` when inactive), with the reason each stays off the map:
+/// Which surfaces are active follows `Config::features` and Blossom store
+/// configuration — never a hard-coded always-on set of role-bound routes.
+/// A request against a disabled feature is **not** served (`404`); `GET /`
+/// omits the corresponding keys. Mapping (from §6.1 feature table + the
+/// §7.5 inventory, mirrored in `docs/rest-surface.md`):
 ///
-/// - `blossom_get` / `blossom_head` / `blossom_upload` / `blossom_delete` —
-///   §7.4 Blossom surface. Mounted **only** when `ZKCOINS_BLOSSOM_STORE` is
-///   configured (content-addressed filesystem store). No default path; absent
-///   store ⇒ keys unadvertised and routes unmounted.
+/// | Surfaces | Gate |
+/// |---|---|
+/// | `health`, `health_ready`, `info` | always (API process) |
+/// | `chain_*` | `explorer` |
+/// | `tx`, `jobs*`, `attest_*`, `grants_*`, `pull*`, `record`, `proof`, `account_state`, `receipts_stream`, `bootstrap_*` | `wallet` |
+/// | `publish_spendrecord` | `publisher` |
+/// | `blossom_*` | `ZKCOINS_BLOSSOM_STORE` **and** (`wallet` **or** `explorer`) |
 ///
-/// Inventory keys remain in [`CLOSED_ENDPOINT_KEYS`]; advertisement tracks
-/// the always-on set (25 keys, including `receipts_stream`) plus optional
-/// Blossom (4 keys) when configured — all 29 when the store is set.
+/// `lightning_bridge` / `mail_bridge` open no §7.5 inventory paths (extension
+/// docs only) and therefore add no variants here.
+///
+/// Inventory keys remain in [`CLOSED_ENDPOINT_KEYS`]; advertisement is exactly
+/// the active set derived by [`ServedSurface::active`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServedSurface {
     Health,
@@ -143,8 +147,11 @@ enum ServedSurface {
 }
 
 impl ServedSurface {
-    /// Always-on surfaces (independent of Blossom store configuration).
-    const ALWAYS_ON: &[ServedSurface] = &[
+    /// Full inventory of surfaces this binary knows how to register.
+    ///
+    /// Activation is decided per entry by [`ServedSurface::is_active`]; this
+    /// list is **not** what `GET /` returns.
+    const ALL: &[ServedSurface] = &[
         ServedSurface::Health,
         ServedSurface::HealthReady,
         ServedSurface::Info,
@@ -170,23 +177,69 @@ impl ServedSurface {
         ServedSurface::BootstrapChallenge,
         ServedSurface::BootstrapEntrust,
         ServedSurface::BootstrapRevoke,
-    ];
-
-    /// Blossom surfaces — registered only when the store is configured.
-    const BLOSSOM: &[ServedSurface] = &[
         ServedSurface::BlossomGet,
         ServedSurface::BlossomHead,
         ServedSurface::BlossomUpload,
         ServedSurface::BlossomDelete,
     ];
 
-    /// Surfaces active for this process given whether Blossom is configured.
-    fn active(blossom_configured: bool) -> Vec<ServedSurface> {
-        let mut out = Self::ALWAYS_ON.to_vec();
-        if blossom_configured {
-            out.extend_from_slice(Self::BLOSSOM);
+    /// Whether this surface is registered (and advertised) for the given
+    /// feature set and Blossom store configuration.
+    fn is_active(self, features: &BTreeSet<Feature>, blossom_configured: bool) -> bool {
+        match self {
+            // Always-on API process surface (§7.5 L2874–L2877; rest-surface #1–#4).
+            ServedSurface::Health | ServedSurface::HealthReady | ServedSurface::Info => true,
+
+            // `explorer` — public chain projection (§6.1 L2338; rest-surface #5–#7).
+            ServedSurface::ChainAccumulator
+            | ServedSurface::ChainInscriptions
+            | ServedSurface::ChainNullifier => features.contains(&Feature::Explorer),
+
+            // `wallet` — proving, submission, pull, attest, grants, bootstrap
+            // (§6.1 L2337; rest-surface #8–#22, #24–#26).
+            ServedSurface::Tx
+            | ServedSurface::Jobs
+            | ServedSurface::JobsStream
+            | ServedSurface::JobsSign
+            | ServedSurface::JobsCancel
+            | ServedSurface::AttestBalanceChallenge
+            | ServedSurface::AttestBalance
+            | ServedSurface::GrantsChallenge
+            | ServedSurface::Grants
+            | ServedSurface::PullChallenge
+            | ServedSurface::Pull
+            | ServedSurface::Record
+            | ServedSurface::Proof
+            | ServedSurface::AccountState
+            | ServedSurface::ReceiptsStream
+            | ServedSurface::BootstrapChallenge
+            | ServedSurface::BootstrapEntrust
+            | ServedSurface::BootstrapRevoke => features.contains(&Feature::Wallet),
+
+            // `publisher` — hand-off endpoint (§6.1 L2339; rest-surface #23).
+            ServedSurface::PublishSpendrecord => features.contains(&Feature::Publisher),
+
+            // §7.4 Blossom: store must be configured, and at least one of
+            // `wallet` / `explorer` must be on (rest-surface #27–#31; blob fetch
+            // is listed under explorer, upload/delete under both).
+            ServedSurface::BlossomGet
+            | ServedSurface::BlossomHead
+            | ServedSurface::BlossomUpload
+            | ServedSurface::BlossomDelete => {
+                blossom_configured
+                    && (features.contains(&Feature::Wallet)
+                        || features.contains(&Feature::Explorer))
+            }
         }
-        out
+    }
+
+    /// Surfaces active for this process given enabled features and Blossom.
+    fn active(features: &BTreeSet<Feature>, blossom_configured: bool) -> Vec<ServedSurface> {
+        Self::ALL
+            .iter()
+            .copied()
+            .filter(|s| s.is_active(features, blossom_configured))
+            .collect()
     }
 
     /// Closed §7.5 discovery key for this surface.
@@ -346,9 +399,12 @@ fn advertised_path_to_axum_matcher(advertised: &str) -> String {
 }
 
 /// Build the `endpoints` map for `GET /` from the active surface set.
-fn discovery_endpoints(blossom_configured: bool) -> BTreeMap<&'static str, &'static str> {
+fn discovery_endpoints(
+    features: &BTreeSet<Feature>,
+    blossom_configured: bool,
+) -> BTreeMap<&'static str, &'static str> {
     let mut endpoints = BTreeMap::new();
-    for surface in ServedSurface::active(blossom_configured) {
+    for surface in ServedSurface::active(features, blossom_configured) {
         let key = surface.discovery_key();
         let path = closed_path(key);
         endpoints.insert(key, path);
@@ -365,10 +421,10 @@ struct RootResponse {
 
 /// Build the axum router for the given configuration and kernel handle.
 ///
-/// `config.features` is stored in [`AppState`] for `GET /v1/info` (API-owned
-/// advertisement). Route registration is the always-on set plus the Blossom
-/// surface when `config.blossom` is `Some`. §6.1 feature gating of optional
-/// roles lands with those handlers.
+/// Route registration and `GET /` discovery both follow
+/// [`ServedSurface::active`] applied to `config.features` and whether the
+/// Blossom store is configured. `config.features` is also stored in
+/// [`AppState`] for the API-owned `features` array on `GET /v1/info`.
 ///
 /// Returns a fully state-bound router (`Router` / `Router<()>`). Only that
 /// form implements `tower::Service` and is ready for `axum::serve` and test
@@ -402,7 +458,7 @@ pub fn build_router(config: Config, kernel: KernelHandle) -> Router {
 
     let state = AppState {
         kernel,
-        features,
+        features: features.clone(),
         public_hosts: Arc::new(public_hosts),
         blossom: blossom_state,
         subject_ops: Arc::new(crate::ownership::SubjectOpDirectory::new()),
@@ -414,7 +470,7 @@ pub fn build_router(config: Config, kernel: KernelHandle) -> Router {
     // earlier while still returning `Router<AppState>` leaves the tree
     // "missing" state and breaks both `axum::serve` and `oneshot`.
     let mut router = Router::new().route("/", get(root));
-    for surface in ServedSurface::active(blossom_configured) {
+    for surface in ServedSurface::active(&features, blossom_configured) {
         router = surface.register(router, max_blob_bytes);
     }
     router.with_state(state)
@@ -429,7 +485,7 @@ async fn root(State(state): State<AppState>) -> Json<RootResponse> {
     Json(RootResponse {
         name: "zkcoins-api",
         version: env!("CARGO_PKG_VERSION"),
-        endpoints: discovery_endpoints(blossom_configured),
+        endpoints: discovery_endpoints(&state.features, blossom_configured),
     })
 }
 
@@ -462,7 +518,20 @@ mod tests {
     use tonic::Code;
     use tower::ServiceExt;
 
+    /// Default test config enables every §7.5 role feature so handler tests
+    /// exercise the full surface. Feature-gating tests build a narrower set.
     fn test_config() -> Config {
+        Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            kernel_addr: "http://127.0.0.1:50051".to_string(),
+            features: BTreeSet::from([Feature::Wallet, Feature::Explorer, Feature::Publisher]),
+            public_hosts: vec!["node.example.com".to_string()],
+            blossom: None,
+        }
+    }
+
+    /// Config with no optional features — only always-on process surfaces.
+    fn test_config_no_features() -> Config {
         Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             kernel_addr: "http://127.0.0.1:50051".to_string(),
@@ -668,8 +737,9 @@ mod tests {
 
     #[test]
     fn every_served_surface_is_in_closed_inventory() {
-        // Always-on + Blossom (when configured) must each map to inventory.
-        for surface in ServedSurface::active(true) {
+        // Full feature set + Blossom store: every inventory surface must map.
+        let features = BTreeSet::from([Feature::Wallet, Feature::Explorer, Feature::Publisher]);
+        for surface in ServedSurface::active(&features, true) {
             let key = surface.discovery_key();
             let path = closed_path(key);
             assert!(
@@ -677,6 +747,11 @@ mod tests {
                 "served key {key} must resolve to a non-empty inventory path"
             );
         }
+        assert_eq!(
+            ServedSurface::active(&features, true).len(),
+            ServedSurface::ALL.len(),
+            "wallet+explorer+publisher+blossom must activate the full inventory"
+        );
     }
 
     #[tokio::test]
@@ -717,7 +792,8 @@ mod tests {
 
         let endpoints = json["endpoints"].as_object().expect("endpoints object");
 
-        let expected_keys: BTreeSet<&str> = ServedSurface::active(false)
+        let cfg = test_config();
+        let expected_keys: BTreeSet<&str> = ServedSurface::active(&cfg.features, false)
             .iter()
             .map(|s| s.discovery_key())
             .collect();
@@ -755,7 +831,7 @@ mod tests {
                 "bootstrap_entrust",
                 "bootstrap_revoke",
             ]),
-            "always-on surfaces include receipts_stream once SubscribeReceipts is wired"
+            "test_config (wallet+explorer+publisher, no blossom) advertises 25 keys"
         );
         assert_eq!(
             endpoints["bootstrap_challenge"].as_str(),
@@ -1101,8 +1177,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        // Wallet feature does not yet open extra surfaces beyond the job set
-        // (already always-on). Unbuilt wallet keys stay unadvertised.
+        // Wallet alone opens the job/pull surfaces and omits explorer/publisher.
         let app = build_router(
             Config {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -1122,15 +1197,157 @@ mod tests {
         let endpoints = json["endpoints"].as_object().expect("endpoints object");
         assert!(
             endpoints.contains_key("tx"),
-            "job surface key 'tx' must be advertised once the handler exists"
+            "wallet feature must advertise the job surface key 'tx'"
         );
         assert!(
             endpoints.contains_key("pull"),
-            "stage C2 advertises /v1/pull once the handler exists"
+            "wallet feature must advertise /v1/pull"
         );
         assert!(
             endpoints.contains_key("receipts_stream"),
-            "receipts_stream is advertised once SubscribeReceipts is wired"
+            "wallet feature must advertise receipts_stream"
+        );
+        assert!(
+            !endpoints.contains_key("chain_accumulator"),
+            "explorer surface must stay unadvertised without explorer feature"
+        );
+        assert!(
+            !endpoints.contains_key("publish_spendrecord"),
+            "publisher surface must stay unadvertised without publisher feature"
+        );
+    }
+
+    /// Without the change: wallet/explorer/publisher routes were always-on,
+    /// so a disabled feature still returned a non-404 (kernel error / 405 / …)
+    /// and `GET /` still advertised the key.
+    #[tokio::test]
+    async fn disabled_wallet_surface_is_404_and_absent_from_discovery() {
+        let app = build_router(test_config_no_features(), Arc::new(UnreachableKernel));
+
+        // Probe a concrete wallet path — must not match any route.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tx")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "disabled wallet surface must not be served"
+        );
+
+        let res = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        let endpoints = json["endpoints"].as_object().expect("endpoints object");
+        assert!(
+            !endpoints.contains_key("tx"),
+            "GET / must not advertise disabled wallet key 'tx'"
+        );
+        assert!(
+            !endpoints.contains_key("jobs"),
+            "GET / must not advertise disabled wallet key 'jobs'"
+        );
+        // Always-on process surfaces remain.
+        assert!(endpoints.contains_key("health"));
+        assert!(endpoints.contains_key("info"));
+        assert_eq!(
+            endpoints.len(),
+            3,
+            "no-features config must advertise only health, health_ready, info; got {:?}",
+            endpoints.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_explorer_surface_is_404_and_absent_from_discovery() {
+        // Wallet on, explorer off: chain routes must vanish.
+        let cfg = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            kernel_addr: "http://127.0.0.1:50051".to_string(),
+            features: BTreeSet::from([Feature::Wallet]),
+            public_hosts: vec!["node.example.com".to_string()],
+            blossom: None,
+        };
+        let app = build_router(cfg, Arc::new(UnreachableKernel));
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/chain/accumulator")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "disabled explorer surface must not be served"
+        );
+
+        let res = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        let endpoints = json["endpoints"].as_object().expect("endpoints object");
+        assert!(
+            !endpoints.contains_key("chain_accumulator"),
+            "GET / must not advertise disabled explorer key"
+        );
+        assert!(
+            endpoints.contains_key("tx"),
+            "wallet surface must remain advertised when only explorer is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_publisher_surface_is_404_and_absent_from_discovery() {
+        let cfg = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            kernel_addr: "http://127.0.0.1:50051".to_string(),
+            features: BTreeSet::from([Feature::Wallet, Feature::Explorer]),
+            public_hosts: vec!["node.example.com".to_string()],
+            blossom: None,
+        };
+        let app = build_router(cfg, Arc::new(UnreachableKernel));
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/publish/spendrecord")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "disabled publisher surface must not be served"
+        );
+
+        let res = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        let endpoints = json["endpoints"].as_object().expect("endpoints object");
+        assert!(
+            !endpoints.contains_key("publish_spendrecord"),
+            "GET / must not advertise disabled publisher key"
         );
     }
 
@@ -1570,6 +1787,229 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(json["job_id"], "job-1");
         assert_eq!(json["status"], "accepted");
+    }
+
+    /// Missing `Idempotency-Key` is optional: request reaches the kernel and
+    /// may succeed. Distinct from a present-but-empty header (next test).
+    #[tokio::test]
+    async fn post_tx_missing_idempotency_key_is_allowed() {
+        let kernel = ScriptedKernel {
+            submit: Some(Ok(JobHandle {
+                job_id: "job-no-key".to_string(),
+                status: "accepted".to_string(),
+            })),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tx")
+                    .header("content-type", "application/json")
+                    // deliberately no Idempotency-Key
+                    .body(Body::from(mint_body().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::ACCEPTED,
+            "absent Idempotency-Key must not be rewritten into a client error"
+        );
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["job_id"], "job-no-key");
+    }
+
+    /// Present-but-empty `Idempotency-Key` is `400 malformed_request`.
+    ///
+    /// Asserts the two outcomes diverge: missing → `Ok(None)`, empty value →
+    /// `400 malformed_request`. `http::HeaderValue` cannot encode a zero-byte
+    /// value, so the empty branch is exercised through the value parser rather
+    /// than a crafted HTTP request; the missing path is also covered by
+    /// `post_tx_missing_idempotency_key_is_allowed` at HTTP level.
+    #[test]
+    fn post_tx_empty_vs_missing_idempotency_key_diverge() {
+        // Missing → Ok(None) → not a client error.
+        let headers = axum::http::HeaderMap::new();
+        assert!(crate::jobs::idempotency_key_from_headers(&headers)
+            .expect("missing ok")
+            .is_none());
+        // Empty value → 400 malformed_request (never Ok(Some(""))).
+        let err = crate::jobs::parse_idempotency_key_value("").expect_err("empty must error");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+    }
+
+    /// Unknown top-level field must be `400 malformed_request`, not ignored.
+    #[tokio::test]
+    async fn post_tx_unknown_top_level_field_is_malformed_400() {
+        let kernel = ScriptedKernel {
+            submit: Some(Ok(JobHandle {
+                job_id: "x".into(),
+                status: "accepted".into(),
+            })),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let mut body = mint_body();
+        body["extra_unknown"] = Value::String("nope".into());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tx")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::BAD_REQUEST,
+            "unknown field must be 400, not 422 or silent drop"
+        );
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+    }
+
+    /// Unknown field inside a nested object (issuance) is also rejected.
+    #[tokio::test]
+    async fn post_tx_unknown_nested_field_is_malformed_400() {
+        let kernel = ScriptedKernel {
+            submit: Some(Ok(JobHandle {
+                job_id: "x".into(),
+                status: "accepted".into(),
+            })),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let mut body = mint_body();
+        body["issuance"]["foreign_nested"] = Value::Number(1.into());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tx")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::BAD_REQUEST,
+            "nested unknown field must be 400, not silently dropped"
+        );
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+    }
+
+    /// Empty job_id from the kernel must not become a client-visible 202.
+    #[tokio::test]
+    async fn post_tx_empty_job_id_from_kernel_is_not_202() {
+        let kernel = ScriptedKernel {
+            submit: Some(Ok(JobHandle {
+                job_id: String::new(),
+                status: "accepted".to_string(),
+            })),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tx")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            res.status(),
+            StatusCode::ACCEPTED,
+            "empty job_id must not be admitted as 202"
+        );
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert!(
+            json["message"].as_str().unwrap_or("").contains("job_id"),
+            "message must name the empty job_id, got {}",
+            json["message"]
+        );
+    }
+
+    /// Unknown / non-accepted kernel status must not become a client-visible 202.
+    #[tokio::test]
+    async fn post_tx_unknown_status_from_kernel_is_not_202() {
+        let kernel = ScriptedKernel {
+            submit: Some(Ok(JobHandle {
+                job_id: "job-weird".to_string(),
+                status: "totally_unknown_phase".to_string(),
+            })),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tx")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            res.status(),
+            StatusCode::ACCEPTED,
+            "unknown status must not be admitted as 202"
+        );
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert!(
+            json["message"].as_str().unwrap_or("").contains("accepted")
+                || json["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("totally_unknown_phase"),
+            "message must name the status contract, got {}",
+            json["message"]
+        );
+    }
+
+    /// Empty status string is also not a valid admit terminal.
+    #[tokio::test]
+    async fn post_tx_empty_status_from_kernel_is_not_202() {
+        let kernel = ScriptedKernel {
+            submit: Some(Ok(JobHandle {
+                job_id: "job-empty-status".to_string(),
+                status: String::new(),
+            })),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tx")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(res.status(), StatusCode::ACCEPTED);
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
@@ -3260,7 +3700,7 @@ mod tests {
         let config = test_config();
         let state = AppState {
             kernel: kernel.clone(),
-            features: BTreeSet::new(),
+            features: config.features.clone(),
             public_hosts: Arc::new(config.public_hosts.clone()),
             blossom: None,
             subject_ops,
@@ -3268,7 +3708,7 @@ mod tests {
         };
         let app = {
             let mut router = Router::new().route("/", get(root));
-            for surface in ServedSurface::active(false) {
+            for surface in ServedSurface::active(&config.features, false) {
                 router = surface.register(router, None);
             }
             router.with_state(state)
@@ -5132,10 +5572,11 @@ mod tests {
     }
 
     fn blossom_app(root: std::path::PathBuf, max: u64, ops: BTreeSet<[u8; 32]>) -> Router {
+        // Blossom mounts only with store **and** wallet|explorer (§6.1 / §7.4).
         let cfg = Config {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             kernel_addr: "http://127.0.0.1:50051".to_string(),
-            features: BTreeSet::new(),
+            features: BTreeSet::from([Feature::Explorer, Feature::Wallet]),
             public_hosts: vec!["node.example.com".to_string()],
             blossom: Some(crate::config::BlossomConfig {
                 store_root: root,

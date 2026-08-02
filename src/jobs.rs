@@ -27,7 +27,13 @@ use std::convert::Infallible;
 // ---------------------------------------------------------------------------
 
 /// §7.5 `TransitionRequest` JSON body for `POST /v1/tx` (L2898–L2930).
+///
+/// §7.5: "the body is exactly this JSON object" — unknown fields are
+/// `400 malformed_request`. `deny_unknown_fields` is set on **every** nested
+/// object type below so a foreign key inside `output_templates[]` or
+/// `issuance` is rejected the same way as one at the top level.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransitionRequestJson {
     pub kind: String,
     pub subject: String,
@@ -48,6 +54,7 @@ pub struct TransitionRequestJson {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutputTemplateJson {
     pub recipient: String,
     pub asset_id: String,
@@ -55,6 +62,7 @@ pub struct OutputTemplateJson {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IssuanceJson {
     pub name: String,
     pub decimals: u32,
@@ -68,6 +76,7 @@ pub struct IssuanceJson {
 
 /// §7.5 sign body (L2891): `{ signature: <hex64>, s2c_nonce: <hex32> }`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignBodyJson {
     pub signature: String,
     pub s2c_nonce: String,
@@ -78,28 +87,42 @@ pub struct SignBodyJson {
 // ---------------------------------------------------------------------------
 
 /// `POST /v1/tx` → `SubmitTransition` → `202 { job_id, status: "accepted" }`.
+///
+/// Body is deserialized via a §7.5-shaped extractor so unknown fields and
+/// other serde failures become `400 malformed_request` (not axum's default
+/// 422 with a non-§7.5 body).
 pub async fn post_tx(
     State(kernel): State<KernelHandle>,
     headers: HeaderMap,
-    Json(body): Json<TransitionRequestJson>,
+    body: Result<Json<TransitionRequestJson>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ApiError> {
+    let Json(body) = body.map_err(|rej| ApiError::malformed(format!("request body: {rej}")))?;
     let mut req = json_to_transition(body)?;
+    // Missing header ⇒ leave proto field empty (kernel treats empty as absent).
+    // Present-but-empty is a client error, not silently rewritten to absent.
     if let Some(key) = idempotency_key_from_headers(&headers)? {
         req.idempotency_key = key;
     }
     let handle: JobHandle = kernel.submit_transition(req).await?;
-    let body = json!({
-        "job_id": handle.job_id,
-        "status": "accepted",
-    });
-    // Spec: 202 is the only success status for POST /v1/tx (L3031).
-    // Echo kernel status only when it is the closed success literal.
-    if !handle.status.is_empty() && handle.status != "accepted" {
+    // Spec §7.5: 202 is the only success for POST /v1/tx, and the body is
+    // `{ job_id, status: "accepted" }`. An empty job_id or non-accepted
+    // status is a kernel contract violation — never admit as success
+    // (same discipline as AttestBalance in `attest.rs`).
+    if handle.job_id.is_empty() {
+        return Err(ApiError::internal(
+            "kernel JobHandle.job_id is empty on SubmitTransition success",
+        ));
+    }
+    if handle.status != "accepted" {
         return Err(ApiError::internal(format!(
             "kernel JobHandle.status must be \"accepted\" on submit success, got {:?}",
             handle.status
         )));
     }
+    let body = json!({
+        "job_id": handle.job_id,
+        "status": "accepted",
+    });
     Ok((StatusCode::ACCEPTED, Json(body)).into_response())
 }
 
@@ -494,18 +517,37 @@ fn decode_hex_field(hex: &str, byte_len: usize, field: &str) -> Result<Vec<u8>, 
         .map_err(|e: HexError| ApiError::malformed(format!("{field}: {e}")))
 }
 
-fn idempotency_key_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+/// Parse the §7.5 `Idempotency-Key` request header.
+///
+/// - **Absent** → `Ok(None)` — caller leaves the proto field empty (missing).
+/// - **Present but empty** → `400 malformed_request` (empty ≠ missing).
+/// - **Present, non-empty, ≤ 64 bytes, ASCII** → `Ok(Some(key))`.
+pub(crate) fn idempotency_key_from_headers(
+    headers: &HeaderMap,
+) -> Result<Option<String>, ApiError> {
     let Some(raw) = headers.get("idempotency-key") else {
         return Ok(None);
     };
     let s = raw
         .to_str()
-        .map_err(|_| ApiError::malformed("Idempotency-Key must be ASCII"))?
-        .to_string();
+        .map_err(|_| ApiError::malformed("Idempotency-Key must be ASCII"))?;
+    parse_idempotency_key_value(s)
+}
+
+/// Validate a present `Idempotency-Key` value (header already observed).
+///
+/// Separated from header extraction so empty-vs-missing can be unit-tested
+/// without depending on `http::HeaderValue` (which rejects empty bytes).
+pub(crate) fn parse_idempotency_key_value(s: &str) -> Result<Option<String>, ApiError> {
+    if s.is_empty() {
+        return Err(ApiError::malformed(
+            "Idempotency-Key header is present but empty",
+        ));
+    }
     if s.len() > 64 {
         return Err(ApiError::malformed("Idempotency-Key exceeds 64 bytes"));
     }
-    Ok(Some(s))
+    Ok(Some(s.to_string()))
 }
 
 /// §7.5 job poll object (L2889, L2959–L2991).
@@ -660,4 +702,105 @@ fn job_poll_headers(job: &Job) -> (StatusCode, Option<u64>) {
         _ => 2, // proving / publishing / accepted — RECOMMENDED 2 (L2944)
     };
     (StatusCode::OK, Some(secs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn hex32(byte: u8) -> String {
+        crate::hexutil::encode_hex(&[byte; 32])
+    }
+
+    fn mint_json() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "mint",
+            "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "next_pubkey": hex32(0x11),
+            "npk_rand": hex32(0x22),
+            "output_templates": [{
+                "recipient": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+                "asset_id": hex32(0x33),
+                "amount": "100"
+            }],
+            "issuance": {
+                "name": "TestCoin",
+                "decimals": 8,
+                "issuance_version": 1,
+                "amount": "1000"
+            }
+        })
+    }
+
+    #[test]
+    fn idempotency_missing_header_is_none() {
+        let headers = HeaderMap::new();
+        let got = idempotency_key_from_headers(&headers).expect("ok");
+        assert_eq!(got, None, "absent header must stay None, not empty string");
+    }
+
+    /// Present-but-empty is a client error. Distinct from missing (`None`).
+    ///
+    /// Tested at the value layer: `http::HeaderValue` rejects empty bytes, so
+    /// an HTTP request builder cannot construct this case — the wire still
+    /// requires the same rule when a stack delivers an empty value.
+    #[test]
+    fn idempotency_empty_value_is_malformed_not_none() {
+        let err = parse_idempotency_key_value("").expect_err("empty");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        // Contrast: missing header is Ok(None), not an error.
+        let headers = HeaderMap::new();
+        assert!(idempotency_key_from_headers(&headers).unwrap().is_none());
+    }
+
+    #[test]
+    fn idempotency_nonempty_header_is_some() {
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "abc".parse().unwrap());
+        let got = idempotency_key_from_headers(&headers).expect("ok");
+        assert_eq!(got.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn transition_request_rejects_unknown_top_level_field() {
+        let mut v = mint_json();
+        v["not_in_spec"] = serde_json::json!(true);
+        let err = serde_json::from_value::<TransitionRequestJson>(v).expect_err("deny");
+        assert!(
+            err.to_string().contains("not_in_spec") || err.to_string().contains("unknown field"),
+            "serde must reject unknown field, got {err}"
+        );
+    }
+
+    #[test]
+    fn transition_request_rejects_unknown_nested_issuance_field() {
+        let mut v = mint_json();
+        v["issuance"]["ghost"] = serde_json::json!("x");
+        let err = serde_json::from_value::<TransitionRequestJson>(v).expect_err("deny nested");
+        assert!(
+            err.to_string().contains("ghost") || err.to_string().contains("unknown field"),
+            "nested deny_unknown_fields must fire, got {err}"
+        );
+    }
+
+    #[test]
+    fn transition_request_rejects_unknown_nested_output_template_field() {
+        let mut v = mint_json();
+        v["output_templates"][0]["extra"] = serde_json::json!(1);
+        let err = serde_json::from_value::<TransitionRequestJson>(v).expect_err("deny nested ot");
+        assert!(
+            err.to_string().contains("extra") || err.to_string().contains("unknown field"),
+            "output_templates deny_unknown_fields must fire, got {err}"
+        );
+    }
+
+    #[test]
+    fn transition_request_accepts_exact_mint_shape() {
+        let v = mint_json();
+        let parsed: TransitionRequestJson =
+            serde_json::from_value(v).expect("exact shape must parse");
+        assert_eq!(parsed.kind, "mint");
+    }
 }

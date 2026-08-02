@@ -182,10 +182,12 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Replica-/Blob-Pfad).
 |---|---|
 | `blossom_*` (ohne `ZKCOINS_BLOSSOM_STORE`) | §7.4; die vier Schlüssel werden **nur** advertised, wenn der inhaltsadressierte Store konfiguriert ist. |
 
-Router und Discovery teilen eine Quelle (`ServedSurface` in `src/routes.rs`): eine neue
-registrierte Fläche erscheint automatisch in `GET /`; ein Inventur-Key ohne Route
-wird nicht beworben. Path-Parameter in Discovery/`CLOSED_ENDPOINT_KEYS` nutzen die
-Spec-Schreibweise `<name>` (Axum-Matcher: `:name`).
+Router und Discovery teilen eine Quelle (`ServedSurface` in `src/routes.rs`): die
+aktive Mengen folgt `Config::features` und dem Blossom-Store; eine neue
+registrierte Fläche erscheint automatisch in `GET /`; deaktivierte Features
+sind unregistriert und unbeworben (fail-closed, §7.5). Path-Parameter in
+Discovery/`CLOSED_ENDPOINT_KEYS` nutzen die Spec-Schreibweise `<name>`
+(Axum-Matcher: `:name`).
 
 gRPC: getragenes `proto/kernel/v1/kernel.proto` (Identität per SHA-256-Pin +
 Sibling-Vergleich mit `zk-coins/node`), Client `tonic 0.13.1`, Fehlerübersetzung
@@ -197,7 +199,7 @@ ausschließlich über `google.rpc.ErrorInfo` (`domain`, `reason`,
 | Lücke | Warum |
 |---|---|
 | Blossom `ReplicaReceiptV1` | §4.6 Dual-Commit (Blob + Delivery-Event) fehlt; Upload antwortet ehrlich nur mit `{ blob_id }` — kein `receipt`. |
-| Feature-Gate `404 feature_disabled` | Bootstrap/Publish/Job/Attest-Fläche ist in dieser Stufe always-on; Gate folgt mit den optionalen Rollen. |
+| — | Feature-Gating (§6.1 / §7.5) ist aktiv: `ServedSurface::active` filtert nach `ZKCOINS_FEATURES` + Blossom-Store; deaktivierte Flächen sind unregistriert (HTTP 404) und fehlen in `GET /`. |
 
 ---
 

@@ -16,9 +16,51 @@ use tonic::Status;
 /// Normative `ErrorInfo.domain` (§7.8).
 pub const ERROR_INFO_DOMAIN: &str = "kernel.v1";
 
+/// Closed §7.5 `machine_code` set that a kernel `ErrorInfo.reason` **MAY**
+/// carry (§7.5 jobs-family table + the additional codes closing the
+/// enumeration across §7.4–§7.7, plus `feature_disabled` from the §7.5 intro).
+///
+/// An unknown reason is a **protocol violation by the kernel**, not a client
+/// error: the API fails closed with `500 internal_error` and **never**
+/// forwards a foreign code onto the public wire (same discipline as a missing
+/// or non-canonical `http_status`).
+const CLOSED_ERROR_REASONS: &[&str] = &[
+    // Jobs family (§7.5 machine_code table)
+    "invalid_input_coin",
+    "insufficient_balance",
+    "bounds_exceeded",
+    "unknown_publisher",
+    "stale_message",
+    "invalid_signature",
+    "job_not_found",
+    "wrong_phase",
+    "proving_failed",
+    "publish_rejected",
+    "circuit_digest_mismatch",
+    // Additional codes closing the enumeration (§7.5 additional table)
+    "malformed_request",
+    "idempotency_conflict",
+    "unauthorized",
+    "scope_exceeded",
+    "challenge_expired",
+    "session_expired",
+    "not_found",
+    "payload_too_large",
+    "retention_hold",
+    "rate_limited",
+    "dependency_not_final",
+    "internal_error",
+    // §7.5 intro: disabled feature answers `404 feature_disabled`
+    "feature_disabled",
+];
+
 /// Wire type URL for `google.rpc.ErrorInfo` (with and without the type.googleapis.com prefix).
 const ERROR_INFO_TYPE_URL: &str = "type.googleapis.com/google.rpc.ErrorInfo";
 const ERROR_INFO_TYPE_SUFFIX: &str = "google.rpc.ErrorInfo";
+
+fn is_closed_error_reason(reason: &str) -> bool {
+    CLOSED_ERROR_REASONS.contains(&reason)
+}
 
 /// Minimal `google.rpc.ErrorInfo` (field numbers match googleapis).
 #[derive(Clone, PartialEq, Message)]
@@ -67,6 +109,14 @@ fn validate_and_build(info: ErrorInfo, status_message: &str) -> Result<ApiError,
     }
     if info.reason.is_empty() {
         return Err("reason is empty".to_string());
+    }
+    // Closed §7.5 machine_code set — a foreign reason is a kernel protocol
+    // violation. Do not forward it as the public `error` field.
+    if !is_closed_error_reason(&info.reason) {
+        return Err(format!(
+            "reason is not a closed §7.5 machine_code: {:?}",
+            info.reason
+        ));
     }
     let http_raw = match info.metadata.get("http_status") {
         Some(v) => v.as_str(),
@@ -314,5 +364,60 @@ mod tests {
             "message must name canonical form, got {}",
             err.body.message
         );
+    }
+
+    /// Without the closed-set check, a non-empty foreign reason is forwarded
+    /// as the public machine code. That must fail loud instead.
+    #[test]
+    fn unknown_error_info_reason_is_fail_closed_500_not_forwarded() {
+        let st = encode_kernel_error_status(
+            Code::Internal,
+            "kernel invented a code",
+            "totally_made_up_reason",
+            500,
+        );
+        let err = kernel_status_to_api_error(&st);
+        assert_eq!(
+            err.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unknown kernel reason is a server-side protocol fault, not a client 4xx"
+        );
+        assert_eq!(
+            err.body.error, "internal_error",
+            "foreign reason must not become the public error code"
+        );
+        assert!(
+            err.body.message.contains("totally_made_up_reason")
+                || err.body.message.contains("machine_code")
+                || err.body.message.contains("closed"),
+            "message must name the foreign reason or the closed-set rule, got {}",
+            err.body.message
+        );
+        assert_ne!(
+            err.body.error, "totally_made_up_reason",
+            "foreign reason must never be echoed as the wire machine code"
+        );
+    }
+
+    #[test]
+    fn closed_reason_set_accepts_known_machine_codes() {
+        // Spot-check a few codes from each §7.5 table so the constant is not
+        // accidentally empty / truncated.
+        for reason in [
+            "job_not_found",
+            "bounds_exceeded",
+            "malformed_request",
+            "session_expired",
+            "dependency_not_final",
+            "feature_disabled",
+            "internal_error",
+        ] {
+            assert!(
+                is_closed_error_reason(reason),
+                "closed set must include {reason:?}"
+            );
+        }
+        assert!(!is_closed_error_reason(""));
+        assert!(!is_closed_error_reason("not_a_real_code"));
     }
 }
