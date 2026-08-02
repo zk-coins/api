@@ -24,6 +24,28 @@ pub const ERROR_INFO_DOMAIN: &str = "kernel.v1";
 /// error: the API fails closed with `500 internal_error` and **never**
 /// forwards a foreign code onto the public wire (same discipline as a missing
 /// or non-canonical `http_status`).
+///
+/// ## Delivery credential (§7.5 `OutputTemplate.delivery`)
+///
+/// Invalid / missing / unknown-type delivery credentials are **not** a new
+/// machine code. Spec §7.5 maps every failed invoice/profile check-list item
+/// and every presence-rule violation to `malformed_request` / 400. The node
+/// (`KernelErrorCode::MalformedRequest` → reason `malformed_request`) agrees.
+/// This closed set therefore gains **no** delivery-specific reason from that
+/// wire addition.
+///
+/// ## Alignment notes (API set vs node `KernelErrorCode::ALL`)
+///
+/// Node `error_contract.rs` / `KernelErrorCode` covers the 21 RPC-level codes.
+/// This API set additionally accepts:
+/// - `proving_failed`, `publish_rejected` — terminal **job** `JobError.error`
+///   values (§7.5 jobs-family table); not `KernelErrorCode` RPC failures, but
+///   listed so a kernel that ever surfaces them via `ErrorInfo` is not
+///   fail-closed as foreign.
+/// - `feature_disabled` — API-layer gate (§7.5 intro), never a kernel code.
+///
+/// Those three extras predate the delivery-credential change and are **not**
+/// a Spec↔node drift for delivery.
 const CLOSED_ERROR_REASONS: &[&str] = &[
     // Jobs family (§7.5 machine_code table)
     "invalid_input_coin",
@@ -38,6 +60,8 @@ const CLOSED_ERROR_REASONS: &[&str] = &[
     "publish_rejected",
     "circuit_digest_mismatch",
     // Additional codes closing the enumeration (§7.5 additional table)
+    // `malformed_request` also covers failed/missing `OutputTemplate.delivery`
+    // (§7.5 delivery check-lists + presence rule + unknown `delivery.type`).
     "malformed_request",
     "idempotency_conflict",
     "unauthorized",
@@ -411,6 +435,10 @@ mod tests {
             "dependency_not_final",
             "feature_disabled",
             "internal_error",
+            // Delivery credential failures reuse malformed_request — there is
+            // no distinct delivery_* machine code in Spec or node.
+            "proving_failed",
+            "publish_rejected",
         ] {
             assert!(
                 is_closed_error_reason(reason),
@@ -419,5 +447,9 @@ mod tests {
         }
         assert!(!is_closed_error_reason(""));
         assert!(!is_closed_error_reason("not_a_real_code"));
+        // Delivery did not introduce a new public code.
+        assert!(!is_closed_error_reason("invalid_delivery"));
+        assert!(!is_closed_error_reason("delivery_required"));
+        assert!(!is_closed_error_reason("invalid_invoice"));
     }
 }

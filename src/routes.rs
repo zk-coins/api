@@ -1428,6 +1428,8 @@ mod tests {
         revoke_calls: AtomicUsize,
         publish_calls: AtomicUsize,
         list_inscriptions_calls: AtomicUsize,
+        /// SubmitTransition call counter (delivery form rejections must stay 0).
+        submit_calls: AtomicUsize,
         /// Last pull authority observed (for grant/ownership plumbing asserts).
         last_pull_authority: Mutex<Option<SessionAuthority>>,
         /// Last PullRequest observed (resolved_scope / subject plumbing).
@@ -1442,11 +1444,15 @@ mod tests {
         last_list_inscriptions: Mutex<Option<ListInscriptionsRequest>>,
         /// Last SubscribeReceipts request (session + chan_bind; never subject).
         last_subscribe_receipts: Mutex<Option<SubscribeReceiptsRequest>>,
+        /// Last SubmitTransition request (delivery field-for-field asserts).
+        last_submit: Mutex<Option<TransitionRequest>>,
     }
 
     #[async_trait]
     impl KernelRpc for ScriptedKernel {
-        async fn submit_transition(&self, _req: TransitionRequest) -> Result<JobHandle, ApiError> {
+        async fn submit_transition(&self, req: TransitionRequest) -> Result<JobHandle, ApiError> {
+            self.submit_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_submit.lock().unwrap() = Some(req);
             match &self.submit {
                 Some(Ok(h)) => Ok(h.clone()),
                 Some(Err(e)) => Err(e.clone()),
@@ -2074,6 +2080,233 @@ mod tests {
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
         assert_eq!(json["error"], "bounds_exceeded");
         assert_eq!(json["message"], "too many outputs");
+    }
+
+    /// Distinctive pk0 hex used only in delivery HTTP tests — must never
+    /// appear in 400 response bodies (form errors name paths, not values).
+    fn delivery_test_pk0() -> String {
+        "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90".to_string()
+    }
+
+    fn delivery_test_memo() -> String {
+        "MEMO_RETENTION_MARKER_DO_NOT_LOG_xyz".to_string()
+    }
+
+    fn mint_body_with_invoice_delivery() -> Value {
+        let mut body = mint_body();
+        body["output_templates"][0]["delivery"] = serde_json::json!({
+            "type": "invoice",
+            "invoice": {
+                "amount": "100",
+                "recipient": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+                "asset_id": hex32(0x33),
+                "memo": delivery_test_memo(),
+                "pk0": delivery_test_pk0(),
+                "nk_commit": hex32(0x44),
+                "ivpk": hex32(0x55),
+                "op_pubkey": hex32(0x66),
+                "relays": ["wss://relay.example"],
+                "addr_sig": crate::hexutil::encode_hex(&[0x77u8; 64]),
+                "sig": crate::hexutil::encode_hex(&[0x88u8; 64]),
+            }
+        });
+        body
+    }
+
+    /// Well-formed invoice delivery reaches the kernel field-for-field.
+    #[tokio::test]
+    async fn post_tx_invoice_delivery_forwards_to_kernel() {
+        let kernel = Arc::new(ScriptedKernel {
+            submit: Some(Ok(JobHandle {
+                job_id: "job-deliv".into(),
+                status: "accepted".into(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tx")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body_with_invoice_delivery().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        assert_eq!(kernel.submit_calls.load(Ordering::SeqCst), 1);
+        let last = kernel.last_submit.lock().unwrap();
+        let req = last.as_ref().expect("submit captured");
+        assert_eq!(req.output_templates.len(), 1);
+        let cred = req.output_templates[0]
+            .delivery
+            .as_ref()
+            .expect("delivery present on proto");
+        let inv = match cred.body.as_ref().expect("oneof") {
+            crate::kernel::kernel_v1::delivery_credential::Body::Invoice(i) => i,
+            other => panic!("expected Invoice, got {other:?}"),
+        };
+        assert_eq!(
+            inv.pk0,
+            crate::hexutil::decode_hex_exact(&delivery_test_pk0(), 32).unwrap()
+        );
+        assert_eq!(inv.memo, delivery_test_memo());
+        assert_eq!(inv.relays, vec!["wss://relay.example".to_string()]);
+        // Position binding: sole template is index 0.
+        assert_eq!(req.output_templates[0].amount, "100");
+    }
+
+    /// Unknown `delivery.type` is API-edge 400 — kernel is never called.
+    #[tokio::test]
+    async fn post_tx_unknown_delivery_type_no_kernel_call() {
+        let kernel = Arc::new(ScriptedKernel {
+            submit: Some(Ok(JobHandle {
+                job_id: "x".into(),
+                status: "accepted".into(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let mut body = mint_body();
+        body["output_templates"][0]["delivery"] = serde_json::json!({
+            "type": "carrier_pigeon",
+            "invoice": { "amount": "1" }
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tx")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+        assert_eq!(
+            kernel.submit_calls.load(Ordering::SeqCst),
+            0,
+            "form rejection must not call SubmitTransition"
+        );
+    }
+
+    /// Unknown nested invoice field is API-edge 400 — no kernel call.
+    #[tokio::test]
+    async fn post_tx_unknown_invoice_field_no_kernel_call() {
+        let kernel = Arc::new(ScriptedKernel {
+            submit: Some(Ok(JobHandle {
+                job_id: "x".into(),
+                status: "accepted".into(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let mut body = mint_body_with_invoice_delivery();
+        body["output_templates"][0]["delivery"]["invoice"]["ghost"] = Value::Bool(true);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tx")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+        assert_eq!(kernel.submit_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Missing required invoice field is API-edge 400 — no kernel call.
+    #[tokio::test]
+    async fn post_tx_missing_invoice_pk0_no_kernel_call() {
+        let kernel = Arc::new(ScriptedKernel {
+            submit: Some(Ok(JobHandle {
+                job_id: "x".into(),
+                status: "accepted".into(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let mut body = mint_body_with_invoice_delivery();
+        body["output_templates"][0]["delivery"]["invoice"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pk0");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tx")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+        // Response must not echo a pk0 that was never in the body either —
+        // and must not leak the memo that *was* present.
+        let msg = json["message"].as_str().unwrap_or("");
+        assert!(!msg.contains(&delivery_test_memo()));
+        assert!(!msg.contains(&delivery_test_pk0()));
+        assert_eq!(kernel.submit_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Submit with a credential: 400 form-error message (wrong pk0 width)
+    /// must contain neither the pk0 hex nor the memo text.
+    #[tokio::test]
+    async fn post_tx_delivery_form_error_does_not_leak_pk0_or_memo() {
+        let kernel = Arc::new(ScriptedKernel {
+            submit: Some(Ok(JobHandle {
+                job_id: "x".into(),
+                status: "accepted".into(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone());
+        let mut body = mint_body_with_invoice_delivery();
+        // Wrong width — triggers decode_hex_field form error after parse.
+        let bad_pk0 = "ab".repeat(20); // 40 chars
+        body["output_templates"][0]["delivery"]["invoice"]["pk0"] = Value::String(bad_pk0.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tx")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+        let msg = json["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("pk0"),
+            "message must name the field path, got {msg}"
+        );
+        assert!(
+            !msg.contains(&bad_pk0),
+            "§7.5 retention: must not echo pk0 hex, got {msg}"
+        );
+        assert!(
+            !msg.contains(&delivery_test_memo()),
+            "§7.5 retention: must not echo memo, got {msg}"
+        );
+        assert_eq!(kernel.submit_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

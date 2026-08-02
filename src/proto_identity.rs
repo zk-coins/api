@@ -15,7 +15,7 @@
 /// worktree used for this stage (`31bffc90…`). Updating the proto **requires**
 /// updating this pin in the same change.
 pub const KERNEL_PROTO_SHA256_HEX: &str =
-    "31bffc90fec10dea7d7198861af8097c6102ea82bcc4d71fd772231cef6ad559";
+    "4575264c1c4e175b889859abfca901356883b62ee4ade8d6afb32c7d5b9a038e";
 
 /// Relative path of the carried contract from the workspace / api crate root.
 pub const KERNEL_PROTO_REL: &str = "proto/kernel/v1/kernel.proto";

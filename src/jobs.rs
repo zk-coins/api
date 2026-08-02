@@ -7,7 +7,9 @@
 use crate::error::ApiError;
 use crate::hexutil::{decode_hex_exact, encode_hex, HexError};
 use crate::kernel::kernel_v1::{
-    AwaitingSignature, Issuance, Job, JobEvent, JobHandle, JobRequest, JobResult as ProtoJobResult,
+    delivery_credential, AwaitingSignature, DeliveryCredential as ProtoDeliveryCredential,
+    Invoice as ProtoInvoice, Issuance, Job, JobEvent, JobHandle, JobRequest,
+    JobResult as ProtoJobResult, Kind0Event as ProtoKind0Event,
     OutputTemplate as ProtoOutputTemplate, SignRequest, TransitionRequest,
 };
 use crate::kernel::KernelHandle;
@@ -21,6 +23,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
+use std::fmt;
 
 // ---------------------------------------------------------------------------
 // JSON request types (exact §7.5 shapes)
@@ -53,12 +56,155 @@ pub struct TransitionRequestJson {
     pub issuance: Option<IssuanceJson>,
 }
 
-#[derive(Debug, Deserialize)]
+/// §7.5 `OutputTemplate`. `delivery` is optional on the wire; presence for
+/// non-self outputs is enforced by the **kernel** (§7.5 presence rule), not
+/// here. The API only checks form and forwards.
+///
+/// **Debug** redacts `delivery` entirely — §7.5 retention: the API layer
+/// **MUST NOT** log the credential (`pk0` / `memo` / signatures link the
+/// recipient to its genesis on-chain nullifier key).
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutputTemplateJson {
     pub recipient: String,
     pub asset_id: String,
     pub amount: String,
+    #[serde(default)]
+    pub delivery: Option<DeliveryCredentialJson>,
+}
+
+impl fmt::Debug for OutputTemplateJson {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OutputTemplateJson")
+            .field("recipient", &self.recipient)
+            .field("asset_id", &self.asset_id)
+            .field("amount", &self.amount)
+            .field(
+                "delivery",
+                &self
+                    .delivery
+                    .as_ref()
+                    .map(|_| "<redacted delivery credential — §7.5 retention>"),
+            )
+            .finish()
+    }
+}
+
+/// Closed tagged union matching §7.5 `DeliveryCredential`.
+///
+/// REST: `{ "type": "invoice", "invoice": … }` | `{ "type": "profile", "event": … }`.
+/// Any other `type`, any structural deviation, and unknown nested fields are
+/// `400 malformed_request` at the API edge. Content checks (signatures,
+/// address preimage, profile kind-0 rules) are **kernel-only**.
+///
+/// **Debug** never prints credential contents (same §7.5 retention rule).
+#[derive(Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum DeliveryCredentialJson {
+    #[serde(rename = "invoice")]
+    Invoice { invoice: InvoiceJson },
+    #[serde(rename = "profile")]
+    Profile { event: Kind0EventJson },
+}
+
+impl fmt::Debug for DeliveryCredentialJson {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Spec §7.5 retention: API MUST NOT log delivery. Name only the arm.
+        match self {
+            Self::Invoice { .. } => {
+                f.write_str("DeliveryCredentialJson::Invoice { /* redacted */ }")
+            }
+            Self::Profile { .. } => {
+                f.write_str("DeliveryCredentialJson::Profile { /* redacted */ }")
+            }
+        }
+    }
+}
+
+/// Full §1.5 / §4.3 `Invoice` on the REST surface (§7.1 hex + decimal-string).
+///
+/// Form only at the API: hex widths and required keys. No crypto, no address
+/// preimage, no relay-URL policy. `memo` absent vs empty is preserved on the
+/// REST side; proto3 string maps both to empty bytes on the wire when absent
+/// or empty — the API does **not** trim a present memo.
+///
+/// **Debug** redacts `pk0`, `memo`, and both signatures.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvoiceJson {
+    pub amount: String,
+    pub recipient: String,
+    pub asset_id: String,
+    #[serde(default)]
+    pub memo: Option<String>,
+    pub pk0: String,
+    pub nk_commit: String,
+    pub ivpk: String,
+    pub op_pubkey: String,
+    pub relays: Vec<String>,
+    pub addr_sig: String,
+    pub sig: String,
+}
+
+impl fmt::Debug for InvoiceJson {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // §7.5: after a successful check the kernel retains only
+        // {ivpk, op_pubkey, relays}; pk0 / memo / signatures MUST NOT be
+        // logged. The API never verifies — and still MUST NOT log them.
+        f.debug_struct("InvoiceJson")
+            .field("amount", &self.amount)
+            .field("recipient", &self.recipient)
+            .field("asset_id", &self.asset_id)
+            .field(
+                "memo",
+                &self
+                    .memo
+                    .as_ref()
+                    .map(|_| "<redacted memo — §7.5 retention>"),
+            )
+            .field("pk0", &"<redacted pk0 — §7.5 retention>")
+            .field("nk_commit", &"<redacted>")
+            .field("ivpk", &"<redacted>")
+            .field("op_pubkey", &"<redacted>")
+            .field("relays", &self.relays.len())
+            .field("addr_sig", &"<redacted>")
+            .field("sig", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Canonical NIP-01 kind-0 event shape on the REST surface (`type: "profile"`).
+///
+/// Binary fields are lowercase-or-uppercase hex of exact width. `tags` is the
+/// JSON array of tag arrays; the API serialises it to `Kind0Event.tags_json`
+/// without reformatting the `content` string.
+///
+/// **Debug** redacts id / pubkey / content / sig (content holds the `zkcoins`
+/// object including `pk0`).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Kind0EventJson {
+    pub id: String,
+    pub pubkey: String,
+    pub created_at: u64,
+    pub kind: u32,
+    pub tags: Vec<Vec<String>>,
+    pub content: String,
+    pub sig: String,
+}
+
+impl fmt::Debug for Kind0EventJson {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Kind0EventJson")
+            .field("id", &"<redacted>")
+            .field("pubkey", &"<redacted>")
+            .field("created_at", &self.created_at)
+            .field("kind", &self.kind)
+            .field("tags", &self.tags.len())
+            .field("content", &"<redacted content — §7.5 retention>")
+            .field("sig", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,11 +237,19 @@ pub struct SignBodyJson {
 /// Body is deserialized via a §7.5-shaped extractor so unknown fields and
 /// other serde failures become `400 malformed_request` (not axum's default
 /// 422 with a non-§7.5 body).
+///
+/// **Retention (§7.5 `delivery`):** this handler never logs the request body
+/// and never interpolates credential fields into success paths. Form-error
+/// messages name field *paths* and form classes only — not `pk0` hex or
+/// `memo` text. `Debug` on the JSON types redacts `delivery` for the same
+/// reason (see `OutputTemplateJson` / `InvoiceJson`).
 pub async fn post_tx(
     State(kernel): State<KernelHandle>,
     headers: HeaderMap,
     body: Result<Json<TransitionRequestJson>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ApiError> {
+    // Map extractor failures to §7.5 shape. Serde's messages name field paths
+    // / types; they must not become a back-channel for credential contents.
     let Json(body) = body.map_err(|rej| ApiError::malformed(format!("request body: {rej}")))?;
     let mut req = json_to_transition(body)?;
     // Missing header ⇒ leave proto field empty (kernel treats empty as absent).
@@ -367,13 +521,7 @@ fn json_to_transition(body: TransitionRequestJson) -> Result<TransitionRequest, 
         Some(list) => {
             let mut out = Vec::with_capacity(list.len());
             for (i, t) in list.into_iter().enumerate() {
-                let asset_id =
-                    decode_hex_field(&t.asset_id, 32, &format!("output_templates[{i}].asset_id"))?;
-                out.push(ProtoOutputTemplate {
-                    recipient: t.recipient,
-                    asset_id,
-                    amount: t.amount,
-                });
+                out.push(json_to_output_template(t, i)?);
             }
             out
         }
@@ -465,6 +613,107 @@ fn json_to_transition(body: TransitionRequestJson) -> Result<TransitionRequest, 
         fold_coin_ids,
         issuance,
         idempotency_key: String::new(),
+    })
+}
+
+/// REST → proto for one `OutputTemplate`, including optional `delivery`.
+///
+/// Field-for-field, no normalisation: hex is form-checked (width + charset)
+/// and decoded; strings (`recipient`, `amount`, memo, relays, content) pass
+/// through unchanged (no trim). Credential **content** is never inspected.
+fn json_to_output_template(
+    t: OutputTemplateJson,
+    index: usize,
+) -> Result<ProtoOutputTemplate, ApiError> {
+    let prefix = format!("output_templates[{index}]");
+    let asset_id = decode_hex_field(&t.asset_id, 32, &format!("{prefix}.asset_id"))?;
+    let delivery = match t.delivery {
+        None => None,
+        Some(cred) => Some(json_to_delivery_credential(cred, &prefix)?),
+    };
+    Ok(ProtoOutputTemplate {
+        recipient: t.recipient,
+        asset_id,
+        amount: t.amount,
+        delivery,
+    })
+}
+
+/// REST closed tagged union → proto `DeliveryCredential` oneof.
+///
+/// Maps `type: "invoice"` → `body = Invoice`, `type: "profile"` →
+/// `body = ProfileEvent`. Unknown `type` is already rejected by serde at the
+/// JSON edge. Error messages name only field paths and form classes — never
+/// credential bytes or memo text (§7.5 retention).
+fn json_to_delivery_credential(
+    cred: DeliveryCredentialJson,
+    output_prefix: &str,
+) -> Result<ProtoDeliveryCredential, ApiError> {
+    let prefix = format!("{output_prefix}.delivery");
+    let body = match cred {
+        DeliveryCredentialJson::Invoice { invoice } => {
+            delivery_credential::Body::Invoice(json_to_invoice(invoice, &prefix)?)
+        }
+        DeliveryCredentialJson::Profile { event } => {
+            delivery_credential::Body::ProfileEvent(json_to_kind0_event(event, &prefix)?)
+        }
+    };
+    Ok(ProtoDeliveryCredential { body: Some(body) })
+}
+
+fn json_to_invoice(inv: InvoiceJson, delivery_prefix: &str) -> Result<ProtoInvoice, ApiError> {
+    let p = format!("{delivery_prefix}.invoice");
+    // Form only: exact hex widths. Do not trim strings; do not parse amount as
+    // u128; do not require non-empty relays (kernel check-list).
+    let asset_id = decode_hex_field(&inv.asset_id, 32, &format!("{p}.asset_id"))?;
+    let pk0 = decode_hex_field(&inv.pk0, 32, &format!("{p}.pk0"))?;
+    let nk_commit = decode_hex_field(&inv.nk_commit, 32, &format!("{p}.nk_commit"))?;
+    let ivpk = decode_hex_field(&inv.ivpk, 32, &format!("{p}.ivpk"))?;
+    let op_pubkey = decode_hex_field(&inv.op_pubkey, 32, &format!("{p}.op_pubkey"))?;
+    let addr_sig = decode_hex_field(&inv.addr_sig, 64, &format!("{p}.addr_sig"))?;
+    let sig = decode_hex_field(&inv.sig, 64, &format!("{p}.sig"))?;
+    // Absent memo → empty proto string (proto3); present empty string stays
+    // empty; present non-empty is copied byte-for-byte (no trim).
+    let memo = inv.memo.unwrap_or_default();
+    Ok(ProtoInvoice {
+        amount: inv.amount,
+        recipient: inv.recipient,
+        asset_id,
+        memo,
+        pk0,
+        nk_commit,
+        ivpk,
+        op_pubkey,
+        relays: inv.relays,
+        addr_sig,
+        sig,
+    })
+}
+
+fn json_to_kind0_event(
+    ev: Kind0EventJson,
+    delivery_prefix: &str,
+) -> Result<ProtoKind0Event, ApiError> {
+    let p = format!("{delivery_prefix}.event");
+    // Form only: hex widths. kind == 0 and NIP-01 verification are kernel-side.
+    let id = decode_hex_field(&ev.id, 32, &format!("{p}.id"))?;
+    let pubkey = decode_hex_field(&ev.pubkey, 32, &format!("{p}.pubkey"))?;
+    let sig = decode_hex_field(&ev.sig, 64, &format!("{p}.sig"))?;
+    // tags → tags_json: canonical JSON array, no pretty-print. Failure here is
+    // structural (tags not serialisable) — message names the path only.
+    let tags_json = serde_json::to_string(&ev.tags).map_err(|_| {
+        ApiError::malformed(format!(
+            "{p}.tags must be a JSON-serialisable array of string arrays"
+        ))
+    })?;
+    Ok(ProtoKind0Event {
+        id,
+        pubkey,
+        created_at: ev.created_at,
+        kind: ev.kind,
+        tags_json,
+        content: ev.content,
+        sig,
     })
 }
 
@@ -707,10 +956,56 @@ fn job_poll_headers(job: &Job) -> (StatusCode, Option<u64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::kernel_v1::delivery_credential::Body as DeliveryBody;
     use axum::http::HeaderMap;
 
     fn hex32(byte: u8) -> String {
         crate::hexutil::encode_hex(&[byte; 32])
+    }
+
+    fn hex64(byte: u8) -> String {
+        crate::hexutil::encode_hex(&[byte; 64])
+    }
+
+    /// Distinctive 32-byte hex that must never appear in logs / error text.
+    fn distinctive_pk0() -> String {
+        // Unique nibble pattern so substring false-positives are unlikely.
+        "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90".to_string()
+    }
+
+    fn distinctive_memo() -> String {
+        "MEMO_RETENTION_MARKER_DO_NOT_LOG_xyz".to_string()
+    }
+
+    fn sample_invoice_json() -> serde_json::Value {
+        serde_json::json!({
+            "amount": "100",
+            "recipient": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "asset_id": hex32(0x33),
+            "memo": distinctive_memo(),
+            "pk0": distinctive_pk0(),
+            "nk_commit": hex32(0x44),
+            "ivpk": hex32(0x55),
+            "op_pubkey": hex32(0x66),
+            "relays": ["wss://relay.example"],
+            "addr_sig": hex64(0x77),
+            "sig": hex64(0x88),
+        })
+    }
+
+    fn sample_profile_event_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": hex32(0x91),
+            "pubkey": hex32(0x92),
+            "created_at": 1_700_000_000_u64,
+            "kind": 0,
+            "tags": [],
+            "content": format!(
+                "{{\"zkcoins\":{{\"pk0\":\"{}\",\"memo\":\"should-not-matter\"}}}}",
+                distinctive_pk0()
+            ),
+            "sig": hex64(0x93),
+        })
     }
 
     fn mint_json() -> serde_json::Value {
@@ -730,6 +1025,53 @@ mod tests {
                 "issuance_version": 1,
                 "amount": "1000"
             }
+        })
+    }
+
+    fn mint_with_invoice_delivery() -> serde_json::Value {
+        let mut v = mint_json();
+        v["output_templates"][0]["delivery"] = serde_json::json!({
+            "type": "invoice",
+            "invoice": sample_invoice_json(),
+        });
+        v
+    }
+
+    fn mint_with_profile_delivery() -> serde_json::Value {
+        let mut v = mint_json();
+        v["output_templates"][0]["delivery"] = serde_json::json!({
+            "type": "profile",
+            "event": sample_profile_event_json(),
+        });
+        v
+    }
+
+    fn send_two_outputs_with_deliveries() -> serde_json::Value {
+        let inv0 = sample_invoice_json();
+        let mut inv1 = sample_invoice_json();
+        inv1["amount"] = serde_json::json!("200");
+        inv1["pk0"] = serde_json::json!(hex32(0xAB));
+        inv1["memo"] = serde_json::json!("second-output-memo");
+        serde_json::json!({
+            "kind": "send",
+            "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "next_pubkey": hex32(0x11),
+            "npk_rand": hex32(0x22),
+            "input_coins": [hex32(0x01)],
+            "output_templates": [
+                {
+                    "recipient": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+                    "asset_id": hex32(0x33),
+                    "amount": "100",
+                    "delivery": { "type": "invoice", "invoice": inv0 }
+                },
+                {
+                    "recipient": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+                    "asset_id": hex32(0x33),
+                    "amount": "200",
+                    "delivery": { "type": "invoice", "invoice": inv1 }
+                }
+            ]
         })
     }
 
@@ -802,5 +1144,294 @@ mod tests {
         let parsed: TransitionRequestJson =
             serde_json::from_value(v).expect("exact shape must parse");
         assert_eq!(parsed.kind, "mint");
+    }
+
+    // -----------------------------------------------------------------------
+    // Delivery credential: form edge + field-for-field forward
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn invoice_delivery_forwards_field_for_field() {
+        let parsed: TransitionRequestJson =
+            serde_json::from_value(mint_with_invoice_delivery()).expect("parse");
+        let req = json_to_transition(parsed).expect("convert");
+        assert_eq!(req.output_templates.len(), 1);
+        let ot = &req.output_templates[0];
+        let cred = ot.delivery.as_ref().expect("delivery present");
+        let inv = match cred.body.as_ref().expect("oneof set") {
+            DeliveryBody::Invoice(i) => i,
+            other => panic!("expected Invoice arm, got {other:?}"),
+        };
+        assert_eq!(inv.amount, "100");
+        assert_eq!(
+            inv.recipient,
+            "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+        );
+        assert_eq!(inv.asset_id, vec![0x33; 32]);
+        assert_eq!(inv.memo, distinctive_memo());
+        assert_eq!(inv.pk0, decode_hex_exact(&distinctive_pk0(), 32).unwrap());
+        assert_eq!(inv.nk_commit, vec![0x44; 32]);
+        assert_eq!(inv.ivpk, vec![0x55; 32]);
+        assert_eq!(inv.op_pubkey, vec![0x66; 32]);
+        assert_eq!(inv.relays, vec!["wss://relay.example".to_string()]);
+        assert_eq!(inv.addr_sig, vec![0x77; 64]);
+        assert_eq!(inv.sig, vec![0x88; 64]);
+        // Output template fields unchanged alongside delivery.
+        assert_eq!(ot.amount, "100");
+        assert_eq!(ot.asset_id, vec![0x33; 32]);
+    }
+
+    #[test]
+    fn profile_delivery_forwards_field_for_field() {
+        let parsed: TransitionRequestJson =
+            serde_json::from_value(mint_with_profile_delivery()).expect("parse");
+        let req = json_to_transition(parsed).expect("convert");
+        let cred = req.output_templates[0]
+            .delivery
+            .as_ref()
+            .expect("delivery present");
+        let ev = match cred.body.as_ref().expect("oneof set") {
+            DeliveryBody::ProfileEvent(e) => e,
+            other => panic!("expected ProfileEvent arm, got {other:?}"),
+        };
+        assert_eq!(ev.id, vec![0x91; 32]);
+        assert_eq!(ev.pubkey, vec![0x92; 32]);
+        assert_eq!(ev.created_at, 1_700_000_000);
+        assert_eq!(ev.kind, 0);
+        assert_eq!(ev.tags_json, "[]");
+        assert!(
+            ev.content.contains(&distinctive_pk0()),
+            "content must be forwarded byte-for-byte (no redact on the wire)"
+        );
+        assert_eq!(ev.sig, vec![0x93; 64]);
+    }
+
+    #[test]
+    fn delivery_position_binding_two_outputs() {
+        // Each delivery stays bound to output_templates[i] — never re-keyed.
+        let parsed: TransitionRequestJson =
+            serde_json::from_value(send_two_outputs_with_deliveries()).expect("parse");
+        let req = json_to_transition(parsed).expect("convert");
+        assert_eq!(req.output_templates.len(), 2);
+
+        let inv0 = match req.output_templates[0]
+            .delivery
+            .as_ref()
+            .unwrap()
+            .body
+            .as_ref()
+            .unwrap()
+        {
+            DeliveryBody::Invoice(i) => i,
+            _ => panic!("[0] invoice"),
+        };
+        let inv1 = match req.output_templates[1]
+            .delivery
+            .as_ref()
+            .unwrap()
+            .body
+            .as_ref()
+            .unwrap()
+        {
+            DeliveryBody::Invoice(i) => i,
+            _ => panic!("[1] invoice"),
+        };
+        assert_eq!(inv0.amount, "100");
+        assert_eq!(inv0.memo, distinctive_memo());
+        assert_eq!(inv0.pk0, decode_hex_exact(&distinctive_pk0(), 32).unwrap());
+        assert_eq!(inv1.amount, "200");
+        assert_eq!(inv1.memo, "second-output-memo");
+        assert_eq!(inv1.pk0, vec![0xAB; 32]);
+        // Positions must not swap.
+        assert_ne!(inv0.pk0, inv1.pk0);
+        assert_eq!(req.output_templates[0].amount, "100");
+        assert_eq!(req.output_templates[1].amount, "200");
+    }
+
+    #[test]
+    fn invoice_memo_absent_vs_empty_both_map_without_trim() {
+        // Absent memo → empty proto string.
+        let mut v = mint_with_invoice_delivery();
+        v["output_templates"][0]["delivery"]["invoice"]
+            .as_object_mut()
+            .unwrap()
+            .remove("memo");
+        let req = json_to_transition(serde_json::from_value(v).unwrap()).unwrap();
+        let inv = match req.output_templates[0]
+            .delivery
+            .as_ref()
+            .unwrap()
+            .body
+            .as_ref()
+            .unwrap()
+        {
+            DeliveryBody::Invoice(i) => i,
+            _ => panic!("invoice"),
+        };
+        assert_eq!(inv.memo, "");
+
+        // Present memo with leading/trailing spaces is NOT trimmed.
+        let mut v2 = mint_with_invoice_delivery();
+        v2["output_templates"][0]["delivery"]["invoice"]["memo"] =
+            serde_json::json!("  spaced memo  ");
+        let req2 = json_to_transition(serde_json::from_value(v2).unwrap()).unwrap();
+        let inv2 = match req2.output_templates[0]
+            .delivery
+            .as_ref()
+            .unwrap()
+            .body
+            .as_ref()
+            .unwrap()
+        {
+            DeliveryBody::Invoice(i) => i,
+            _ => panic!("invoice"),
+        };
+        assert_eq!(inv2.memo, "  spaced memo  ");
+    }
+
+    #[test]
+    fn unknown_delivery_type_is_malformed_at_json_edge() {
+        let mut v = mint_json();
+        v["output_templates"][0]["delivery"] = serde_json::json!({
+            "type": "carrier_pigeon",
+            "invoice": sample_invoice_json(),
+        });
+        let err = serde_json::from_value::<TransitionRequestJson>(v).expect_err("unknown type");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("carrier_pigeon")
+                || msg.contains("unknown variant")
+                || msg.contains("did not match"),
+            "unknown type must fail serde, got {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_field_inside_invoice_is_malformed() {
+        let mut v = mint_with_invoice_delivery();
+        v["output_templates"][0]["delivery"]["invoice"]["ghost_field"] = serde_json::json!("nope");
+        let err = serde_json::from_value::<TransitionRequestJson>(v).expect_err("deny");
+        assert!(
+            err.to_string().contains("ghost_field") || err.to_string().contains("unknown field"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_field_inside_profile_event_is_malformed() {
+        let mut v = mint_with_profile_delivery();
+        v["output_templates"][0]["delivery"]["event"]["extra"] = serde_json::json!(1);
+        let err = serde_json::from_value::<TransitionRequestJson>(v).expect_err("deny");
+        assert!(
+            err.to_string().contains("extra") || err.to_string().contains("unknown field"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn missing_invoice_required_field_is_malformed() {
+        let mut v = mint_with_invoice_delivery();
+        v["output_templates"][0]["delivery"]["invoice"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pk0");
+        let err = serde_json::from_value::<TransitionRequestJson>(v).expect_err("missing pk0");
+        assert!(
+            err.to_string().contains("pk0") || err.to_string().contains("missing field"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn missing_profile_required_field_is_malformed() {
+        let mut v = mint_with_profile_delivery();
+        v["output_templates"][0]["delivery"]["event"]
+            .as_object_mut()
+            .unwrap()
+            .remove("content");
+        let err = serde_json::from_value::<TransitionRequestJson>(v).expect_err("missing content");
+        assert!(
+            err.to_string().contains("content") || err.to_string().contains("missing field"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn invoice_pk0_wrong_hex_width_is_malformed_without_echoing_value() {
+        let mut v = mint_with_invoice_delivery();
+        // Distinctive wrong-length hex — must not leak into the error message.
+        let bad = "deadbeef".repeat(5); // 40 chars, not 64
+        v["output_templates"][0]["delivery"]["invoice"]["pk0"] = serde_json::json!(bad.clone());
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("form");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("pk0"),
+            "message must name the field path, got {}",
+            err.body.message
+        );
+        assert!(
+            !err.body.message.contains(&bad),
+            "§7.5 retention: error must not echo pk0 hex, got {}",
+            err.body.message
+        );
+        assert!(
+            !err.body.message.contains(&distinctive_memo()),
+            "error must not quote memo either, got {}",
+            err.body.message
+        );
+    }
+
+    /// Capture layer for the §7.5 retention rule: Debug of the parsed body
+    /// (what a logger that prints the extractor would see) must not contain
+    /// `pk0` hex or `memo` text. Same discipline as `BootstrapEntrustBody`.
+    #[test]
+    fn delivery_debug_and_error_paths_never_log_pk0_or_memo() {
+        let parsed: TransitionRequestJson =
+            serde_json::from_value(mint_with_invoice_delivery()).expect("parse");
+        let dbg = format!("{parsed:?}");
+        let pk0 = distinctive_pk0();
+        let memo = distinctive_memo();
+        assert!(
+            !dbg.contains(&pk0),
+            "Debug of TransitionRequestJson must redact pk0; got {dbg}"
+        );
+        assert!(
+            !dbg.contains(&memo),
+            "Debug of TransitionRequestJson must redact memo; got {dbg}"
+        );
+        // Arm name is allowed; credential contents are not.
+        assert!(
+            dbg.contains("redacted") || dbg.contains("Invoice"),
+            "Debug should still indicate a redacted delivery arm, got {dbg}"
+        );
+
+        // Profile content carries pk0 inside zkcoins JSON — also redacted.
+        let parsed_p: TransitionRequestJson =
+            serde_json::from_value(mint_with_profile_delivery()).expect("parse profile");
+        let dbg_p = format!("{parsed_p:?}");
+        assert!(
+            !dbg_p.contains(&pk0),
+            "profile Debug must redact content-held pk0; got {dbg_p}"
+        );
+
+        // Invoice-level Debug alone.
+        match &parsed.output_templates.as_ref().unwrap()[0].delivery {
+            Some(DeliveryCredentialJson::Invoice { invoice }) => {
+                let inv_dbg = format!("{invoice:?}");
+                assert!(!inv_dbg.contains(&pk0));
+                assert!(!inv_dbg.contains(&memo));
+            }
+            other => panic!("expected invoice arm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn absent_delivery_stays_none_on_proto() {
+        // Self-output MAY omit delivery; API does not invent one.
+        let parsed: TransitionRequestJson = serde_json::from_value(mint_json()).expect("parse");
+        let req = json_to_transition(parsed).expect("convert");
+        assert!(req.output_templates[0].delivery.is_none());
     }
 }
