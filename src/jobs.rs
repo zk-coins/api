@@ -69,10 +69,21 @@ fn is_closed_job_error_code(code: &str) -> bool {
     CLOSED_JOB_ERROR_CODES.contains(&code)
 }
 
+/// Closed `Job.kind` vocabulary on the public poll / SSE surface.
+const CLOSED_JOB_KINDS: &[&str] = &["mint", "send", "receive", "attest_balance"];
+
+fn is_closed_job_kind(kind: &str) -> bool {
+    CLOSED_JOB_KINDS.contains(&kind)
+}
+
+fn is_transition_job_kind(kind: &str) -> bool {
+    matches!(kind, "mint" | "send" | "receive")
+}
+
 /// Validate a kernel `Job` against the closed status set, status↔payload
-/// exclusivity, and terminal error-code vocabulary. Fail-closed as
-/// `500 internal_error` on any contract breach (never forward foreign
-/// statuses or error codes onto the public wire).
+/// exclusivity, kind-dependent result shape, and terminal error-code
+/// vocabulary. Fail-closed as `500 internal_error` on any contract breach
+/// (never forward foreign statuses or error codes onto the public wire).
 fn validate_job(job: &Job) -> Result<(), ApiError> {
     if !is_closed_job_status(&job.status) {
         return Err(ApiError::internal(format!(
@@ -80,10 +91,24 @@ fn validate_job(job: &Job) -> Result<(), ApiError> {
             job.status
         )));
     }
+    if !is_closed_job_kind(&job.kind) {
+        return Err(ApiError::internal(format!(
+            "kernel Job.kind is not a closed §7.5 job kind: {:?}",
+            job.kind
+        )));
+    }
 
     let has_awaiting = job.awaiting_signature.is_some();
     let has_result = job.result.is_some();
     let has_error = job.error.is_some();
+
+    // Terminal states must not carry a phase string (proto comment / §7.5).
+    if is_terminal_job_status(&job.status) && !job.phase.is_empty() {
+        return Err(ApiError::internal(format!(
+            "job status {} must have empty phase, got {:?}",
+            job.status, job.phase
+        )));
+    }
 
     match job.status.as_str() {
         "awaiting_signature" => {
@@ -97,6 +122,12 @@ fn validate_job(job: &Job) -> Result<(), ApiError> {
                     "job status awaiting_signature must not carry result or error",
                 ));
             }
+            if !is_transition_job_kind(&job.kind) {
+                return Err(ApiError::internal(format!(
+                    "job kind {:?} must not enter awaiting_signature",
+                    job.kind
+                )));
+            }
         }
         "completed" => {
             if !has_result {
@@ -109,6 +140,8 @@ fn validate_job(job: &Job) -> Result<(), ApiError> {
                     "job status completed must not carry awaiting_signature or error",
                 ));
             }
+            let result = job.result.as_ref().expect("checked has_result");
+            validate_job_result_for_kind(&job.kind, result)?;
         }
         "failed" | "cancelled" => {
             if !has_error {
@@ -141,6 +174,66 @@ fn validate_job(job: &Job) -> Result<(), ApiError> {
             }
         }
         _ => unreachable!("closed set checked above"),
+    }
+    Ok(())
+}
+
+/// Kind-dependent completed-result shape.
+///
+/// - `attest_balance`: non-empty `attestation`; no transition digest fields.
+/// - `mint`/`send`/`receive`: required transition digests; no `attestation`.
+fn validate_job_result_for_kind(kind: &str, result: &ProtoJobResult) -> Result<(), ApiError> {
+    let has_attestation = !result.attestation.is_empty();
+    let has_transition_digest = !result.new_account_state_hash.is_empty()
+        || !result.output_coins_root.is_empty()
+        || !result.input_nullifiers_root.is_empty()
+        || !result.publisher_pubkey.is_empty()
+        || !result.output_coin_ids.is_empty();
+
+    match kind {
+        "attest_balance" => {
+            if !has_attestation {
+                return Err(ApiError::internal(
+                    "attest_balance completed result must carry non-empty attestation",
+                ));
+            }
+            if has_transition_digest {
+                return Err(ApiError::internal(
+                    "attest_balance completed result must not carry transition digest fields",
+                ));
+            }
+        }
+        "mint" | "send" | "receive" => {
+            if has_attestation {
+                return Err(ApiError::internal(format!(
+                    "transition job kind {kind:?} must not carry attestation"
+                )));
+            }
+            // Required digests for transition completion.
+            if result.new_account_state_hash.len() != 32 {
+                return Err(ApiError::internal(format!(
+                    "transition job result.new_account_state_hash must be 32 bytes, got {}",
+                    result.new_account_state_hash.len()
+                )));
+            }
+            if result.output_coins_root.len() != 32 {
+                return Err(ApiError::internal(format!(
+                    "transition job result.output_coins_root must be 32 bytes, got {}",
+                    result.output_coins_root.len()
+                )));
+            }
+            if result.input_nullifiers_root.len() != 32 {
+                return Err(ApiError::internal(format!(
+                    "transition job result.input_nullifiers_root must be 32 bytes, got {}",
+                    result.input_nullifiers_root.len()
+                )));
+            }
+        }
+        other => {
+            return Err(ApiError::internal(format!(
+                "kernel Job.kind is not a closed §7.5 job kind: {other:?}"
+            )));
+        }
     }
     Ok(())
 }
@@ -987,9 +1080,20 @@ fn job_to_json(job: &Job) -> Result<Value, ApiError> {
 
     if job.status == "failed" || job.status == "cancelled" {
         let e = job.error.as_ref().expect("validate_job checked");
+        // Neutralise internal diagnostics on the public wire (poll + SSE).
+        let public_message = if e.error == "internal_error" {
+            tracing::error!(
+                job_id = %job.job_id,
+                message = %e.message,
+                "job terminal internal_error (operator diagnostic only)"
+            );
+            crate::error::PUBLIC_INTERNAL_MESSAGE.to_string()
+        } else {
+            e.message.clone()
+        };
         obj.insert(
             "error".to_string(),
-            json!({ "error": e.error, "message": e.message }),
+            json!({ "error": e.error, "message": public_message }),
         );
     }
 
@@ -1011,9 +1115,12 @@ fn awaiting_signature_json(a: &AwaitingSignature) -> Result<Value, ApiError> {
     }))
 }
 
+/// Project a completed `JobResult` already validated by [`validate_job`].
+///
+/// Kind-dependent presence is enforced in `validate_job_result_for_kind`;
+/// this helper only formats present fields.
 fn job_result_json(r: &ProtoJobResult) -> Result<Value, ApiError> {
     let mut obj = serde_json::Map::new();
-    // Digest fields may be empty for attest_balance jobs; only encode when set.
     if !r.new_account_state_hash.is_empty() {
         obj.insert(
             "new_account_state_hash".to_string(),
@@ -1045,7 +1152,12 @@ fn job_result_json(r: &ProtoJobResult) -> Result<Value, ApiError> {
     for (i, id) in r.output_coin_ids.iter().enumerate() {
         coin_ids.push(require_hex32(id, &format!("result.output_coin_ids[{i}]"))?);
     }
-    obj.insert("output_coin_ids".to_string(), json!(coin_ids));
+    // Transition jobs always expose the (possibly empty) coin-id list.
+    // Attest jobs have no coin ids — omit the field when empty and attestation
+    // is present so clients do not see a meaningless empty array.
+    if !coin_ids.is_empty() || r.attestation.is_empty() {
+        obj.insert("output_coin_ids".to_string(), json!(coin_ids));
+    }
 
     if !r.publisher_pubkey.is_empty() {
         obj.insert(
@@ -1504,6 +1616,102 @@ mod tests {
         // failed without error
         let job = sample_job("failed");
         assert!(validate_job(&job).is_err());
+    }
+
+    #[test]
+    fn validate_job_rejects_terminal_nonempty_phase() {
+        let mut job = sample_job("completed");
+        job.phase = "publishing".into();
+        job.result = Some(crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![0x11; 32],
+            output_coins_root: vec![0x22; 32],
+            input_nullifiers_root: vec![0x33; 32],
+            output_coin_ids: vec![],
+            publisher_pubkey: vec![],
+            attestation: vec![],
+        });
+        let err = validate_job(&job).expect_err("terminal phase must fail");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("phase"),
+            "cause must name phase, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn validate_job_attest_requires_attestation_rejects_transition_fields() {
+        let mut job = sample_job("completed");
+        job.kind = "attest_balance".into();
+        // Empty result → fail.
+        job.result = Some(crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![],
+            output_coins_root: vec![],
+            input_nullifiers_root: vec![],
+            output_coin_ids: vec![],
+            publisher_pubkey: vec![],
+            attestation: vec![],
+        });
+        assert!(validate_job(&job).is_err());
+
+        // Attestation + transition digest → fail.
+        job.result = Some(crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![0x11; 32],
+            output_coins_root: vec![],
+            input_nullifiers_root: vec![],
+            output_coin_ids: vec![],
+            publisher_pubkey: vec![],
+            attestation: vec![0xaa, 0xbb],
+        });
+        assert!(validate_job(&job).is_err());
+
+        // Pure attestation → ok.
+        job.result = Some(crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![],
+            output_coins_root: vec![],
+            input_nullifiers_root: vec![],
+            output_coin_ids: vec![],
+            publisher_pubkey: vec![],
+            attestation: vec![0xaa, 0xbb, 0xcc],
+        });
+        assert!(validate_job(&job).is_ok());
+    }
+
+    #[test]
+    fn validate_job_transition_rejects_attestation() {
+        let mut job = sample_job("completed");
+        job.result = Some(crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![0x11; 32],
+            output_coins_root: vec![0x22; 32],
+            input_nullifiers_root: vec![0x33; 32],
+            output_coin_ids: vec![],
+            publisher_pubkey: vec![],
+            attestation: vec![0xaa],
+        });
+        let err = validate_job(&job).expect_err("attestation on mint");
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn job_to_json_neutralises_internal_error_message() {
+        const SECRET: &str = "enqueue failed: /var/lib/SECRET_PATH_do_not_leak";
+        let mut job = sample_job("failed");
+        job.error = Some(crate::kernel::kernel_v1::JobError {
+            error: "internal_error".into(),
+            message: SECRET.into(),
+        });
+        let json = job_to_json(&job).expect("project");
+        assert_eq!(json["error"]["error"], "internal_error");
+        assert_eq!(
+            json["error"]["message"],
+            crate::error::PUBLIC_INTERNAL_MESSAGE
+        );
+        let wire = json.to_string();
+        assert!(
+            !wire.contains("SECRET_PATH"),
+            "public JSON must not leak secret: {wire}"
+        );
+        assert!(!wire.contains("enqueue failed"));
     }
 
     #[test]

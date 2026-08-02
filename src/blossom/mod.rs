@@ -24,7 +24,7 @@ pub use auth::{
     verify_blossom_auth, AuthAction, RequiredAction, VerifiedAuthEvent, CLOCK_SKEW_SECS,
     REPLAY_WINDOW_SECS,
 };
-pub use store::{blob_id_of, BlobStore};
+pub use store::{blob_id_of, BlobStore, DeleteIfUploader};
 
 use crate::error::ApiError;
 use crate::extract::LimitedBytes;
@@ -86,21 +86,6 @@ async fn store_size(store: Arc<BlobStore>, id: [u8; 32]) -> Result<Option<u64>, 
         .map_err(|e| ApiError::internal(format!("blossom store size join: {e}")))?
 }
 
-async fn store_exists(store: Arc<BlobStore>, id: [u8; 32]) -> Result<bool, ApiError> {
-    tokio::task::spawn_blocking(move || store.exists(&id))
-        .await
-        .map_err(|e| ApiError::internal(format!("blossom store exists join: {e}")))
-}
-
-async fn store_read_uploader(
-    store: Arc<BlobStore>,
-    id: [u8; 32],
-) -> Result<Option<[u8; 32]>, ApiError> {
-    tokio::task::spawn_blocking(move || store.read_uploader(&id))
-        .await
-        .map_err(|e| ApiError::internal(format!("blossom store read_uploader join: {e}")))?
-}
-
 async fn store_put(
     store: Arc<BlobStore>,
     body: axum::body::Bytes,
@@ -111,10 +96,14 @@ async fn store_put(
         .map_err(|e| ApiError::internal(format!("blossom store put join: {e}")))?
 }
 
-async fn store_delete(store: Arc<BlobStore>, id: [u8; 32]) -> Result<bool, ApiError> {
-    tokio::task::spawn_blocking(move || store.delete(&id))
+async fn store_delete_if_uploader(
+    store: Arc<BlobStore>,
+    id: [u8; 32],
+    expected: [u8; 32],
+) -> Result<DeleteIfUploader, ApiError> {
+    tokio::task::spawn_blocking(move || store.delete_if_uploader(&id, &expected))
         .await
-        .map_err(|e| ApiError::internal(format!("blossom store delete join: {e}")))?
+        .map_err(|e| ApiError::internal(format!("blossom store delete_if_uploader join: {e}")))?
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +212,10 @@ pub async fn upload_blob(
 }
 
 /// `DELETE /blossom/<sha256>` — original uploader only.
+///
+/// Auth event is verified first; ownership check and deletion run as one
+/// store operation ([`BlobStore::delete_if_uploader`]) under the same
+/// per-blob lock so a concurrent re-upload cannot swap ownership mid-flight.
 pub async fn delete_blob(
     State(state): State<AppState>,
     Path(sha256): Path<String>,
@@ -230,17 +223,6 @@ pub async fn delete_blob(
 ) -> Result<Response, ApiError> {
     let blossom = require_blossom(&state)?;
     let id = BlobStore::parse_blob_id(&sha256)?;
-
-    if !store_exists(Arc::clone(&blossom.store), id).await? {
-        return Err(ApiError::not_found(format!("blob {sha256} not found")));
-    }
-
-    // Fail-closed: no uploader note ⇒ refuse DELETE (never allow).
-    let original = store_read_uploader(Arc::clone(&blossom.store), id)
-        .await?
-        .ok_or_else(|| {
-            ApiError::scope_exceeded("blob has no uploader note; DELETE refused (fail-closed)")
-        })?;
 
     let auth_header = headers
         .get(header::AUTHORIZATION)
@@ -251,20 +233,13 @@ pub async fn delete_blob(
     let now = unix_now();
     let verified = verify_blossom_auth(auth_header, RequiredAction::Delete, &id, now)?;
 
-    if verified.op_pubkey != original {
-        return Err(ApiError::scope_exceeded(
+    match store_delete_if_uploader(Arc::clone(&blossom.store), id, verified.op_pubkey).await? {
+        DeleteIfUploader::Deleted => Ok(StatusCode::OK.into_response()),
+        DeleteIfUploader::NotFound => Err(ApiError::not_found(format!("blob {sha256} not found"))),
+        DeleteIfUploader::WrongUploader => Err(ApiError::scope_exceeded(
             "delete op key is not the original uploader of this blob",
-        ));
+        )),
     }
-
-    let deleted = store_delete(Arc::clone(&blossom.store), id).await?;
-    if !deleted {
-        // Race: blob vanished between exists and delete.
-        return Err(ApiError::not_found(format!("blob {sha256} not found")));
-    }
-
-    // Successful DELETE: 200 empty body (§7.4).
-    Ok(StatusCode::OK.into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -280,19 +255,20 @@ fn require_blossom(state: &AppState) -> Result<&BlossomState, ApiError> {
 }
 
 fn require_octet_stream(headers: &HeaderMap) -> Result<(), ApiError> {
+    // §7.4 non-conforming upload form (JSON / multipart / missing CT) →
+    // `400 malformed_request` (closed §7.5 set; no `unsupported_media_type`).
     let Some(ct) = headers.get(header::CONTENT_TYPE) else {
-        return Err(ApiError::unsupported_media_type(
+        return Err(ApiError::malformed(
             "Content-Type application/octet-stream is required for blossom upload",
         ));
     };
     let ct = ct
         .to_str()
-        .map_err(|_| ApiError::unsupported_media_type("Content-Type is not valid UTF-8"))?;
+        .map_err(|_| ApiError::malformed("Content-Type is not valid UTF-8"))?;
     // Exact media type; parameters (e.g. charset) are not a conforming form.
     let media = ct.split(';').next().unwrap_or(ct).trim();
     if media != "application/octet-stream" {
-        // Multipart / JSON called out by §7.4 as non-conforming → 415.
-        return Err(ApiError::unsupported_media_type(format!(
+        return Err(ApiError::malformed(format!(
             "Content-Type must be application/octet-stream, got {media:?} \
              (multipart and JSON are not a conforming v1 upload form)"
         )));

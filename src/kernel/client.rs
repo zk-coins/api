@@ -6,7 +6,7 @@
 //! first RPC (mapped separately from domain ErrorInfo).
 
 use crate::error::ApiError;
-use crate::kernel::error_info::kernel_status_to_api_error;
+use crate::kernel::error_info::{kernel_status_to_api_error_for, KernelProcedure};
 use crate::kernel::pb::kernel_v1::kernel_client::KernelClient as TonicKernelClient;
 use crate::kernel::pb::kernel_v1::{
     AccountStateRequest, AccountStateResult, AccumulatorTip, AttestRequest, Challenge,
@@ -186,7 +186,7 @@ impl KernelRpc for KernelClient {
         let response = client
             .submit_transition(Request::new(req))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::SubmitTransition))?;
         Ok(response.into_inner())
     }
 
@@ -195,7 +195,7 @@ impl KernelRpc for KernelClient {
         let response = client
             .get_job(Request::new(req))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::GetJob))?;
         Ok(response.into_inner())
     }
 
@@ -207,10 +207,13 @@ impl KernelRpc for KernelClient {
         let response = client
             .stream_job(Request::new(req))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::StreamJob))?;
         let stream = response.into_inner().map(|item| match item {
             Ok(ev) => Ok(ev),
-            Err(status) => Err(kernel_status_to_api_error(&status)),
+            Err(status) => Err(kernel_status_to_api_error_for(
+                &status,
+                Some(KernelProcedure::StreamJob),
+            )),
         });
         Ok(Box::pin(stream))
     }
@@ -220,7 +223,7 @@ impl KernelRpc for KernelClient {
         let response = client
             .sign_transition(Request::new(req))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::SignTransition))?;
         Ok(response.into_inner())
     }
 
@@ -229,7 +232,7 @@ impl KernelRpc for KernelClient {
         let response = client
             .cancel_job(Request::new(req))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::CancelJob))?;
         Ok(response.into_inner())
     }
 
@@ -238,7 +241,7 @@ impl KernelRpc for KernelClient {
         let response = client
             .get_info(Request::new(GetInfoRequest {}))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::GetInfo))?;
         Ok(response.into_inner())
     }
 
@@ -247,7 +250,7 @@ impl KernelRpc for KernelClient {
         let response = client
             .get_accumulator(Request::new(GetAccumulatorRequest {}))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::GetAccumulator))?;
         Ok(response.into_inner())
     }
 
@@ -259,10 +262,13 @@ impl KernelRpc for KernelClient {
         let response = client
             .list_inscriptions(Request::new(req))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::ListInscriptions))?;
         let stream = response.into_inner().map(|item| match item {
             Ok(ins) => Ok(ins),
-            Err(status) => Err(kernel_status_to_api_error(&status)),
+            Err(status) => Err(kernel_status_to_api_error_for(
+                &status,
+                Some(KernelProcedure::ListInscriptions),
+            )),
         });
         Ok(Box::pin(stream))
     }
@@ -275,7 +281,7 @@ impl KernelRpc for KernelClient {
         let response = client
             .get_nullifier_path(Request::new(req))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::GetNullifierPath))?;
         Ok(response.into_inner())
     }
 
@@ -284,7 +290,7 @@ impl KernelRpc for KernelClient {
         let response = client
             .open_pull_challenge(Request::new(req))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::OpenPullChallenge))?;
         Ok(response.into_inner())
     }
 
@@ -293,7 +299,7 @@ impl KernelRpc for KernelClient {
         let response = client
             .attest_balance(Request::new(req))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::AttestBalance))?;
         Ok(response.into_inner())
     }
 
@@ -302,7 +308,7 @@ impl KernelRpc for KernelClient {
         let response = client
             .issue_view_grant(Request::new(req))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::IssueViewGrant))?;
         Ok(response.into_inner())
     }
 
@@ -320,7 +326,10 @@ impl KernelRpc for KernelClient {
             SESSION_AUTHORITY_METADATA,
             MetadataValue::from_static(authority.as_str()),
         );
-        let response = client.pull(request).await.map_err(map_status)?;
+        let response = client
+            .pull(request)
+            .await
+            .map_err(map_for(KernelProcedure::Pull))?;
         Ok(response.into_inner())
     }
 
@@ -329,7 +338,7 @@ impl KernelRpc for KernelClient {
         let response = client
             .get_record(Request::new(req))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::GetRecord))?;
         Ok(response.into_inner())
     }
 
@@ -338,7 +347,7 @@ impl KernelRpc for KernelClient {
         let response = client
             .get_coin_proof(Request::new(req))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::GetCoinProof))?;
         Ok(response.into_inner())
     }
 
@@ -350,7 +359,7 @@ impl KernelRpc for KernelClient {
         let response = client
             .get_account_state(Request::new(req))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::GetAccountState))?;
         Ok(response.into_inner())
     }
 
@@ -362,10 +371,13 @@ impl KernelRpc for KernelClient {
         let response = client
             .subscribe_receipts(Request::new(req))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::SubscribeReceipts))?;
         let stream = response.into_inner().map(|item| match item {
             Ok(receipt) => Ok(receipt),
-            Err(status) => Err(kernel_status_to_api_error(&status)),
+            Err(status) => Err(kernel_status_to_api_error_for(
+                &status,
+                Some(KernelProcedure::SubscribeReceipts),
+            )),
         });
         Ok(Box::pin(stream))
     }
@@ -378,7 +390,7 @@ impl KernelRpc for KernelClient {
         let response = client
             .entrust_operational_bundle(Request::new(req))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::EntrustOperationalBundle))?;
         Ok(response.into_inner())
     }
 
@@ -390,7 +402,7 @@ impl KernelRpc for KernelClient {
         let response = client
             .revoke_operational_bundle(Request::new(req))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::RevokeOperationalBundle))?;
         Ok(response.into_inner())
     }
 
@@ -399,23 +411,23 @@ impl KernelRpc for KernelClient {
         let response = client
             .publish(Request::new(req))
             .await
-            .map_err(map_status)?;
+            .map_err(map_for(KernelProcedure::Publish))?;
         Ok(response.into_inner())
     }
 }
 
-/// Map a tonic `Status` to REST.
+/// Map a tonic `Status` to REST for a known kernel procedure.
 ///
 /// Domain failures carry `ErrorInfo` and become the §7.5 body via
-/// [`kernel_status_to_api_error`]. Transport failures (unreachable kernel,
+/// [`kernel_status_to_api_error_for`]. Transport failures (unreachable kernel,
 /// reset connection) arrive as a `Status` **without** usable ErrorInfo after
 /// tonic converts the underlying `transport::Error`; that path is also
 /// fail-closed to `500 internal_error` (no guessed machine code). The
 /// dedicated [`super::transport_error_to_api_error`] helper documents the same
 /// outcome for call sites that still hold a raw `transport::Error` — this
 /// client never holds that type under `connect_lazy`.
-fn map_status(status: tonic::Status) -> ApiError {
-    kernel_status_to_api_error(&status)
+fn map_for(procedure: KernelProcedure) -> impl FnOnce(tonic::Status) -> ApiError {
+    move |status| kernel_status_to_api_error_for(&status, Some(procedure))
 }
 
 #[cfg(test)]

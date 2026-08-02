@@ -14,8 +14,8 @@ use crate::hexutil::{decode_hex_exact, encode_hex};
 use crate::kernel::kernel_v1::{GrantRequest, PullChallengeRequest, Scope};
 use crate::ownership::{
     decode_zk_address, encode_grant_asset_ids, issue_grant_request_hash, parse_u64_decimal,
-    verify_ownership_proof, ChallengeDomain, ChallengeEcho, OwnershipProofJson,
-    ISSUE_GRANT_CHALLENGE_DOMAIN, SCOPE_NOT_AFTER_UNBOUNDED,
+    validate_resolved_scope, verify_ownership_proof, ChallengeDomain, ChallengeEcho,
+    OwnerOnlyProofJson, ResolvedScope, ISSUE_GRANT_CHALLENGE_DOMAIN, SCOPE_NOT_AFTER_UNBOUNDED,
 };
 use crate::state::AppState;
 use axum::extract::State;
@@ -52,7 +52,7 @@ pub struct IssueGrantBody {
     /// Grant-level expiry (§7.1 decimal-string u64) — bound into request_hash.
     pub expiry: String,
     pub challenge: ChallengeEcho,
-    pub ownership_proof: OwnershipProofJson,
+    pub ownership_proof: OwnerOnlyProofJson,
 }
 
 // ---------------------------------------------------------------------------
@@ -113,11 +113,19 @@ fn normalise_scope(scope: &GrantScopeJson) -> Result<NormalisedScope, ApiError> 
             .map_err(|e| ApiError::malformed(format!("scope.not_after: {}", e.body.message)))?,
     };
 
-    Ok(NormalisedScope {
+    let resolved = ResolvedScope {
         all_assets,
         asset_ids,
         not_before,
         not_after,
+    };
+    validate_resolved_scope(&resolved)?;
+
+    Ok(NormalisedScope {
+        all_assets: resolved.all_assets,
+        asset_ids: resolved.asset_ids,
+        not_before: resolved.not_before,
+        not_after: resolved.not_after,
     })
 }
 
@@ -203,12 +211,15 @@ pub async fn post_grants(
         grant_expiry,
     );
 
+    // GrantProof arm → 401 before any kernel call (tagged union, not 400).
+    let ownership_proof = body.ownership_proof.require_ownership()?;
+
     // Domain is the IssueGrant endpoint constant — not taken from body.
     let verified = verify_ownership_proof(
         ChallengeDomain::IssueGrant,
         &body.subject,
         &body.challenge,
-        &body.ownership_proof,
+        &ownership_proof,
         &request_hash,
         state.public_hosts.as_slice(),
     )?;

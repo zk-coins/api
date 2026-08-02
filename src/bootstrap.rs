@@ -29,7 +29,7 @@ use crate::kernel::kernel_v1::{
 };
 use crate::ownership::{
     decode_zk_address, verify_simple_ownership_proof, ChallengeDomain, ChallengeEcho,
-    OwnershipProofJson, ENTRUST_CHALLENGE_DOMAIN, REVOKE_CHALLENGE_DOMAIN,
+    OwnerOnlyProofJson, ENTRUST_CHALLENGE_DOMAIN, REVOKE_CHALLENGE_DOMAIN,
 };
 use crate::state::AppState;
 use axum::extract::State;
@@ -63,7 +63,7 @@ pub struct BootstrapChallengeBody {
 pub struct BootstrapEntrustBody {
     /// Redeem-body `expiry` (§7.5 normative): `{ nonce, expiry }` from issuance.
     pub challenge: ChallengeEcho,
-    pub ownership_proof: OwnershipProofJson,
+    pub ownership_proof: OwnerOnlyProofJson,
     /// 161-byte `serialize(OperationalBundle)` as hex (`<hex322>`).
     ///
     /// **Never log this field.** It holds five 256-bit operational secrets.
@@ -84,7 +84,7 @@ impl std::fmt::Debug for BootstrapEntrustBody {
 pub struct BootstrapRevokeBody {
     /// Redeem-body `expiry` (§7.5 normative): `{ nonce, expiry }` from issuance.
     pub challenge: ChallengeEcho,
-    pub ownership_proof: OwnershipProofJson,
+    pub ownership_proof: OwnerOnlyProofJson,
 }
 
 // ---------------------------------------------------------------------------
@@ -211,12 +211,21 @@ pub async fn post_bootstrap_entrust(
     JsonBody(body): JsonBody<BootstrapEntrustBody>,
 ) -> Result<Response, ApiError> {
     // ---- pure validation (no kernel) ----
+    // Destructure so the hex `bundle` string is dropped before the kernel
+    // await (only `bundle_bytes` remains).
+    let BootstrapEntrustBody {
+        challenge,
+        ownership_proof,
+        bundle,
+    } = body;
     // Bundle first: reject wrong width without touching the challenge store.
     // `parse_operational_bundle_hex` never interpolates the hex into errors.
-    let bundle_bytes = parse_operational_bundle_hex(&body.bundle)?;
+    let bundle_bytes = parse_operational_bundle_hex(&bundle)?;
+    drop(bundle);
 
-    // Subject lives only on the ownership proof (no outer subject field).
-    let subject = body.ownership_proof.subject.clone();
+    // GrantProof arm → 401; Ownership arm carries the subject (no outer field).
+    let ownership_proof = ownership_proof.require_ownership()?;
+    let subject = ownership_proof.subject.clone();
     if subject.is_empty() {
         return Err(ApiError::malformed("ownership_proof.subject is required"));
     }
@@ -225,14 +234,10 @@ pub async fn post_bootstrap_entrust(
     let verified = verify_simple_ownership_proof(
         ChallengeDomain::Entrust,
         &subject,
-        &body.challenge,
-        &body.ownership_proof,
+        &challenge,
+        &ownership_proof,
         state.public_hosts.as_slice(),
     )?;
-
-    // Drop the hex string before the await so it is not held across the RPC.
-    // `bundle_bytes` is the only remaining copy in this stack frame.
-    drop(body);
 
     // ---- only now: kernel (nonce consumption lives here) ----
     let result: EntrustResult = state
@@ -255,7 +260,8 @@ pub async fn post_bootstrap_revoke(
     State(state): State<AppState>,
     JsonBody(body): JsonBody<BootstrapRevokeBody>,
 ) -> Result<Response, ApiError> {
-    let subject = body.ownership_proof.subject.clone();
+    let ownership_proof = body.ownership_proof.require_ownership()?;
+    let subject = ownership_proof.subject.clone();
     if subject.is_empty() {
         return Err(ApiError::malformed("ownership_proof.subject is required"));
     }
@@ -264,7 +270,7 @@ pub async fn post_bootstrap_revoke(
         ChallengeDomain::Revoke,
         &subject,
         &body.challenge,
-        &body.ownership_proof,
+        &ownership_proof,
         state.public_hosts.as_slice(),
     )?;
 

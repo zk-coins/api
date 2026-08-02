@@ -134,6 +134,83 @@ pub struct OwnershipProofJson {
     pub signature: String,
 }
 
+/// Tagged proof union for **owner-only** endpoints (Attest, IssueGrant,
+/// Entrust, Revoke). Deserialises a real GrantProof shape as the `grant` arm
+/// so clients receive `401 unauthorized` (capability gate) rather than
+/// `400 malformed_request` from missing Ownership fields.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum OwnerOnlyProofJson {
+    #[serde(rename = "ownership")]
+    Ownership {
+        subject: String,
+        public_key: String,
+        nk_commit: String,
+        signature: String,
+    },
+    #[serde(rename = "grant")]
+    Grant {
+        grant: String,
+        grantee_pk: String,
+        signature: String,
+    },
+}
+
+impl OwnerOnlyProofJson {
+    /// Reject GrantProof with `401 unauthorized`; return OwnershipProof fields.
+    pub fn require_ownership(self) -> Result<OwnershipProofJson, ApiError> {
+        match self {
+            Self::Ownership {
+                subject,
+                public_key,
+                nk_commit,
+                signature,
+            } => Ok(OwnershipProofJson {
+                proof_type: "ownership".into(),
+                subject,
+                public_key,
+                nk_commit,
+                signature,
+            }),
+            Self::Grant { .. } => Err(ApiError::unauthorized(
+                "GrantProof does not authorise this owner-only action \
+                 (AttestBalance / IssueViewGrant / Entrust / Revoke require OwnershipProof; \
+                 no-escalation)",
+            )),
+        }
+    }
+}
+
+/// Validate normalised scope invariants before any Challenge/Redeem RPC:
+/// - explicit `asset_ids` strictly ascending and unique;
+/// - time interval non-empty (`not_before <= not_after`).
+pub fn validate_resolved_scope(scope: &ResolvedScope) -> Result<(), ApiError> {
+    if !scope.all_assets {
+        if scope.asset_ids.is_empty() {
+            return Err(ApiError::malformed(
+                "scope.asset_ids list must be non-empty when not \"*\"",
+            ));
+        }
+        for window in scope.asset_ids.windows(2) {
+            if window[0] >= window[1] {
+                return Err(ApiError::malformed(
+                    "scope.asset_ids must be strictly ascending and unique",
+                ));
+            }
+        }
+    } else if !scope.asset_ids.is_empty() {
+        return Err(ApiError::internal(
+            "ResolvedScope invariant: all_assets with non-empty asset_ids",
+        ));
+    }
+    if scope.not_before > scope.not_after {
+        return Err(ApiError::malformed(
+            "scope time interval is empty (not_before > not_after)",
+        ));
+    }
+    Ok(())
+}
+
 /// Challenge fields echoed by the client so the API can recompute `chal`
 /// without holding challenge state.
 ///
@@ -1627,6 +1704,52 @@ mod tests {
         .expect_err("cross-domain");
         assert_eq!(err.body.error, "unauthorized");
         assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn validate_resolved_scope_rejects_non_ascending_and_empty_interval() {
+        let a = [0x01u8; 32];
+        let mut b = [0x02u8; 32];
+        b[0] = 0x02;
+        // Descending
+        let s = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![b, a],
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        let err = validate_resolved_scope(&s).expect_err("descending");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("ascending"));
+
+        // Duplicate
+        let s = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![a, a],
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        assert!(validate_resolved_scope(&s).is_err());
+
+        // Empty interval
+        let s = ResolvedScope {
+            all_assets: true,
+            asset_ids: vec![],
+            not_before: 100,
+            not_after: 50,
+        };
+        let err = validate_resolved_scope(&s).expect_err("empty interval");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("empty") || err.body.message.contains("not_before"));
+
+        // Valid ascending
+        let s = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![a, b],
+            not_before: 10,
+            not_after: 20,
+        };
+        assert!(validate_resolved_scope(&s).is_ok());
     }
 
     #[test]

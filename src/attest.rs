@@ -14,7 +14,7 @@ use crate::hexutil::{decode_hex_exact, encode_hex};
 use crate::kernel::kernel_v1::{AttestRequest, JobHandle, PullChallengeRequest};
 use crate::ownership::{
     attest_request_hash, ceiling_encoding, decode_zk_address, parse_u64_decimal,
-    verify_ownership_proof, ChallengeDomain, ChallengeEcho, OwnershipProofJson,
+    verify_ownership_proof, ChallengeDomain, ChallengeEcho, OwnerOnlyProofJson,
     ATTEST_BALANCE_CHALLENGE_DOMAIN,
 };
 use crate::state::AppState;
@@ -44,7 +44,7 @@ pub struct AttestBalanceBody {
     #[serde(default)]
     pub size_ceiling: Option<String>,
     pub challenge: ChallengeEcho,
-    pub ownership_proof: OwnershipProofJson,
+    pub ownership_proof: OwnerOnlyProofJson,
 }
 
 // ---------------------------------------------------------------------------
@@ -134,12 +134,15 @@ pub async fn post_attest_balance(
     // Server-computed request_hash — never a client-supplied hash field.
     let request_hash = attest_request_hash(&subject_raw, &asset_id, &ceiling_enc);
 
+    // GrantProof arm → 401 before any kernel call (tagged union, not 400).
+    let ownership_proof = body.ownership_proof.require_ownership()?;
+
     // Domain is the AttestBalance endpoint constant — not taken from body.
     let verified = verify_ownership_proof(
         ChallengeDomain::AttestBalance,
         &body.subject,
         &body.challenge,
-        &body.ownership_proof,
+        &ownership_proof,
         &request_hash,
         state.public_hosts.as_slice(),
     )?;

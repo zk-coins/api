@@ -98,6 +98,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # kernel-proto/build.rs invokes `protoc` (via tonic-build / prost-build)
+      # to compile proto/kernel/v1/kernel.proto. ubuntu-latest does not ship
+      # protobuf-compiler by default — without this step, fmt is fine but
+      # clippy/build/test fail with "Could not find `protoc`".
+      - name: Install protoc (kernel-proto build.rs)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Check formatting
         run: cargo fmt --all --check
 

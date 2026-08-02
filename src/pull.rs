@@ -29,9 +29,10 @@ use crate::kernel::kernel_v1::{
     Scope, SubscribeReceiptsRequest,
 };
 use crate::ownership::{
-    chan_bind_for_host, decode_zk_address, parse_u64_decimal, verify_grant_proof,
-    verify_pull_ownership_proof, GrantProofJson, GrantVerificationContext, OwnershipProofJson,
-    ResolvedScope, SessionAuthority, PULL_CHALLENGE_DOMAIN, SCOPE_NOT_AFTER_UNBOUNDED,
+    chan_bind_for_host, decode_zk_address, parse_u64_decimal, validate_resolved_scope,
+    verify_grant_proof, verify_pull_ownership_proof, GrantProofJson, GrantVerificationContext,
+    OwnershipProofJson, ResolvedScope, SessionAuthority, PULL_CHALLENGE_DOMAIN,
+    SCOPE_NOT_AFTER_UNBOUNDED,
 };
 use crate::state::AppState;
 use axum::extract::{Path, State};
@@ -155,12 +156,16 @@ fn normalise_scope(scope: &PullScopeJson) -> Result<ResolvedScope, ApiError> {
             .map_err(|e| ApiError::malformed(format!("scope.not_after: {}", e.body.message)))?,
     };
 
-    Ok(ResolvedScope {
+    let resolved = ResolvedScope {
         all_assets,
         asset_ids,
         not_before,
         not_after,
-    })
+    };
+    // Canonical form before any Challenge/Redeem kernel RPC: strictly
+    // ascending unique asset ids; non-empty time interval.
+    validate_resolved_scope(&resolved)?;
+    Ok(resolved)
 }
 
 fn scope_to_proto(scope: &ResolvedScope) -> Scope {

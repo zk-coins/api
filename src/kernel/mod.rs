@@ -8,7 +8,10 @@ mod error_info;
 mod pb;
 
 pub use client::{connect_lazy, KernelClient, KernelHandle, KernelRpc};
-pub use error_info::{kernel_status_to_api_error, transport_error_to_api_error, ERROR_INFO_DOMAIN};
+pub use error_info::{
+    kernel_status_to_api_error, kernel_status_to_api_error_for, transport_error_to_api_error,
+    KernelProcedure, ERROR_INFO_DOMAIN,
+};
 pub use pb::kernel_v1;
 
 #[cfg(test)]

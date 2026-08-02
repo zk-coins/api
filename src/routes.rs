@@ -2608,6 +2608,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_job_internal_error_message_is_neutral() {
+        const SECRET: &str = "enqueue failed: /var/lib/SECRET_JOB_PATH_xyz";
+        let mut job = accepted_job("job-leak-poll");
+        job.status = "failed".to_string();
+        job.error = Some(crate::kernel::kernel_v1::JobError {
+            error: "internal_error".into(),
+            message: SECRET.into(),
+        });
+        let kernel = ScriptedKernel {
+            get: Some(Ok(job)),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/jobs/job-leak-poll")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = body_bytes(res).await;
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(
+            !text.contains("SECRET_JOB_PATH"),
+            "poll body must not leak operator path: {text}"
+        );
+        assert!(!text.contains("enqueue failed"));
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["error"], "internal_error");
+        assert_eq!(
+            json["error"]["message"],
+            crate::error::PUBLIC_INTERNAL_MESSAGE
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_job_internal_error_message_is_neutral() {
+        const SECRET: &str = "enqueue failed: /var/lib/SECRET_SSE_PATH_xyz";
+        let err_ev = JobEvent {
+            event: "error".into(),
+            job: Some(Job {
+                job_id: "job-leak-sse".into(),
+                kind: "mint".into(),
+                status: "failed".into(),
+                phase: String::new(),
+                progress: 1.0,
+                awaiting_signature: None,
+                result: None,
+                error: Some(crate::kernel::kernel_v1::JobError {
+                    error: "internal_error".into(),
+                    message: SECRET.into(),
+                }),
+            }),
+        };
+        let kernel = ScriptedKernel {
+            stream: Some(Ok(vec![Ok(err_ev)])),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/jobs/job-leak-sse/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(res).await).expect("utf8");
+        assert!(
+            body.contains("event: error"),
+            "must emit error event, body={body}"
+        );
+        assert!(
+            body.contains(crate::error::PUBLIC_INTERNAL_MESSAGE),
+            "SSE must carry neutral internal message, body={body}"
+        );
+        assert!(
+            !body.contains("SECRET_SSE_PATH"),
+            "SSE must not leak operator path, body={body}"
+        );
+        assert!(!body.contains("enqueue failed"));
+    }
+
+    #[tokio::test]
+    async fn get_job_terminal_nonempty_phase_is_500() {
+        let mut job = accepted_job("job-phase");
+        job.status = "completed".to_string();
+        job.phase = "publishing".to_string();
+        job.result = Some(crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![0x11; 32],
+            output_coins_root: vec![0x22; 32],
+            input_nullifiers_root: vec![0x33; 32],
+            output_coin_ids: vec![],
+            publisher_pubkey: vec![],
+            attestation: vec![],
+        });
+        let kernel = ScriptedKernel {
+            get: Some(Ok(job)),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/jobs/job-phase")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
+    }
+
+    #[tokio::test]
     async fn stream_job_emits_phase_then_complete() {
         let phase = JobEvent {
             event: "phase".into(),
@@ -2819,13 +2941,17 @@ mod tests {
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
         assert_eq!(json["error"], "internal_error");
+        assert_eq!(
+            json["message"],
+            crate::error::PUBLIC_INTERNAL_MESSAGE,
+            "public message must be neutral, not the kernel diagnostic"
+        );
         assert!(
-            json["message"]
+            !json["message"]
                 .as_str()
                 .unwrap()
                 .contains("Chain identity unavailable"),
-            "message must carry the kernel cause, got {}",
-            json["message"]
+            "kernel diagnostic must not appear on the wire"
         );
     }
 
@@ -2983,13 +3109,18 @@ mod tests {
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
         assert_eq!(json["error"], "internal_error");
-        assert!(
+        assert_eq!(
+            json["message"],
+            crate::error::PUBLIC_INTERNAL_MESSAGE,
+            "internal_error must carry the neutral public message, got {}",
             json["message"]
+        );
+        assert!(
+            !json["message"]
                 .as_str()
                 .unwrap()
                 .contains("Chain view unavailable"),
-            "message must name the cause, got {}",
-            json["message"]
+            "kernel cause must stay off the wire"
         );
     }
 
@@ -3112,13 +3243,18 @@ mod tests {
             json.get("present").is_none(),
             "error body must not look like a Path-B absence answer"
         );
-        assert!(
+        assert_eq!(
+            json["message"],
+            crate::error::PUBLIC_INTERNAL_MESSAGE,
+            "internal_error must carry the neutral public message, got {}",
             json["message"]
+        );
+        assert!(
+            !json["message"]
                 .as_str()
                 .unwrap()
                 .contains("Failed to build nullifier path"),
-            "message must carry the kernel cause, got {}",
-            json["message"]
+            "kernel cause must stay off the wire"
         );
     }
 
@@ -3631,9 +3767,10 @@ mod tests {
         );
         let sig = ownership_fixtures::sign_chal(&sk, &chal);
 
-        // Signature is valid; kernel reports challenge_expired via ErrorInfo.
+        // Signature is valid; kernel reports challenge_expired via ErrorInfo
+        // (gRPC UNAUTHENTICATED + http_status 410 — production triple).
         let expired = encode_kernel_error_status(
-            tonic::Code::FailedPrecondition,
+            tonic::Code::Unauthenticated,
             "challenge nonce expired",
             "challenge_expired",
             410,
@@ -3671,7 +3808,9 @@ mod tests {
 
     #[tokio::test]
     async fn grant_proof_type_is_unauthorized_without_kernel() {
-        let (_sk, pk0, nkc, _subject_raw, subject_bech) = ownership_fixtures::identity();
+        // Real GrantProof wire shape (no ownership fields). Must deserialise
+        // as the grant arm and answer 401 — not 400 from missing subject/pk.
+        let (_sk, _pk0, _nkc, _subject_raw, subject_bech) = ownership_fixtures::identity();
         let kernel = Arc::new(ScriptedKernel {
             attest: Some(Ok(JobHandle {
                 job_id: "x".into(),
@@ -3692,9 +3831,8 @@ mod tests {
             },
             "ownership_proof": {
                 "type": "grant",
-                "subject": subject_bech,
-                "public_key": encode_hex(&pk0),
-                "nk_commit": encode_hex(&nkc),
+                "grant": "zkgrant1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+                "grantee_pk": encode_hex(&[0xABu8; 32]),
                 "signature": encode_hex(&[0u8; 64]),
             },
         });
@@ -3709,11 +3847,62 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "real GrantProof form must be 401, not 400 malformed"
+        );
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+        assert!(
+            json["message"].as_str().unwrap().contains("GrantProof"),
+            "message must name GrantProof, got {}",
+            json["message"]
+        );
+        assert_eq!(kernel.attest_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(kernel.issue_grant_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn grants_real_grant_proof_form_is_401_without_kernel() {
+        let (_sk, _pk0, _nkc, _subject_raw, subject_bech) = ownership_fixtures::identity();
+        let kernel = Arc::new(ScriptedKernel {
+            issue_grant: Some(Ok(GrantResult {
+                grant: "zkgrant1".into(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone()).expect("router");
+        let body = serde_json::json!({
+            "subject": subject_bech,
+            "grantee_pk": encode_hex(&[0xFFu8; 32]),
+            "scope": { "asset_ids": "*" },
+            "expiry": "2000000000",
+            "challenge": {
+                "nonce": encode_hex(&[2u8; 32]),
+                "expiry": "100",
+            },
+            "ownership_proof": {
+                "type": "grant",
+                "grant": "zkgrant1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+                "grantee_pk": encode_hex(&[0xABu8; 32]),
+                "signature": encode_hex(&[0u8; 64]),
+            },
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
         assert_eq!(json["error"], "unauthorized");
-        assert!(json["message"].as_str().unwrap().contains("GrantProof"));
-        assert_eq!(kernel.attest_calls.load(Ordering::SeqCst), 0);
         assert_eq!(kernel.issue_grant_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -6406,7 +6595,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blossom_upload_rejects_json_content_type_with_415() {
+    async fn blossom_upload_rejects_json_content_type_as_malformed_request() {
         let root = blossom_temp_root("jsonct");
         let (sk, pk) = blossom_sk_pk();
         let mut ops = BTreeSet::new();
@@ -6427,9 +6616,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        // §7.4 non-conforming form → 400 malformed_request (closed §7.5 set).
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
-        assert_eq!(json["error"], "unsupported_media_type");
+        assert_eq!(json["error"], "malformed_request");
         let _ = std::fs::remove_dir_all(&root);
     }
 

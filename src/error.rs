@@ -85,16 +85,6 @@ impl ApiError {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", message)
     }
 
-    /// Unsupported request media type / 415 — non-raw Blossom upload body
-    /// (multipart or JSON is not a conforming v1 form, §7.4).
-    pub fn unsupported_media_type(message: impl Into<String>) -> Self {
-        Self::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_media_type",
-            message,
-        )
-    }
-
     /// Fail-closed stand-in when the kernel transport breaks or the kernel
     /// violates the ErrorInfo contract. Spec §7.5 closes the enumeration with
     /// `internal_error` / 500 for any condition not listed.
