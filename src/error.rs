@@ -12,11 +12,19 @@ pub struct ErrorBody {
     pub message: String,
 }
 
+/// Public wire text for every `500 internal_error`. Internal diagnostics stay
+/// off the wire (absolute paths, OS errors, kernel contract detail) and are
+/// carried only in [`ApiError::cause`] / structured logs.
+pub const PUBLIC_INTERNAL_MESSAGE: &str = "an internal error occurred";
+
 /// An HTTP error ready to return from a handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
     pub status: StatusCode,
     pub body: ErrorBody,
+    /// Operator-facing cause for logs / startup diagnostics. **Never** copied
+    /// into the HTTP body by [`IntoResponse`].
+    pub(crate) cause: Option<String>,
 }
 
 impl ApiError {
@@ -27,6 +35,7 @@ impl ApiError {
                 error: error.into(),
                 message: message.into(),
             },
+            cause: None,
         }
     }
 
@@ -64,6 +73,13 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, "not_found", message)
     }
 
+    /// §7.5 intro / §6.1: known route whose role feature is off for this
+    /// deployment → `404 feature_disabled`. Distinct from a bare axum 404 for
+    /// a path that was never registered (including unconfigured Blossom).
+    pub fn feature_disabled(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, "feature_disabled", message)
+    }
+
     /// §7.5 `payload_too_large` / 413 — Blossom body over the advertised limit.
     pub fn payload_too_large(message: impl Into<String>) -> Self {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", message)
@@ -82,8 +98,26 @@ impl ApiError {
     /// Fail-closed stand-in when the kernel transport breaks or the kernel
     /// violates the ErrorInfo contract. Spec §7.5 closes the enumeration with
     /// `internal_error` / 500 for any condition not listed.
-    pub fn internal(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
+    ///
+    /// The public `message` is always [`PUBLIC_INTERNAL_MESSAGE`]. The
+    /// diagnostic string is stored in [`Self::cause`] and emitted via
+    /// `tracing` only — never forwarded onto the wire.
+    pub fn internal(cause: impl Into<String>) -> Self {
+        let cause = cause.into();
+        tracing::error!(cause = %cause, "internal_error");
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: ErrorBody {
+                error: "internal_error".to_string(),
+                message: PUBLIC_INTERNAL_MESSAGE.to_string(),
+            },
+            cause: Some(cause),
+        }
+    }
+
+    /// Operator-facing cause when present (startup / tests). Not the wire body.
+    pub fn cause(&self) -> Option<&str> {
+        self.cause.as_deref()
     }
 }
 
@@ -92,6 +126,39 @@ impl IntoResponse for ApiError {
         // Always a §7.5 JSON body — never a bare status with an empty body.
         // (Axum's default 404 fallback is status-only; handlers must not
         // look like that when they intentionally return an ApiError.)
+        // `cause` is intentionally dropped here.
         (self.status, Json(self.body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn internal_public_body_is_neutral_cause_stays_off_wire() {
+        let err = ApiError::internal(
+            "blossom store: cannot create root /var/lib/secret-path: permission denied",
+        );
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, PUBLIC_INTERNAL_MESSAGE);
+        assert!(
+            err.cause().expect("cause retained").contains("secret-path"),
+            "operator cause must retain the diagnostic"
+        );
+        let res = err.clone().into_response();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            !text.contains("secret-path"),
+            "public body must not leak the path: {text}"
+        );
+        assert!(
+            !text.contains("permission denied"),
+            "public body must not leak the OS error: {text}"
+        );
+        assert!(text.contains(PUBLIC_INTERNAL_MESSAGE));
     }
 }

@@ -22,6 +22,7 @@
 //! the kernel is dialed; a bad body fails at the edge with length/form only.
 
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::hexutil::encode_hex;
 use crate::kernel::kernel_v1::{
     EntrustRequest, EntrustResult, PullChallengeRequest, RevokeRequest, RevokeResult,
@@ -149,7 +150,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
 /// `POST /v1/bootstrap/challenge` → OpenPullChallenge(action=entrust|revoke).
 pub async fn post_bootstrap_challenge(
     State(state): State<AppState>,
-    Json(body): Json<BootstrapChallengeBody>,
+    JsonBody(body): JsonBody<BootstrapChallengeBody>,
 ) -> Result<Response, ApiError> {
     if body.subject.is_empty() {
         return Err(ApiError::malformed("subject is required"));
@@ -207,7 +208,7 @@ pub async fn post_bootstrap_challenge(
 /// never leaves this process as a secret-bearing RPC payload.
 pub async fn post_bootstrap_entrust(
     State(state): State<AppState>,
-    Json(body): Json<BootstrapEntrustBody>,
+    JsonBody(body): JsonBody<BootstrapEntrustBody>,
 ) -> Result<Response, ApiError> {
     // ---- pure validation (no kernel) ----
     // Bundle first: reject wrong width without touching the challenge store.
@@ -252,7 +253,7 @@ pub async fn post_bootstrap_entrust(
 /// `RevokeOperationalBundle`.
 pub async fn post_bootstrap_revoke(
     State(state): State<AppState>,
-    Json(body): Json<BootstrapRevokeBody>,
+    JsonBody(body): JsonBody<BootstrapRevokeBody>,
 ) -> Result<Response, ApiError> {
     let subject = body.ownership_proof.subject.clone();
     if subject.is_empty() {

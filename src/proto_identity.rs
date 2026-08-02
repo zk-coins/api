@@ -2,10 +2,25 @@
 //!
 //! The api repo cannot path-depend on zk-coins/node (separate checkouts).
 //! The contract file is therefore carried under `proto/kernel/v1/kernel.proto`
-//! (workspace root) and pinned by content hash. When a sibling node checkout
-//! is present at `../node/proto/kernel/v1/kernel.proto`, the test also
-//! requires byte-identity with that file so local multi-repo worktrees catch
-//! drift immediately.
+//! (workspace root) and pinned by content hash.
+//!
+//! ## CI vs local
+//!
+//! - **CI gate (always):** [`KERNEL_PROTO_SHA256_HEX`] must match the bytes of
+//!   the carried file. This is the only identity check that can fail in a
+//!   standalone api checkout (the usual CI shape).
+//! - **Local multi-repo worktree (optional):** when a sibling node checkout
+//!   is present at `../node/proto/kernel/v1/kernel.proto`, the test also
+//!   requires byte-identity with that file so local stacks catch drift
+//!   immediately.
+//!
+//! The sibling comparison is **intentionally not a CI gate**. CI does not
+//! check out `zk-coins/node` next to this tree, so a silent `return` on
+//! absence would always be green without testing anything. The test below
+//! therefore **names** that absence (`eprintln` + early return) and keeps
+//! the pin-vs-file assertion as the real, always-on gate. Do not "fix"
+//! the early return into a hard failure unless CI starts checking out the
+//! node contract at a fixed ref.
 //!
 //! Lives in the **api** package (not `kernel-proto`) so `cargo test -p api`
 //! always runs the pin; codegen isolation is a separate concern.
@@ -50,6 +65,7 @@ mod tests {
         out
     }
 
+    /// **CI-relevant gate:** carried file bytes must equal the pin.
     #[test]
     fn carried_proto_matches_pinned_sha256() {
         let path = local_proto_path();
@@ -82,11 +98,23 @@ mod tests {
         );
     }
 
+    /// **Local-only optional check** — not a CI gate.
+    ///
+    /// When `../node` is absent (standalone / CI checkout), this test
+    /// **explicitly skips** after documenting why. It must never be a silent
+    /// green success that pretends the sibling was compared. The pin test
+    /// above is the real CI identity gate.
     #[test]
-    fn carried_proto_matches_sibling_node_when_present() {
+    fn carried_proto_matches_sibling_node_when_present_local_only() {
         let sibling = sibling_node_proto_path();
         if !Path::new(&sibling).is_file() {
-            // Standalone api checkout: pin above is the identity gate.
+            // Named skip: absence is expected in CI and standalone api clones.
+            // Do not treat this as proof that the node contract matches.
+            eprintln!(
+                "proto_identity: sibling node proto absent at {} — \
+                 skipping local multi-repo byte compare (CI gate is pin==file)",
+                sibling.display()
+            );
             return;
         }
         let local = std::fs::read(local_proto_path()).expect("local proto");

@@ -8,12 +8,26 @@
 //! traversal (`..`, separators, uppercase, Unicode tricks) is structurally
 //! impossible — not filtered after the fact.
 //!
-//! ## Atomic write
+//! ## Atomic write (no-replace)
 //!
-//! Upload writes to a temporary file in the same directory, then `rename`s
-//! onto the final address. An aborted upload cannot leave a half-written
-//! blob under a valid content address (that would break the content-
-//! addressed invariant: address would no longer hash to content).
+//! Upload writes blob and uploader-note to unique temp files in the same
+//! directory, then installs each final name with **hard-link create-new**
+//! semantics (`hard_link` fails with `AlreadyExists` if the target is
+//! present). That closes the TOCTOU between `is_file()` and `rename()`, and
+//! never replaces an existing content-addressed object or note.
+//!
+//! Temp names include process id, a monotonic counter, and a time component
+//! so concurrent puts never share a temp path.
+//!
+//! ## Blob + note pair
+//!
+//! A durable object is the pair `(blob, note)`. Install order is blob then
+//! note; if note install fails after blob install, the blob we just created
+//! is rolled back. A crash between the two can leave a blob without a note
+//! — **incomplete**. `put` refuses while incomplete (no new note on an
+//! orphan). Recovery on `open` removes incomplete pairs. A complete pair is
+//! never reported for an incomplete address, so a foreign retry cannot
+//! inherit DELETE ownership.
 //!
 //! ## Uploader note
 //!
@@ -28,9 +42,13 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Exactly 64 lowercase hex characters (32 decoded bytes).
 pub const BLOB_ID_HEX_LEN: usize = 64;
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Content-addressed store rooted at `root`.
 #[derive(Debug, Clone)]
@@ -40,7 +58,7 @@ pub struct BlobStore {
 
 impl BlobStore {
     /// Open (or create) a store at `root`. No default path — the caller must
-    /// supply a configured root.
+    /// supply a configured root. Runs incomplete-pair recovery before return.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, ApiError> {
         let root = root.into();
         fs::create_dir_all(&root).map_err(|e| {
@@ -61,7 +79,9 @@ impl BlobStore {
                 root.display()
             )));
         }
-        Ok(Self { root })
+        let store = Self { root };
+        store.recover_incomplete_pairs()?;
+        Ok(store)
     }
 
     /// Filesystem root (tests / diagnostics).
@@ -118,13 +138,17 @@ impl BlobStore {
             .join(format!("{}.uploader", Self::blob_id_hex(id)))
     }
 
-    /// `true` when a durable blob exists under this address.
+    /// `true` when a **complete** durable pair (blob + note) exists.
     pub fn exists(&self, id: &[u8; 32]) -> bool {
-        self.blob_path(id).is_file()
+        self.blob_path(id).is_file() && self.uploader_path(id).is_file()
     }
 
-    /// Byte length of a stored blob, or `None` if absent.
+    /// Byte length of a stored blob, or `None` if the complete pair is absent.
     pub fn size(&self, id: &[u8; 32]) -> Result<Option<u64>, ApiError> {
+        if !self.exists(id) {
+            // Incomplete orphan: not a readable object.
+            return Ok(None);
+        }
         let path = self.blob_path(id);
         match fs::metadata(&path) {
             Ok(m) if m.is_file() => Ok(Some(m.len())),
@@ -140,8 +164,11 @@ impl BlobStore {
         }
     }
 
-    /// Read the full blob body, or `None` if absent.
+    /// Read the full blob body, or `None` if the complete pair is absent.
     pub fn read(&self, id: &[u8; 32]) -> Result<Option<Vec<u8>>, ApiError> {
+        if !self.exists(id) {
+            return Ok(None);
+        }
         let path = self.blob_path(id);
         match fs::read(&path) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -179,65 +206,108 @@ impl BlobStore {
         Ok(Some(id))
     }
 
-    /// Store `body` under `blob_id = H(body)`. Idempotent: if the address
-    /// already holds a file, the body is not rewritten and the uploader note
-    /// is left alone (first-uploader wins for DELETE).
+    /// Store `body` under `blob_id = H(body)`. Idempotent when a **complete**
+    /// pair already exists: body is not rewritten and the uploader note is
+    /// left alone (first-uploader wins for DELETE).
+    ///
+    /// Incomplete pairs (blob without note) are recovered away before install
+    /// so a retry never inherits foreign DELETE ownership.
     ///
     /// Returns the content address.
     pub fn put(&self, body: &[u8], uploader_op: &[u8; 32]) -> Result<[u8; 32], ApiError> {
         let id: [u8; 32] = Sha256::digest(body).into();
         let final_path = self.blob_path(&id);
+        let note_path = self.uploader_path(&id);
 
-        if final_path.is_file() {
-            // Content-addressed: same bytes ⇒ same address. Do not touch the
-            // original uploader note.
+        // Complete pair: first-uploader wins; do not rewrite note.
+        if final_path.is_file() && note_path.is_file() {
             return Ok(id);
         }
 
-        // Atomic blob write: temp in same directory, then rename.
-        let tmp_name = format!(".{}.tmp.{}", Self::blob_id_hex(&id), std::process::id());
-        let tmp_path = self.root.join(&tmp_name);
-        write_exclusive(&tmp_path, body).map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
-            ApiError::internal(format!(
-                "blossom store: write temp {}: {e}",
-                tmp_path.display()
-            ))
-        })?;
-        fs::rename(&tmp_path, &final_path).map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
-            ApiError::internal(format!(
-                "blossom store: rename {} → {}: {e}",
-                tmp_path.display(),
-                final_path.display()
-            ))
-        })?;
+        // Incomplete pair (blob xor note): do **not** attach a new uploader
+        // note — that would hand DELETE ownership to a foreign retry. Fail
+        // closed; `open` / operator recovery clears orphans.
+        if final_path.is_file() || note_path.is_file() {
+            return Err(ApiError::internal(
+                "blossom store: incomplete blob/note pair present; \
+                 refuse put so a foreign retry cannot claim DELETE ownership \
+                 (run store open recovery or remove the orphan)",
+            ));
+        }
 
-        // Uploader note — also atomic. Failure after the blob rename is
-        // reported loudly; DELETE will fail-closed without the note.
-        let note_path = self.uploader_path(&id);
-        let note_tmp = self.root.join(format!(
-            ".{}.uploader.tmp.{}",
-            Self::blob_id_hex(&id),
-            std::process::id()
-        ));
+        let tag = unique_tmp_tag();
+        let hex = Self::blob_id_hex(&id);
+        let blob_tmp = self.root.join(format!(".{hex}.blob.tmp.{tag}"));
+        let note_tmp = self.root.join(format!(".{hex}.note.tmp.{tag}"));
+
+        // Both temps first (unique names — no collision across concurrent puts).
+        if let Err(e) = write_exclusive(&blob_tmp, body) {
+            let _ = fs::remove_file(&blob_tmp);
+            return Err(ApiError::internal(format!(
+                "blossom store: write blob temp {}: {e}",
+                blob_tmp.display()
+            )));
+        }
         let note_hex = encode_hex(uploader_op);
-        write_exclusive(&note_tmp, note_hex.as_bytes()).map_err(|e| {
+        if let Err(e) = write_exclusive(&note_tmp, note_hex.as_bytes()) {
+            let _ = fs::remove_file(&blob_tmp);
             let _ = fs::remove_file(&note_tmp);
-            ApiError::internal(format!(
-                "blossom store: write uploader temp {}: {e}",
+            return Err(ApiError::internal(format!(
+                "blossom store: write note temp {}: {e}",
                 note_tmp.display()
-            ))
-        })?;
-        fs::rename(&note_tmp, &note_path).map_err(|e| {
-            let _ = fs::remove_file(&note_tmp);
-            ApiError::internal(format!(
-                "blossom store: rename uploader note {}: {e}",
-                note_path.display()
-            ))
-        })?;
+            )));
+        }
 
-        Ok(id)
+        // Install blob with no-replace. Concurrent winner may have finished a
+        // complete pair in the meantime.
+        match install_no_replace(&blob_tmp, &final_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&note_tmp);
+                // Another put won the blob slot. If they also installed the
+                // note, we are the idempotent loser — success, original note.
+                // If note is still missing, do not attach ours (ownership).
+                if note_path.is_file() {
+                    return Ok(id);
+                }
+                return Err(ApiError::internal(
+                    "blossom store: concurrent put left incomplete pair; retry after recovery",
+                ));
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&note_tmp);
+                return Err(ApiError::internal(format!(
+                    "blossom store: install blob {}: {e}",
+                    final_path.display()
+                )));
+            }
+        }
+
+        // Install note; roll back our blob if this fails so we do not leave
+        // an incomplete pair that a foreign retry could claim as success.
+        match install_no_replace(&note_tmp, &note_path) {
+            Ok(()) => Ok(id),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // Note appeared (shouldn't under normal exclusive install of
+                // the same id by us) — treat complete pair as success.
+                if note_path.is_file() {
+                    Ok(id)
+                } else {
+                    let _ = fs::remove_file(&final_path);
+                    Err(ApiError::internal(format!(
+                        "blossom store: install note race on {}: {e}",
+                        note_path.display()
+                    )))
+                }
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&final_path);
+                Err(ApiError::internal(format!(
+                    "blossom store: install note {}: {e}",
+                    note_path.display()
+                )))
+            }
+        }
     }
 
     /// Delete blob and uploader note. Returns `true` if the blob existed.
@@ -267,6 +337,59 @@ impl BlobStore {
             }
         }
         Ok(existed)
+    }
+
+    /// Remove incomplete pairs under the store root (blob without note, or
+    /// note without blob). Temp files are left for the next put's unique
+    /// names / OS cleanup of abandoned temps is best-effort.
+    fn recover_incomplete_pairs(&self) -> Result<(), ApiError> {
+        let rd = fs::read_dir(&self.root).map_err(|e| {
+            ApiError::internal(format!(
+                "blossom store: read_dir {}: {e}",
+                self.root.display()
+            ))
+        })?;
+        let mut blob_hexes = Vec::new();
+        let mut note_hexes = Vec::new();
+        for entry in rd {
+            let entry = entry
+                .map_err(|e| ApiError::internal(format!("blossom store: read_dir entry: {e}")))?;
+            let name = match entry.file_name().into_string() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if name.len() == BLOB_ID_HEX_LEN
+                && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            {
+                if entry.path().is_file() {
+                    blob_hexes.push(name);
+                }
+                continue;
+            }
+            if let Some(hex) = name.strip_suffix(".uploader") {
+                if hex.len() == BLOB_ID_HEX_LEN
+                    && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                    && entry.path().is_file()
+                {
+                    note_hexes.push(hex.to_string());
+                }
+            }
+        }
+        for hex in &blob_hexes {
+            let note = self.root.join(format!("{hex}.uploader"));
+            if !note.is_file() {
+                let blob = self.root.join(hex);
+                let _ = fs::remove_file(&blob);
+            }
+        }
+        for hex in &note_hexes {
+            let blob = self.root.join(hex);
+            if !blob.is_file() {
+                let note = self.root.join(format!("{hex}.uploader"));
+                let _ = fs::remove_file(&note);
+            }
+        }
+        Ok(())
     }
 
     /// Test/diagnostic: list names of regular files directly under the root.
@@ -301,17 +424,47 @@ fn nibble(b: u8) -> u8 {
     }
 }
 
+fn unique_tmp_tag() -> String {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}-{}", std::process::id(), nanos, seq)
+}
+
 /// Create a new file exclusively and write all bytes, then sync.
 fn write_exclusive(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
     f.write_all(bytes)?;
     f.sync_all()?;
-    // Drop closes the file before rename.
+    // Drop closes the file before link/rename.
     drop(f);
     // Touch parent directory durability on platforms that need it is
-    // best-effort; rename is still atomic for the directory entry.
+    // best-effort; the directory entry install below is still atomic.
     let _ = File::open(path.parent().unwrap_or(Path::new("."))).and_then(|d| d.sync_all());
     Ok(())
+}
+
+/// Install `tmp` at `final_path` only if `final_path` does not already exist.
+///
+/// Uses `hard_link` (fails with `AlreadyExists` when the target is present)
+/// then removes the temp. Never rename-over.
+fn install_no_replace(tmp: &Path, final_path: &Path) -> io::Result<()> {
+    match fs::hard_link(tmp, final_path) {
+        Ok(()) => {
+            let _ = fs::remove_file(tmp);
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(tmp);
+            Err(e)
+        }
+        Err(e) => {
+            let _ = fs::remove_file(tmp);
+            Err(e)
+        }
+    }
 }
 
 /// SHA-256 of raw bytes — the normative `blob_id` (§4.2.1).
@@ -322,7 +475,8 @@ pub fn blob_id_of(body: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::Arc;
+    use std::thread;
 
     fn temp_root() -> PathBuf {
         let nanos = SystemTime::now()
@@ -414,14 +568,48 @@ mod tests {
         let store = BlobStore::open(&root).expect("open");
         let body = b"partial-write-simulation";
         let id = blob_id_of(body);
-        // Simulate an aborted upload: temp file left behind, no rename.
-        let tmp = root.join(format!(".{}.tmp.aborted", BlobStore::blob_id_hex(&id)));
+        // Simulate an aborted upload: temp file left behind, no install.
+        let tmp = root.join(format!(".{}.blob.tmp.aborted", BlobStore::blob_id_hex(&id)));
         fs::write(&tmp, body).expect("write temp");
         assert!(
             store.read(&id).expect("read").is_none(),
             "temp file must not be readable under the content address"
         );
         assert!(!store.exists(&id));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn incomplete_blob_without_note_refuses_put_and_open_recovers() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let body = b"orphan-blob-body";
+        let id = blob_id_of(body);
+        // Simulate crash after blob install, before note.
+        fs::write(store.blob_path(&id), body).expect("orphan blob");
+        assert!(store.read_uploader(&id).expect("read").is_none());
+        assert!(
+            !store.exists(&id),
+            "incomplete pair must not count as exists"
+        );
+        // Foreign retry must not claim DELETE ownership via a new note.
+        let uploader = [0x33u8; 32];
+        let err = store
+            .put(body, &uploader)
+            .expect_err("put must refuse incomplete");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("incomplete"),
+            "cause must name incomplete pair, got {:?}",
+            err.cause()
+        );
+        // open recovery clears the orphan; a subsequent put may then succeed.
+        drop(store);
+        let store = BlobStore::open(&root).expect("re-open recovers");
+        assert!(!store.blob_path(&id).is_file());
+        let id2 = store.put(body, &uploader).expect("put after recovery");
+        assert_eq!(id2, id);
+        assert_eq!(store.read_uploader(&id).unwrap().unwrap(), uploader);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -434,7 +622,93 @@ mod tests {
         // Remove only the note — DELETE auth path must refuse.
         fs::remove_file(store.uploader_path(&id)).expect("rm note");
         assert!(store.read_uploader(&id).expect("read").is_none());
-        assert!(store.exists(&id));
+        // exists requires the complete pair.
+        assert!(!store.exists(&id));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_recovers_incomplete_pairs() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        let body = b"recover-me";
+        let id = blob_id_of(body);
+        let hex = BlobStore::blob_id_hex(&id);
+        fs::write(root.join(&hex), body).unwrap();
+        // No note — open must clear the orphan.
+        let store = BlobStore::open(&root).expect("open");
+        assert!(!store.blob_path(&id).is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Parallel puts of the **same** content by different uploaders: exactly
+    /// one note wins (first complete pair); no panic; both observe Ok.
+    #[test]
+    fn parallel_puts_same_bytes_single_uploader_note() {
+        let root = temp_root();
+        let store = Arc::new(BlobStore::open(&root).expect("open"));
+        let body = b"parallel-same-bytes";
+        let mut handles = Vec::new();
+        for i in 0..8u8 {
+            let store = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                let mut op = [0u8; 32];
+                op[0] = i;
+                store.put(body, &op)
+            }));
+        }
+        let mut oks = 0;
+        for h in handles {
+            if h.join().expect("thread").is_ok() {
+                oks += 1;
+            }
+        }
+        assert!(oks >= 1, "at least one put must succeed");
+        let id = blob_id_of(body);
+        let note = store
+            .read_uploader(&id)
+            .expect("note")
+            .expect("complete pair must have a note");
+        // Note is some single uploader — stable after all joins.
+        assert_eq!(store.read(&id).unwrap().unwrap(), body);
+        // Second wave still preserves that note.
+        let late = store.put(body, &[0xff; 32]).expect("late put");
+        assert_eq!(late, id);
+        assert_eq!(
+            store.read_uploader(&id).unwrap().unwrap(),
+            note,
+            "first complete uploader must win DELETE ownership"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Parallel puts of **different** content by different uploaders all
+    /// succeed with their own notes.
+    #[test]
+    fn parallel_puts_distinct_uploaders_and_bodies() {
+        let root = temp_root();
+        let store = Arc::new(BlobStore::open(&root).expect("open"));
+        let mut handles = Vec::new();
+        for i in 0..8u8 {
+            let store = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                let body = vec![i; 32];
+                let mut op = [0u8; 32];
+                op[0] = i;
+                op[1] = 0xaa;
+                let id = store.put(&body, &op)?;
+                let note = store
+                    .read_uploader(&id)?
+                    .ok_or_else(|| ApiError::internal("missing note after put"))?;
+                if note != op {
+                    return Err(ApiError::internal("note mismatch after put"));
+                }
+                Ok::<_, ApiError>(id)
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread").expect("put");
+        }
         let _ = fs::remove_dir_all(&root);
     }
 }

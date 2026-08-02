@@ -32,12 +32,12 @@ The API layer sits **outward** of the node. It consumes the node's internal **ke
 
 > **Status: scaffold.** The API surface is currently served by [`zk-coins/node`](https://github.com/zk-coins/node) directly; this repo will hold the standalone API layer once the kernel RPC contract stabilises. The full design is specified in [§6.1 (kernel and API)](https://docs.zkcoins.com/specification), [§7.5 (REST)](https://docs.zkcoins.com/specification), and [§7.8 (kernel RPC)](https://docs.zkcoins.com/specification).
 
-### Inventory and stage A (this branch)
+### Current surface
 
 - Full §7.5 endpoint inventory (method, capability, feature, kernel RPC): [`docs/rest-surface.md`](docs/rest-surface.md).
 - Rust process (`axum` + `tonic 0.13.1` client): **`GET /`**, **`GET /health`**, info/chain reads, the job surface, **attest/grants**, pull/records/account, **`GET /v1/receipts/stream`** (SSE over `SubscribeReceipts`), bootstrap/publish, and optional Blossom. No placeholder routes for unbuilt keys.
 - **OwnershipProof** for attest/grants is verified at the API edge (BIP-340, action-bound domain, `chan_bind`, `request_hash`) **before** any kernel call that would consume a challenge nonce.
-- **`GET /` discovery follows registration** via `ServedSurface` — only served keys are advertised. The 29-key catalogue stays as inventory.
+- **`GET /` discovery follows registration** via `ServedSurface` — only served keys are advertised. Known-but-disabled inventory paths answer `404 feature_disabled`. The 29-key catalogue stays as inventory.
 - Kernel contract: carried `proto/kernel/v1/kernel.proto` with SHA-256 identity pin (`src/proto_identity.rs`); REST errors from `ErrorInfo.metadata["http_status"]` only (API-local auth failures use §7.5 `401 unauthorized` directly).
 - Codegen lives in the workspace member **`kernel-proto`** (tonic client stubs only). Workspace `default-members = ["."]` keeps default `cargo clippy` / `cargo test` on the **api** package so generated code is not linted.
 - Fail-closed env: `ZKCOINS_BIND_ADDR`, `ZKCOINS_KERNEL_ADDR`, `ZKCOINS_FEATURES`, `ZKCOINS_PUBLIC_HOST` (see the inventory doc). Optional Blossom store: `ZKCOINS_BLOSSOM_STORE` (+ max bytes / allowed ops companions).

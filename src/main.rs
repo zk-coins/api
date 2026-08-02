@@ -34,7 +34,13 @@ async fn main() -> ExitCode {
     let kernel_addr = config.kernel_addr.clone();
     let feature_count = config.features.len();
 
-    let app = build_router(config, kernel);
+    let app = match build_router(config, kernel) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("api: startup error: {e}");
+            return ExitCode::from(1);
+        }
+    };
 
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {
         Ok(l) => l,

@@ -466,10 +466,11 @@ mod tests {
         let err = ApiError::internal("kernel transport error: connection refused");
         assert_eq!(err.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
         assert!(
-            err.body.message.contains("kernel transport error"),
-            "message must name transport class, got {}",
-            err.body.message
+            err.cause().unwrap_or("").contains("kernel transport error"),
+            "operator cause must name transport class, got {:?}",
+            err.cause()
         );
     }
 }

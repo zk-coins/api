@@ -27,9 +27,9 @@ pub use auth::{
 pub use store::{blob_id_of, BlobStore};
 
 use crate::error::ApiError;
+use crate::extract::LimitedBytes;
 use crate::hexutil::{decode_hex_exact, encode_hex};
 use crate::state::AppState;
-use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -71,6 +71,53 @@ struct UploadResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Blocking store helpers (keep reactor threads free of sync fsync/read)
+// ---------------------------------------------------------------------------
+
+async fn store_read(store: Arc<BlobStore>, id: [u8; 32]) -> Result<Option<Vec<u8>>, ApiError> {
+    tokio::task::spawn_blocking(move || store.read(&id))
+        .await
+        .map_err(|e| ApiError::internal(format!("blossom store read join: {e}")))?
+}
+
+async fn store_size(store: Arc<BlobStore>, id: [u8; 32]) -> Result<Option<u64>, ApiError> {
+    tokio::task::spawn_blocking(move || store.size(&id))
+        .await
+        .map_err(|e| ApiError::internal(format!("blossom store size join: {e}")))?
+}
+
+async fn store_exists(store: Arc<BlobStore>, id: [u8; 32]) -> Result<bool, ApiError> {
+    tokio::task::spawn_blocking(move || store.exists(&id))
+        .await
+        .map_err(|e| ApiError::internal(format!("blossom store exists join: {e}")))
+}
+
+async fn store_read_uploader(
+    store: Arc<BlobStore>,
+    id: [u8; 32],
+) -> Result<Option<[u8; 32]>, ApiError> {
+    tokio::task::spawn_blocking(move || store.read_uploader(&id))
+        .await
+        .map_err(|e| ApiError::internal(format!("blossom store read_uploader join: {e}")))?
+}
+
+async fn store_put(
+    store: Arc<BlobStore>,
+    body: axum::body::Bytes,
+    uploader: [u8; 32],
+) -> Result<[u8; 32], ApiError> {
+    tokio::task::spawn_blocking(move || store.put(&body, &uploader))
+        .await
+        .map_err(|e| ApiError::internal(format!("blossom store put join: {e}")))?
+}
+
+async fn store_delete(store: Arc<BlobStore>, id: [u8; 32]) -> Result<bool, ApiError> {
+    tokio::task::spawn_blocking(move || store.delete(&id))
+        .await
+        .map_err(|e| ApiError::internal(format!("blossom store delete join: {e}")))?
+}
+
+// ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
@@ -81,9 +128,8 @@ pub async fn get_blob(
 ) -> Result<Response, ApiError> {
     let blossom = require_blossom(&state)?;
     let id = BlobStore::parse_blob_id(&sha256)?;
-    let bytes = blossom
-        .store
-        .read(&id)?
+    let bytes = store_read(Arc::clone(&blossom.store), id)
+        .await?
         .ok_or_else(|| ApiError::not_found(format!("blob {sha256} not found")))?;
     let mut res = Response::new(axum::body::Body::from(bytes));
     *res.status_mut() = StatusCode::OK;
@@ -101,9 +147,8 @@ pub async fn head_blob(
 ) -> Result<Response, ApiError> {
     let blossom = require_blossom(&state)?;
     let id = BlobStore::parse_blob_id(&sha256)?;
-    let size = blossom
-        .store
-        .size(&id)?
+    let size = store_size(Arc::clone(&blossom.store), id)
+        .await?
         .ok_or_else(|| ApiError::not_found(format!("blob {sha256} not found")))?;
     let mut res = Response::new(axum::body::Body::empty());
     *res.status_mut() = StatusCode::OK;
@@ -123,14 +168,16 @@ pub async fn head_blob(
 pub async fn upload_blob(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Bytes,
+    LimitedBytes(body): LimitedBytes,
 ) -> Result<Response, ApiError> {
     let blossom = require_blossom(&state)?;
 
     // Content-Type is mandatory application/octet-stream.
     require_octet_stream(&headers)?;
 
-    // Body size — advertised limit, no clamping.
+    // Body size — advertised limit, no clamping. The route-level body limit is
+    // set to the same max so axum buffering rejects far-oversized bodies; both
+    // paths map to §7.5 `payload_too_large` (handler check + LimitedBytes).
     let max = blossom.max_blob_bytes;
     let body_len = body.len() as u64;
     if body_len > max {
@@ -162,7 +209,7 @@ pub async fn upload_blob(
         ));
     }
 
-    let id = blossom.store.put(&body, &verified.op_pubkey)?;
+    let id = store_put(Arc::clone(&blossom.store), body, verified.op_pubkey).await?;
     debug_assert_eq!(id, body_hash);
 
     // Honest response without receipt (§4.6 absent).
@@ -184,14 +231,16 @@ pub async fn delete_blob(
     let blossom = require_blossom(&state)?;
     let id = BlobStore::parse_blob_id(&sha256)?;
 
-    if !blossom.store.exists(&id) {
+    if !store_exists(Arc::clone(&blossom.store), id).await? {
         return Err(ApiError::not_found(format!("blob {sha256} not found")));
     }
 
     // Fail-closed: no uploader note ⇒ refuse DELETE (never allow).
-    let original = blossom.store.read_uploader(&id)?.ok_or_else(|| {
-        ApiError::scope_exceeded("blob has no uploader note; DELETE refused (fail-closed)")
-    })?;
+    let original = store_read_uploader(Arc::clone(&blossom.store), id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::scope_exceeded("blob has no uploader note; DELETE refused (fail-closed)")
+        })?;
 
     let auth_header = headers
         .get(header::AUTHORIZATION)
@@ -208,7 +257,7 @@ pub async fn delete_blob(
         ));
     }
 
-    let deleted = blossom.store.delete(&id)?;
+    let deleted = store_delete(Arc::clone(&blossom.store), id).await?;
     if !deleted {
         // Race: blob vanished between exists and delete.
         return Err(ApiError::not_found(format!("blob {sha256} not found")));

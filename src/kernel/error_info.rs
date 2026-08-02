@@ -178,6 +178,22 @@ fn validate_and_build(info: ErrorInfo, status_message: &str) -> Result<ApiError,
             ));
         }
     };
+    // Normative reason↔status pairs (§7.5). A kernel that sends a closed
+    // reason with the wrong HTTP status is a protocol fault — fail closed
+    // as 500, never invent the correct status client-side.
+    match info.reason.as_str() {
+        "unauthorized" if code_u16 != 401 => {
+            return Err(format!(
+                "reason \"unauthorized\" requires http_status 401, got {code_u16}"
+            ));
+        }
+        "session_expired" if code_u16 != 410 => {
+            return Err(format!(
+                "reason \"session_expired\" requires http_status 410, got {code_u16}"
+            ));
+        }
+        _ => {}
+    }
     let message = if status_message.is_empty() {
         info.reason.clone()
     } else {
@@ -307,10 +323,11 @@ mod tests {
         let err = kernel_status_to_api_error(&st);
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
         assert!(
-            err.body.message.contains("http_status"),
-            "message must name the missing field, got {}",
-            err.body.message
+            err.cause().unwrap_or("").contains("http_status"),
+            "operator cause must name the missing field, got {:?}",
+            err.cause()
         );
     }
 
@@ -321,11 +338,11 @@ mod tests {
         let err = kernel_status_to_api_error(&st);
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
+        let cause = err.cause().unwrap_or("");
         assert!(
-            err.body.message.contains("out of error range")
-                || err.body.message.contains("http_status"),
-            "message must name the status problem, got {}",
-            err.body.message
+            cause.contains("out of error range") || cause.contains("http_status"),
+            "operator cause must name the status problem, got {cause}"
         );
     }
 
@@ -347,9 +364,9 @@ mod tests {
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(err.body.error, "internal_error");
         assert!(
-            err.body.message.contains("domain"),
-            "message must name domain failure, got {}",
-            err.body.message
+            err.cause().unwrap_or("").contains("domain"),
+            "operator cause must name domain failure, got {:?}",
+            err.cause()
         );
     }
 
@@ -360,9 +377,9 @@ mod tests {
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(err.body.error, "internal_error");
         assert!(
-            err.body.message.contains("ErrorInfo"),
-            "message must mention ErrorInfo, got {}",
-            err.body.message
+            err.cause().unwrap_or("").contains("ErrorInfo"),
+            "operator cause must mention ErrorInfo, got {:?}",
+            err.cause()
         );
     }
 
@@ -384,9 +401,9 @@ mod tests {
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(err.body.error, "internal_error");
         assert!(
-            err.body.message.contains("canonical"),
-            "message must name canonical form, got {}",
-            err.body.message
+            err.cause().unwrap_or("").contains("canonical"),
+            "operator cause must name canonical form, got {:?}",
+            err.cause()
         );
     }
 
@@ -410,17 +427,66 @@ mod tests {
             err.body.error, "internal_error",
             "foreign reason must not become the public error code"
         );
+        let cause = err.cause().unwrap_or("");
         assert!(
-            err.body.message.contains("totally_made_up_reason")
-                || err.body.message.contains("machine_code")
-                || err.body.message.contains("closed"),
-            "message must name the foreign reason or the closed-set rule, got {}",
-            err.body.message
+            cause.contains("totally_made_up_reason")
+                || cause.contains("machine_code")
+                || cause.contains("closed"),
+            "operator cause must name the foreign reason or the closed-set rule, got {cause}"
         );
         assert_ne!(
             err.body.error, "totally_made_up_reason",
             "foreign reason must never be echoed as the wire machine code"
         );
+    }
+
+    /// Without the pair check, `unauthorized` with http_status 403 would be
+    /// forwarded as a 403. Spec binds unauthorized ↔ 401 only.
+    #[test]
+    fn unauthorized_with_wrong_http_status_is_fail_closed_500() {
+        let st =
+            encode_kernel_error_status(Code::PermissionDenied, "not allowed", "unauthorized", 403);
+        let err = kernel_status_to_api_error(&st);
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
+        assert!(
+            err.cause().unwrap_or("").contains("401"),
+            "cause must name the required 401 pairing, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn session_expired_with_wrong_http_status_is_fail_closed_500() {
+        let st = encode_kernel_error_status(
+            Code::FailedPrecondition,
+            "session gone",
+            "session_expired",
+            401,
+        );
+        let err = kernel_status_to_api_error(&st);
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("410"),
+            "cause must name the required 410 pairing, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn unauthorized_401_and_session_expired_410_are_accepted() {
+        let u = encode_kernel_error_status(Code::Unauthenticated, "nope", "unauthorized", 401);
+        let err = kernel_status_to_api_error(&u);
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.body.error, "unauthorized");
+
+        let s =
+            encode_kernel_error_status(Code::FailedPrecondition, "gone", "session_expired", 410);
+        let err = kernel_status_to_api_error(&s);
+        assert_eq!(err.status, StatusCode::GONE);
+        assert_eq!(err.body.error, "session_expired");
     }
 
     #[test]

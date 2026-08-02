@@ -21,6 +21,7 @@
 //! state; the request carries no `subject` field.
 
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::hexutil::{decode_hex_exact, encode_hex};
 use crate::kernel::kernel_v1::{
     AccountStateRequest, AccountStateResult, CoinProofBlob, CoinProofRequest, PullChallengeRequest,
@@ -326,7 +327,7 @@ fn session_chan_bind(public_hosts: &[String]) -> Result<[u8; 32], ApiError> {
 /// `POST /v1/pull/challenge` → OpenPullChallenge(action=pull).
 pub async fn post_pull_challenge(
     State(state): State<AppState>,
-    Json(body): Json<PullChallengeBody>,
+    JsonBody(body): JsonBody<PullChallengeBody>,
 ) -> Result<Response, ApiError> {
     if body.subject.is_empty() {
         return Err(ApiError::malformed("subject is required"));
@@ -377,7 +378,7 @@ pub async fn post_pull_challenge(
 /// under a scoped grant.
 pub async fn post_pull(
     State(state): State<AppState>,
-    Json(body): Json<PullBody>,
+    JsonBody(body): JsonBody<PullBody>,
 ) -> Result<Response, ApiError> {
     // Requested scope: re-echo on redeem, or unbounded sentinels when omitted.
     let requested_scope = match &body.scope {

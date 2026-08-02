@@ -5,6 +5,7 @@
 //! `POST /v1/jobs/<job_id>/cancel`. Axum registers the derived `:job_id` matcher.
 
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::hexutil::{decode_hex_exact, encode_hex, HexError};
 use crate::kernel::kernel_v1::{
     delivery_credential, AwaitingSignature, DeliveryCredential as ProtoDeliveryCredential,
@@ -24,6 +25,162 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::fmt;
+
+// ---------------------------------------------------------------------------
+// Closed job status / error sets (§7.5 jobs family)
+// ---------------------------------------------------------------------------
+
+/// Closed `Job.status` vocabulary on the public poll / SSE surface.
+const CLOSED_JOB_STATUSES: &[&str] = &[
+    "accepted",
+    "proving",
+    "awaiting_signature",
+    "publishing",
+    "completed",
+    "failed",
+    "cancelled",
+];
+
+/// Closed terminal `JobError.error` machine codes (§7.5 jobs-family table).
+const CLOSED_JOB_ERROR_CODES: &[&str] = &[
+    "invalid_input_coin",
+    "insufficient_balance",
+    "bounds_exceeded",
+    "unknown_publisher",
+    "stale_message",
+    "invalid_signature",
+    "proving_failed",
+    "publish_rejected",
+    "circuit_digest_mismatch",
+    "idempotency_conflict",
+    "malformed_request",
+    "internal_error",
+];
+
+fn is_closed_job_status(status: &str) -> bool {
+    CLOSED_JOB_STATUSES.contains(&status)
+}
+
+fn is_terminal_job_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled")
+}
+
+fn is_closed_job_error_code(code: &str) -> bool {
+    CLOSED_JOB_ERROR_CODES.contains(&code)
+}
+
+/// Validate a kernel `Job` against the closed status set, status↔payload
+/// exclusivity, and terminal error-code vocabulary. Fail-closed as
+/// `500 internal_error` on any contract breach (never forward foreign
+/// statuses or error codes onto the public wire).
+fn validate_job(job: &Job) -> Result<(), ApiError> {
+    if !is_closed_job_status(&job.status) {
+        return Err(ApiError::internal(format!(
+            "kernel Job.status is not a closed §7.5 job status: {:?}",
+            job.status
+        )));
+    }
+
+    let has_awaiting = job.awaiting_signature.is_some();
+    let has_result = job.result.is_some();
+    let has_error = job.error.is_some();
+
+    match job.status.as_str() {
+        "awaiting_signature" => {
+            if !has_awaiting {
+                return Err(ApiError::internal(
+                    "job status is awaiting_signature but payload is absent",
+                ));
+            }
+            if has_result || has_error {
+                return Err(ApiError::internal(
+                    "job status awaiting_signature must not carry result or error",
+                ));
+            }
+        }
+        "completed" => {
+            if !has_result {
+                return Err(ApiError::internal(
+                    "job status is completed but result is absent",
+                ));
+            }
+            if has_awaiting || has_error {
+                return Err(ApiError::internal(
+                    "job status completed must not carry awaiting_signature or error",
+                ));
+            }
+        }
+        "failed" | "cancelled" => {
+            if !has_error {
+                return Err(ApiError::internal(format!(
+                    "job status is {} but error is absent",
+                    job.status
+                )));
+            }
+            if has_awaiting || has_result {
+                return Err(ApiError::internal(format!(
+                    "job status {} must not carry awaiting_signature or result",
+                    job.status
+                )));
+            }
+            let err = job.error.as_ref().expect("checked has_error");
+            if !is_closed_job_error_code(&err.error) {
+                return Err(ApiError::internal(format!(
+                    "kernel JobError.error is not a closed job terminal code: {:?}",
+                    err.error
+                )));
+            }
+        }
+        // Non-terminal phases: no exclusive payloads.
+        "accepted" | "proving" | "publishing" => {
+            if has_awaiting || has_result || has_error {
+                return Err(ApiError::internal(format!(
+                    "job status {} must not carry awaiting_signature, result, or error",
+                    job.status
+                )));
+            }
+        }
+        _ => unreachable!("closed set checked above"),
+    }
+    Ok(())
+}
+
+/// SSE event name ↔ job status correlation (§7.5 L2947 / L3033).
+fn validate_sse_event_status(event_name: &str, job: &Job) -> Result<(), ApiError> {
+    validate_job(job)?;
+    match event_name {
+        "phase" => {
+            if is_terminal_job_status(&job.status) {
+                return Err(ApiError::internal(format!(
+                    "SSE event \"phase\" must not carry terminal status {:?}",
+                    job.status
+                )));
+            }
+        }
+        "complete" => {
+            if job.status != "completed" {
+                return Err(ApiError::internal(format!(
+                    "SSE event \"complete\" requires status \"completed\", got {:?}",
+                    job.status
+                )));
+            }
+        }
+        "error" => {
+            if job.status != "failed" && job.status != "cancelled" {
+                return Err(ApiError::internal(format!(
+                    "SSE event \"error\" requires status failed|cancelled, got {:?}",
+                    job.status
+                )));
+            }
+        }
+        _ => {
+            return Err(ApiError::internal(format!(
+                "kernel JobEvent.event is not a §7.5 SSE name: {event_name:?}"
+            )));
+        }
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // JSON request types (exact §7.5 shapes)
@@ -124,9 +281,13 @@ impl fmt::Debug for DeliveryCredentialJson {
 /// Full §1.5 / §4.3 `Invoice` on the REST surface (§7.1 hex + decimal-string).
 ///
 /// Form only at the API: hex widths and required keys. No crypto, no address
-/// preimage, no relay-URL policy. `memo` absent vs empty is preserved on the
-/// REST side; proto3 string maps both to empty bytes on the wire when absent
-/// or empty — the API does **not** trim a present memo.
+/// preimage, no relay-URL policy.
+///
+/// **`memo` (§1.5 normalisation):** Spec: "memo contributes the empty byte
+/// string when absent". `None` and `Some("")` therefore both become the empty
+/// proto string via `unwrap_or_default()`. Non-empty memo is copied
+/// byte-for-byte (no trim). Forwarding is unchanged **except** for that
+/// §1.5 memo normalisation — not a free-form "pass Option through".
 ///
 /// **Debug** redacts `pk0`, `memo`, and both signatures.
 #[derive(Deserialize)]
@@ -234,9 +395,9 @@ pub struct SignBodyJson {
 
 /// `POST /v1/tx` → `SubmitTransition` → `202 { job_id, status: "accepted" }`.
 ///
-/// Body is deserialized via a §7.5-shaped extractor so unknown fields and
-/// other serde failures become `400 malformed_request` (not axum's default
-/// 422 with a non-§7.5 body).
+/// Body is deserialized via [`JsonBody`] so unknown fields, content-type
+/// failures, and other serde rejections become `400 malformed_request` (not
+/// axum's default 422 with a non-§7.5 body).
 ///
 /// **Retention (§7.5 `delivery`):** this handler never logs the request body
 /// and never interpolates credential fields into success paths. Form-error
@@ -246,11 +407,8 @@ pub struct SignBodyJson {
 pub async fn post_tx(
     State(kernel): State<KernelHandle>,
     headers: HeaderMap,
-    body: Result<Json<TransitionRequestJson>, axum::extract::rejection::JsonRejection>,
+    JsonBody(body): JsonBody<TransitionRequestJson>,
 ) -> Result<Response, ApiError> {
-    // Map extractor failures to §7.5 shape. Serde's messages name field paths
-    // / types; they must not become a back-channel for credential contents.
-    let Json(body) = body.map_err(|rej| ApiError::malformed(format!("request body: {rej}")))?;
     let mut req = json_to_transition(body)?;
     // Missing header ⇒ leave proto field empty (kernel treats empty as absent).
     // Present-but-empty is a client error, not silently rewritten to absent.
@@ -293,7 +451,7 @@ pub async fn get_job(
             job_id: job_id.clone(),
         })
         .await?;
-    let (status_header, retry_after) = job_poll_headers(&job);
+    let (status_header, retry_after) = job_poll_headers(&job)?;
     let mut response = (status_header, Json(job_to_json(&job)?)).into_response();
     if let Some(secs) = retry_after {
         response.headers_mut().insert(
@@ -330,7 +488,7 @@ pub async fn stream_job(
 pub async fn post_sign(
     State(kernel): State<KernelHandle>,
     Path(job_id): Path<String>,
-    Json(body): Json<SignBodyJson>,
+    JsonBody(body): JsonBody<SignBodyJson>,
 ) -> Result<Response, ApiError> {
     if job_id.is_empty() {
         return Err(ApiError::malformed("job_id must not be empty"));
@@ -424,11 +582,6 @@ fn stream_break_event(err: &ApiError) -> Event {
 
 fn job_event_to_sse(ev: &JobEvent) -> Result<Event, ApiError> {
     let name = ev.event.as_str();
-    if name != "phase" && name != "complete" && name != "error" {
-        return Err(ApiError::internal(format!(
-            "kernel JobEvent.event is not a §7.5 SSE name: {name:?}"
-        )));
-    }
     let job = match &ev.job {
         Some(j) => j,
         None => {
@@ -437,10 +590,12 @@ fn job_event_to_sse(ev: &JobEvent) -> Result<Event, ApiError> {
             ));
         }
     };
+    // Closed event name + status correlation + payload exclusivity.
+    validate_sse_event_status(name, job)?;
     let data = match name {
         "phase" => phase_event_data(job)?,
         "complete" | "error" => job_to_json(job)?,
-        _ => unreachable!("checked above"),
+        _ => unreachable!("validate_sse_event_status checked name"),
     };
     Ok(Event::default().event(name).data(data.to_string()))
 }
@@ -618,9 +773,10 @@ fn json_to_transition(body: TransitionRequestJson) -> Result<TransitionRequest, 
 
 /// REST → proto for one `OutputTemplate`, including optional `delivery`.
 ///
-/// Field-for-field, no normalisation: hex is form-checked (width + charset)
-/// and decoded; strings (`recipient`, `amount`, memo, relays, content) pass
-/// through unchanged (no trim). Credential **content** is never inspected.
+/// Hex is form-checked (width + charset) and decoded; strings (`recipient`,
+/// `amount`, relays, content) pass through unchanged (no trim). Invoice
+/// `memo` is normalised per §1.5 (absent → empty byte string); see
+/// [`InvoiceJson`]. Credential **content** is never inspected.
 fn json_to_output_template(
     t: OutputTemplateJson,
     index: usize,
@@ -672,8 +828,8 @@ fn json_to_invoice(inv: InvoiceJson, delivery_prefix: &str) -> Result<ProtoInvoi
     let op_pubkey = decode_hex_field(&inv.op_pubkey, 32, &format!("{p}.op_pubkey"))?;
     let addr_sig = decode_hex_field(&inv.addr_sig, 64, &format!("{p}.addr_sig"))?;
     let sig = decode_hex_field(&inv.sig, 64, &format!("{p}.sig"))?;
-    // Absent memo → empty proto string (proto3); present empty string stays
-    // empty; present non-empty is copied byte-for-byte (no trim).
+    // §1.5: memo contributes the empty byte string when absent. Present empty
+    // and present non-empty (no trim) map unchanged except that normalisation.
     let memo = inv.memo.unwrap_or_default();
     Ok(ProtoInvoice {
         amount: inv.amount,
@@ -801,61 +957,40 @@ pub(crate) fn parse_idempotency_key_value(s: &str) -> Result<Option<String>, Api
 
 /// §7.5 job poll object (L2889, L2959–L2991).
 fn job_to_json(job: &Job) -> Result<Value, ApiError> {
+    validate_job(job)?;
+
     let mut obj = serde_json::Map::new();
     obj.insert("job_id".to_string(), Value::String(job.job_id.clone()));
     obj.insert("kind".to_string(), Value::String(job.kind.clone()));
     obj.insert("status".to_string(), Value::String(job.status.clone()));
     // phase absent in terminal states (L2889).
-    let terminal = matches!(job.status.as_str(), "completed" | "failed" | "cancelled");
-    if !terminal && !job.phase.is_empty() {
+    if !is_terminal_job_status(&job.status) && !job.phase.is_empty() {
         obj.insert("phase".to_string(), Value::String(job.phase.clone()));
     }
     obj.insert("progress".to_string(), json!(job.progress));
 
     if job.status == "awaiting_signature" {
-        match &job.awaiting_signature {
-            Some(a) => {
-                obj.insert(
-                    "awaiting_signature".to_string(),
-                    awaiting_signature_json(a)?,
-                );
-            }
-            None => {
-                return Err(ApiError::internal(
-                    "job status is awaiting_signature but payload is absent",
-                ));
-            }
-        }
+        let a = job
+            .awaiting_signature
+            .as_ref()
+            .expect("validate_job checked");
+        obj.insert(
+            "awaiting_signature".to_string(),
+            awaiting_signature_json(a)?,
+        );
     }
 
     if job.status == "completed" {
-        match &job.result {
-            Some(r) => {
-                obj.insert("result".to_string(), job_result_json(r)?);
-            }
-            None => {
-                return Err(ApiError::internal(
-                    "job status is completed but result is absent",
-                ));
-            }
-        }
+        let r = job.result.as_ref().expect("validate_job checked");
+        obj.insert("result".to_string(), job_result_json(r)?);
     }
 
     if job.status == "failed" || job.status == "cancelled" {
-        match &job.error {
-            Some(e) => {
-                obj.insert(
-                    "error".to_string(),
-                    json!({ "error": e.error, "message": e.message }),
-                );
-            }
-            None => {
-                return Err(ApiError::internal(format!(
-                    "job status is {} but error is absent",
-                    job.status
-                )));
-            }
-        }
+        let e = job.error.as_ref().expect("validate_job checked");
+        obj.insert(
+            "error".to_string(),
+            json!({ "error": e.error, "message": e.message }),
+        );
     }
 
     Ok(Value::Object(obj))
@@ -941,16 +1076,19 @@ fn require_hex32(bytes: &[u8], field: &str) -> Result<String, ApiError> {
 }
 
 /// Poll headers: 200 always on success; Retry-After on non-terminal (L2944).
-fn job_poll_headers(job: &Job) -> (StatusCode, Option<u64>) {
-    let terminal = matches!(job.status.as_str(), "completed" | "failed" | "cancelled");
-    if terminal {
-        return (StatusCode::OK, None);
+///
+/// Caller must already have [`validate_job`]'d — unknown status is not treated
+/// as non-terminal (that would invent a retry schedule for foreign values).
+fn job_poll_headers(job: &Job) -> Result<(StatusCode, Option<u64>), ApiError> {
+    validate_job(job)?;
+    if is_terminal_job_status(&job.status) {
+        return Ok((StatusCode::OK, None));
     }
     let secs = match job.status.as_str() {
         "awaiting_signature" => 0,
         _ => 2, // proving / publishing / accepted — RECOMMENDED 2 (L2944)
     };
-    (StatusCode::OK, Some(secs))
+    Ok((StatusCode::OK, Some(secs)))
 }
 
 #[cfg(test)]
@@ -1250,7 +1388,7 @@ mod tests {
 
     #[test]
     fn invoice_memo_absent_vs_empty_both_map_without_trim() {
-        // Absent memo → empty proto string.
+        // §1.5: absent memo → empty proto string (normalisation, not free pass-through).
         let mut v = mint_with_invoice_delivery();
         v["output_templates"][0]["delivery"]["invoice"]
             .as_object_mut()
@@ -1270,6 +1408,23 @@ mod tests {
         };
         assert_eq!(inv.memo, "");
 
+        // Present empty string also → empty (same §1.5 contribution).
+        let mut v_empty = mint_with_invoice_delivery();
+        v_empty["output_templates"][0]["delivery"]["invoice"]["memo"] = serde_json::json!("");
+        let req_empty = json_to_transition(serde_json::from_value(v_empty).unwrap()).unwrap();
+        let inv_empty = match req_empty.output_templates[0]
+            .delivery
+            .as_ref()
+            .unwrap()
+            .body
+            .as_ref()
+            .unwrap()
+        {
+            DeliveryBody::Invoice(i) => i,
+            _ => panic!("invoice"),
+        };
+        assert_eq!(inv_empty.memo, "");
+
         // Present memo with leading/trailing spaces is NOT trimmed.
         let mut v2 = mint_with_invoice_delivery();
         v2["output_templates"][0]["delivery"]["invoice"]["memo"] =
@@ -1287,6 +1442,99 @@ mod tests {
             _ => panic!("invoice"),
         };
         assert_eq!(inv2.memo, "  spaced memo  ");
+    }
+
+    fn sample_job(status: &str) -> Job {
+        Job {
+            job_id: "j1".into(),
+            kind: "mint".into(),
+            status: status.into(),
+            phase: String::new(),
+            progress: 0.0,
+            awaiting_signature: None,
+            result: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn validate_job_rejects_unknown_status() {
+        let job = sample_job("totally_unknown_phase");
+        let err = validate_job(&job).expect_err("unknown status");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("totally_unknown_phase")
+                || err.cause().unwrap_or("").contains("closed"),
+            "cause must name the foreign status, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn validate_job_rejects_unknown_terminal_error_code() {
+        let mut job = sample_job("failed");
+        job.error = Some(crate::kernel::kernel_v1::JobError {
+            error: "not_a_real_job_error".into(),
+            message: "x".into(),
+        });
+        let err = validate_job(&job).expect_err("foreign error code");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("not_a_real_job_error")
+                || err.cause().unwrap_or("").contains("closed"),
+            "cause must name the foreign code, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn validate_job_enforces_status_payload_exclusivity() {
+        // completed without result
+        let job = sample_job("completed");
+        assert!(validate_job(&job).is_err());
+
+        // accepted with error payload
+        let mut job = sample_job("accepted");
+        job.error = Some(crate::kernel::kernel_v1::JobError {
+            error: "proving_failed".into(),
+            message: "x".into(),
+        });
+        assert!(validate_job(&job).is_err());
+
+        // failed without error
+        let job = sample_job("failed");
+        assert!(validate_job(&job).is_err());
+    }
+
+    #[test]
+    fn validate_sse_event_status_correlation() {
+        let mut proving = sample_job("proving");
+        proving.phase = "witness".into();
+        assert!(validate_sse_event_status("phase", &proving).is_ok());
+
+        // phase + terminal status is a contract breach.
+        let mut completed = sample_job("completed");
+        completed.result = Some(crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![0x11; 32],
+            output_coins_root: vec![0x22; 32],
+            input_nullifiers_root: vec![0x33; 32],
+            output_coin_ids: vec![],
+            publisher_pubkey: vec![],
+            attestation: vec![],
+        });
+        assert!(validate_sse_event_status("phase", &completed).is_err());
+        assert!(validate_sse_event_status("complete", &completed).is_ok());
+
+        // complete with non-completed status
+        assert!(validate_sse_event_status("complete", &proving).is_err());
+
+        let mut failed = sample_job("failed");
+        failed.error = Some(crate::kernel::kernel_v1::JobError {
+            error: "proving_failed".into(),
+            message: "x".into(),
+        });
+        assert!(validate_sse_event_status("error", &failed).is_ok());
+        assert!(validate_sse_event_status("error", &proving).is_err());
     }
 
     #[test]

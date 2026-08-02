@@ -9,6 +9,7 @@ pub mod bootstrap;
 pub mod chain;
 pub mod config;
 pub mod error;
+pub mod extract;
 pub mod grants;
 pub mod hexutil;
 pub mod info;
@@ -23,5 +24,5 @@ pub mod state;
 
 pub use config::{BlossomConfig, Config, ConfigError, Feature};
 pub use kernel::{connect_lazy, KernelClient, KernelHandle};
-pub use routes::{build_router, CLOSED_ENDPOINT_KEYS};
+pub use routes::{build_router, StartupError, CLOSED_ENDPOINT_KEYS};
 pub use state::AppState;

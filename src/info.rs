@@ -32,7 +32,15 @@ const READY_REASONS: &[&str] = &[
 /// `GET /v1/info` → `GetInfo` + API-owned `features`.
 pub async fn get_info(State(state): State<AppState>) -> Result<Response, ApiError> {
     let info = state.kernel.get_info().await?;
-    let body = info_to_json(&info, &state.features)?;
+    // When Blossom is configured, advertise the API-enforced upload limit
+    // (`ZKCOINS_BLOSSOM_MAX_BLOB_BYTES`), not the kernel's independent
+    // `Info.max_blob_bytes`. Clients must see the bound that PUT/POST
+    // `/blossom/upload` actually applies; publishing a higher kernel figure
+    // while the API rejects larger bodies would be inconsistent. Equality
+    // with the kernel is **not** required at boot — the REST surface is
+    // authoritative for the public limit when this process stores blobs.
+    let max_blob_override = state.blossom.as_ref().map(|b| b.max_blob_bytes);
+    let body = info_to_json(&info, &state.features, max_blob_override)?;
     Ok((StatusCode::OK, Json(body)).into_response())
 }
 
@@ -141,6 +149,7 @@ fn is_closed_ready_reason(reason: &str) -> bool {
 fn info_to_json(
     info: &Info,
     features: &std::collections::BTreeSet<crate::config::Feature>,
+    max_blob_bytes_override: Option<u64>,
 ) -> Result<Value, ApiError> {
     let network = info.network.as_str();
     match network {
@@ -179,6 +188,13 @@ fn info_to_json(
         .map(|s| Value::String(s.to_string()))
         .collect();
 
+    // Prefer the API Blossom limit when configured; otherwise the kernel value
+    // (informational — no local upload path without a store).
+    let max_blob_bytes = match max_blob_bytes_override {
+        Some(api_limit) => api_limit,
+        None => info.max_blob_bytes,
+    };
+
     Ok(json!({
         "network": network,
         "protocol_version": "v1",
@@ -186,7 +202,7 @@ fn info_to_json(
         "bootstrap_pubkey": bootstrap_pubkey,
         "relay_url": info.relay_url,
         "blossom_url": info.blossom_url,
-        "max_blob_bytes": info.max_blob_bytes,
+        "max_blob_bytes": max_blob_bytes,
         "finality_confirmations": info.finality_confirmations,
         "activation_height": info.activation_height,
         "max_tx_inputs": info.max_tx_inputs,
@@ -327,10 +343,11 @@ mod tests {
     fn info_json_features_from_api_not_kernel_parts() {
         let info = sample_info(true, None);
         let features = BTreeSet::from([Feature::Wallet, Feature::Explorer]);
-        let json = info_to_json(&info, &features).expect("info");
+        let json = info_to_json(&info, &features, None).expect("info");
         assert_eq!(json["network"], "regtest");
         assert_eq!(json["protocol_version"], "v1");
         assert_eq!(json["features"], json!(["explorer", "wallet"]));
+        assert_eq!(json["max_blob_bytes"], 1_048_576);
         // kernel_parts must not leak onto the public surface.
         assert!(json.get("kernel_parts").is_none());
         assert!(json.get("ready").is_none());
@@ -339,6 +356,20 @@ mod tests {
         assert_eq!(
             json["bootstrap"]["manifest_sig"].as_str().unwrap().len(),
             128
+        );
+    }
+
+    /// Without the override, a lower API Blossom limit would leave clients
+    /// seeing the higher kernel figure while uploads reject at the API bound.
+    #[test]
+    fn info_json_prefers_api_max_blob_bytes_when_override_set() {
+        let info = sample_info(true, None);
+        assert_eq!(info.max_blob_bytes, 1_048_576);
+        let features = BTreeSet::new();
+        let json = info_to_json(&info, &features, Some(4096)).expect("info");
+        assert_eq!(
+            json["max_blob_bytes"], 4096,
+            "API-enforced limit must be advertised when Blossom is configured"
         );
     }
 

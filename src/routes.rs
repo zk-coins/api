@@ -2,10 +2,13 @@
 //!
 //! Route registration and the `GET /` discovery document share one source:
 //! [`ServedSurface`]. The closed §7.5 inventory ([`CLOSED_ENDPOINT_KEYS`]) is
-//! the full key catalogue; only keys in the **active** surface set — derived
-//! from `Config::features` and Blossom store configuration — are registered
-//! and advertised. A disabled feature is not served (`404`) and is omitted
-//! from `GET /` (§7.5 / §6.1 fail-closed gating).
+//! the full key catalogue. **Active** surfaces (from `Config::features` and
+//! Blossom store configuration) get real handlers and appear on `GET /`.
+//! **Known but inactive** feature-gated surfaces still register a stub that
+//! answers `404 feature_disabled` with the §7.5 JSON body — they are omitted
+//! from discovery (§7.5 / §6.1 fail-closed gating). **Unconfigured** Blossom
+//! (no store) is left unregistered (bare axum 404), not a feature stub. Paths
+//! outside the inventory remain a bare axum 404.
 //!
 //! Inventory paths are the **advertised** §7.5 form (`<name>` placeholders).
 //! Axum registration uses a derived **matcher** form (`:name`); see
@@ -16,6 +19,7 @@ use crate::blossom;
 use crate::bootstrap;
 use crate::chain;
 use crate::config::{Config, Feature};
+use crate::error::ApiError;
 use crate::grants;
 use crate::info;
 use crate::jobs;
@@ -30,7 +34,25 @@ use axum::routing::{delete, get, head, post, put};
 use axum::{Json, Router};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::sync::Arc;
+
+/// Boot-time failure opening configured resources (e.g. Blossom store root).
+///
+/// Distinct from per-request [`ApiError`]: `main` prints this and exits
+/// without panicking, same as other start errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupError {
+    pub message: String,
+}
+
+impl fmt::Display for StartupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for StartupError {}
 
 /// Closed `endpoints` key set from specification §7.5 (`GET /` row).
 ///
@@ -96,9 +118,9 @@ pub const CLOSED_ENDPOINT_KEYS: &[(&str, &str)] = &[
 ///
 /// Which surfaces are active follows `Config::features` and Blossom store
 /// configuration — never a hard-coded always-on set of role-bound routes.
-/// A request against a disabled feature is **not** served (`404`); `GET /`
-/// omits the corresponding keys. Mapping (from §6.1 feature table + the
-/// §7.5 inventory, mirrored in `docs/rest-surface.md`):
+/// A request against a disabled feature is answered `404 feature_disabled`
+/// (JSON machine code); `GET /` omits the corresponding keys. Mapping (from
+/// §6.1 feature table + the §7.5 inventory, mirrored in `docs/rest-surface.md`):
 ///
 /// | Surfaces | Gate |
 /// |---|---|
@@ -183,8 +205,22 @@ impl ServedSurface {
         ServedSurface::BlossomDelete,
     ];
 
-    /// Whether this surface is registered (and advertised) for the given
-    /// feature set and Blossom store configuration.
+    /// Whether this surface is a Blossom inventory key.
+    fn is_blossom(self) -> bool {
+        matches!(
+            self,
+            ServedSurface::BlossomGet
+                | ServedSurface::BlossomHead
+                | ServedSurface::BlossomUpload
+                | ServedSurface::BlossomDelete
+        )
+    }
+
+    /// Whether this surface is **active** (real handler + discovery key) for
+    /// the given feature set and Blossom store configuration. Inactive
+    /// feature-gated inventory surfaces still mount a `feature_disabled`
+    /// stub; unconfigured Blossom is left unregistered (see
+    /// [`build_router`]).
     fn is_active(self, features: &BTreeSet<Feature>, blossom_configured: bool) -> bool {
         match self {
             // Always-on API process surface (§7.5 L2874–L2877; rest-surface #1–#4).
@@ -326,10 +362,15 @@ impl ServedSurface {
             ServedSurface::BlossomHead => router.route(&path, head(blossom::head_blob)),
             ServedSurface::BlossomDelete => router.route(&path, delete(blossom::delete_blob)),
             ServedSurface::BlossomUpload => {
-                // Disable axum's default 2 MiB body limit so the handler can
-                // enforce the configured max and return the §7.5 machine code.
-                let limit = max_blob_bytes.unwrap_or(0).saturating_add(1);
+                // Cap buffering at the advertised max. Bodies above that are
+                // rejected by LimitedBytes / DefaultBodyLimit as §7.5
+                // `payload_too_large` (including sizes far above max, not only
+                // max+1). The handler still double-checks length.
+                let limit = max_blob_bytes.unwrap_or(0);
                 let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+                // Use at least 1 so DefaultBodyLimit::max(0) is never installed
+                // for a misconfigured path (upload is only active with max>0).
+                let limit = limit.max(1);
                 router.route(
                     &path,
                     put(blossom::upload_blob)
@@ -339,6 +380,56 @@ impl ServedSurface {
             }
         }
     }
+
+    /// Register a known-but-inactive surface as `404 feature_disabled`.
+    ///
+    /// Same methods and path matchers as [`Self::register`], so a disabled
+    /// feature is still *recognised* (not a bare axum 404) while staying
+    /// absent from `GET /` discovery.
+    fn register_disabled(self, router: Router<AppState>) -> Router<AppState> {
+        let path = advertised_path_to_axum_matcher(closed_path(self.discovery_key()));
+        match self {
+            ServedSurface::Health | ServedSurface::HealthReady | ServedSurface::Info => {
+                // Always-on surfaces are never disabled.
+                router
+            }
+            ServedSurface::ChainAccumulator
+            | ServedSurface::ChainInscriptions
+            | ServedSurface::ChainNullifier
+            | ServedSurface::Jobs
+            | ServedSurface::JobsStream
+            | ServedSurface::Record
+            | ServedSurface::Proof
+            | ServedSurface::AccountState
+            | ServedSurface::ReceiptsStream
+            | ServedSurface::BlossomGet => router.route(&path, get(feature_disabled_handler)),
+            ServedSurface::BlossomHead => router.route(&path, head(feature_disabled_handler)),
+            ServedSurface::BlossomDelete => router.route(&path, delete(feature_disabled_handler)),
+            ServedSurface::Tx
+            | ServedSurface::JobsSign
+            | ServedSurface::JobsCancel
+            | ServedSurface::AttestBalanceChallenge
+            | ServedSurface::AttestBalance
+            | ServedSurface::GrantsChallenge
+            | ServedSurface::Grants
+            | ServedSurface::PullChallenge
+            | ServedSurface::Pull
+            | ServedSurface::PublishSpendrecord
+            | ServedSurface::BootstrapChallenge
+            | ServedSurface::BootstrapEntrust
+            | ServedSurface::BootstrapRevoke => router.route(&path, post(feature_disabled_handler)),
+            ServedSurface::BlossomUpload => router.route(
+                &path,
+                put(feature_disabled_handler).post(feature_disabled_handler),
+            ),
+        }
+    }
+}
+
+/// §7.5 / §6.1: known inventory path whose role feature is off for this
+/// deployment. Not used for unconfigured Blossom (those paths stay unregistered).
+async fn feature_disabled_handler() -> ApiError {
+    ApiError::feature_disabled("this endpoint is not enabled on this deployment (feature_disabled)")
 }
 
 /// Look up the canonical **advertised** path for a closed §7.5 key.
@@ -421,10 +512,10 @@ struct RootResponse {
 
 /// Build the axum router for the given configuration and kernel handle.
 ///
-/// Route registration and `GET /` discovery both follow
-/// [`ServedSurface::active`] applied to `config.features` and whether the
-/// Blossom store is configured. `config.features` is also stored in
-/// [`AppState`] for the API-owned `features` array on `GET /v1/info`.
+/// Route registration follows the full inventory: active surfaces get real
+/// handlers; known-but-inactive surfaces get `404 feature_disabled` stubs.
+/// `GET /` discovery lists only the active set. `config.features` is also
+/// stored in [`AppState`] for the API-owned `features` array on `GET /v1/info`.
 ///
 /// Returns a fully state-bound router (`Router` / `Router<()>`). Only that
 /// form implements `tower::Service` and is ready for `axum::serve` and test
@@ -432,11 +523,12 @@ struct RootResponse {
 /// `State<KernelHandle>` (via [`axum::extract::FromRef`]); the concrete
 /// state is supplied once at the end.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if Blossom is configured but the store root cannot be opened —
-/// that is a boot-time misconfiguration, not a per-request failure.
-pub fn build_router(config: Config, kernel: KernelHandle) -> Router {
+/// Returns [`StartupError`] if Blossom is configured but the store root
+/// cannot be opened — boot-time misconfiguration, same fail-closed class as
+/// other start errors in `main` (no panic).
+pub fn build_router(config: Config, kernel: KernelHandle) -> Result<Router, StartupError> {
     let Config {
         bind_addr: _,
         kernel_addr: _,
@@ -446,14 +538,21 @@ pub fn build_router(config: Config, kernel: KernelHandle) -> Router {
     } = config;
 
     let max_blob_bytes = blossom.as_ref().map(|b| b.max_blob_bytes);
-    let blossom_state = blossom.map(|cfg| {
-        blossom::BlossomState::from_config(&cfg).unwrap_or_else(|e| {
-            panic!(
-                "blossom store open failed (boot misconfiguration): {}",
-                e.body.message
-            )
-        })
-    });
+    let blossom_state = match blossom {
+        None => None,
+        Some(cfg) => {
+            let state = blossom::BlossomState::from_config(&cfg).map_err(|e| {
+                let detail = match e.cause() {
+                    Some(c) => c.to_string(),
+                    None => e.body.message.clone(),
+                };
+                StartupError {
+                    message: format!("blossom store open failed: {detail}"),
+                }
+            })?;
+            Some(state)
+        }
+    };
     let blossom_configured = blossom_state.is_some();
 
     let state = AppState {
@@ -465,15 +564,26 @@ pub fn build_router(config: Config, kernel: KernelHandle) -> Router {
         revoked_grants: Arc::new(crate::ownership::RevokedGrantSet::new()),
     };
 
-    // Register every active surface as `Router<AppState>`, then bind state so
-    // the returned tree is `Router<()>` and implements `Service`. Binding
+    // Register every inventory surface as `Router<AppState>`, then bind state
+    // so the returned tree is `Router<()>` and implements `Service`. Binding
     // earlier while still returning `Router<AppState>` leaves the tree
     // "missing" state and breaks both `axum::serve` and `oneshot`.
+    //
+    // Blossom without a configured store is **not** a feature-disabled stub:
+    // the surface simply does not exist on this deployment (bare 404, no
+    // methods registered). When the store *is* configured but wallet/explorer
+    // are off, the path is known-but-inactive → `404 feature_disabled`.
     let mut router = Router::new().route("/", get(root));
-    for surface in ServedSurface::active(&features, blossom_configured) {
-        router = surface.register(router, max_blob_bytes);
+    for surface in ServedSurface::ALL {
+        if surface.is_active(&features, blossom_configured) {
+            router = surface.register(router, max_blob_bytes);
+        } else if surface.is_blossom() && !blossom_configured {
+            // Leave unregistered.
+        } else {
+            router = surface.register_disabled(router);
+        }
     }
-    router.with_state(state)
+    Ok(router.with_state(state))
 }
 
 async fn health() -> Response {
@@ -655,7 +765,7 @@ mod tests {
     }
 
     fn test_app() -> Router {
-        build_router(test_config(), Arc::new(UnreachableKernel))
+        build_router(test_config(), Arc::new(UnreachableKernel)).expect("router")
     }
 
     async fn body_bytes(res: axum::response::Response) -> Vec<u8> {
@@ -1095,7 +1205,7 @@ mod tests {
             list_inscriptions: Some(Ok(Vec::new())),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -1165,7 +1275,7 @@ mod tests {
             public_hosts: vec!["node.example.com".to_string()],
             blossom: None,
         };
-        let app = build_router(cfg, Arc::new(UnreachableKernel));
+        let app = build_router(cfg, Arc::new(UnreachableKernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -1187,7 +1297,8 @@ mod tests {
                 blossom: None,
             },
             Arc::new(UnreachableKernel),
-        );
+        )
+        .expect("router");
         let res = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
@@ -1219,12 +1330,15 @@ mod tests {
 
     /// Without the change: wallet/explorer/publisher routes were always-on,
     /// so a disabled feature still returned a non-404 (kernel error / 405 / …)
-    /// and `GET /` still advertised the key.
+    /// and `GET /` still advertised the key. With the stub, disabled known
+    /// routes answer `404 feature_disabled` (machine code + JSON body), not a
+    /// bare axum 404.
     #[tokio::test]
-    async fn disabled_wallet_surface_is_404_and_absent_from_discovery() {
-        let app = build_router(test_config_no_features(), Arc::new(UnreachableKernel));
+    async fn disabled_wallet_surface_is_404_feature_disabled_and_absent_from_discovery() {
+        let app =
+            build_router(test_config_no_features(), Arc::new(UnreachableKernel)).expect("router");
 
-        // Probe a concrete wallet path — must not match any route.
+        // Probe a concrete wallet path — known inventory, feature off.
         let res = app
             .clone()
             .oneshot(
@@ -1242,6 +1356,37 @@ mod tests {
             StatusCode::NOT_FOUND,
             "disabled wallet surface must not be served"
         );
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(
+            json["error"], "feature_disabled",
+            "disabled known route must carry machine code feature_disabled, got {json}"
+        );
+        assert!(
+            json.get("message").and_then(|m| m.as_str()).is_some(),
+            "§7.5 body must include message, got {json}"
+        );
+
+        // Unknown path (not in inventory) stays a bare framework 404 without
+        // the feature_disabled machine code.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/not-an-inventory-path")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let unknown_body = body_bytes(res).await;
+        if let Ok(j) = serde_json::from_slice::<Value>(&unknown_body) {
+            assert_ne!(
+                j.get("error").and_then(|e| e.as_str()),
+                Some("feature_disabled"),
+                "unknown paths must not claim feature_disabled"
+            );
+        }
 
         let res = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1278,7 +1423,7 @@ mod tests {
             public_hosts: vec!["node.example.com".to_string()],
             blossom: None,
         };
-        let app = build_router(cfg, Arc::new(UnreachableKernel));
+        let app = build_router(cfg, Arc::new(UnreachableKernel)).expect("router");
         let res = app
             .clone()
             .oneshot(
@@ -1293,6 +1438,11 @@ mod tests {
             res.status(),
             StatusCode::NOT_FOUND,
             "disabled explorer surface must not be served"
+        );
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(
+            json["error"], "feature_disabled",
+            "disabled explorer must carry feature_disabled machine code"
         );
 
         let res = app
@@ -1320,7 +1470,7 @@ mod tests {
             public_hosts: vec!["node.example.com".to_string()],
             blossom: None,
         };
-        let app = build_router(cfg, Arc::new(UnreachableKernel));
+        let app = build_router(cfg, Arc::new(UnreachableKernel)).expect("router");
         let res = app
             .clone()
             .oneshot(
@@ -1337,6 +1487,11 @@ mod tests {
             res.status(),
             StatusCode::NOT_FOUND,
             "disabled publisher surface must not be served"
+        );
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(
+            json["error"], "feature_disabled",
+            "disabled publisher must carry feature_disabled machine code"
         );
 
         let res = app
@@ -1775,7 +1930,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -1806,7 +1961,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -1858,7 +2013,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let mut body = mint_body();
         body["extra_unknown"] = Value::String("nope".into());
         let res = app
@@ -1891,7 +2046,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let mut body = mint_body();
         body["issuance"]["foreign_nested"] = Value::Number(1.into());
         let res = app
@@ -1924,7 +2079,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -1944,10 +2099,10 @@ mod tests {
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
         assert_eq!(json["error"], "internal_error");
-        assert!(
-            json["message"].as_str().unwrap_or("").contains("job_id"),
-            "message must name the empty job_id, got {}",
-            json["message"]
+        assert_eq!(
+            json["message"],
+            crate::error::PUBLIC_INTERNAL_MESSAGE,
+            "public internal_error message must be neutral"
         );
     }
 
@@ -1961,7 +2116,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -1981,14 +2136,10 @@ mod tests {
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
         assert_eq!(json["error"], "internal_error");
-        assert!(
-            json["message"].as_str().unwrap_or("").contains("accepted")
-                || json["message"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("totally_unknown_phase"),
-            "message must name the status contract, got {}",
-            json["message"]
+        assert_eq!(
+            json["message"],
+            crate::error::PUBLIC_INTERNAL_MESSAGE,
+            "public internal_error message must be neutral"
         );
     }
 
@@ -2002,7 +2153,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -2027,7 +2178,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let mut body = mint_body();
         body["fee_address"] = Value::String("zk1fee".into());
         let res = app
@@ -2064,7 +2215,7 @@ mod tests {
             submit: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -2123,7 +2274,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -2168,7 +2319,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let mut body = mint_body();
         body["output_templates"][0]["delivery"] = serde_json::json!({
             "type": "carrier_pigeon",
@@ -2205,7 +2356,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let mut body = mint_body_with_invoice_delivery();
         body["output_templates"][0]["delivery"]["invoice"]["ghost"] = Value::Bool(true);
         let res = app
@@ -2235,7 +2386,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let mut body = mint_body_with_invoice_delivery();
         body["output_templates"][0]["delivery"]["invoice"]
             .as_object_mut()
@@ -2274,7 +2425,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let mut body = mint_body_with_invoice_delivery();
         // Wrong width — triggers decode_hex_field form error after parse.
         let bad_pk0 = "ab".repeat(20); // 40 chars
@@ -2315,7 +2466,7 @@ mod tests {
             get: Some(Ok(accepted_job("job-2"))),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -2348,7 +2499,7 @@ mod tests {
             get: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -2376,7 +2527,7 @@ mod tests {
             sign: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let body = serde_json::json!({
             "signature": crate::hexutil::encode_hex(&[0u8; 64]),
             "s2c_nonce": hex32(0xab),
@@ -2405,7 +2556,7 @@ mod tests {
             sign: Some(Ok(job)),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let body = serde_json::json!({
             "signature": crate::hexutil::encode_hex(&[1u8; 64]),
             "s2c_nonce": hex32(0xcd),
@@ -2439,7 +2590,7 @@ mod tests {
             cancel: Some(Ok(job)),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -2495,7 +2646,7 @@ mod tests {
             stream: Some(Ok(vec![Ok(phase), Ok(complete)])),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -2542,7 +2693,7 @@ mod tests {
             stream: Some(Ok(vec![Err(ApiError::internal("kernel stream dropped"))])),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -2563,8 +2714,12 @@ mod tests {
             "error event must carry machine code, body={body}"
         );
         assert!(
-            body.contains("kernel stream dropped"),
-            "error event must carry the cause message, body={body}"
+            body.contains(crate::error::PUBLIC_INTERNAL_MESSAGE),
+            "error event must carry the public internal message, body={body}"
+        );
+        assert!(
+            !body.contains("kernel stream dropped"),
+            "error event must not leak the operator cause, body={body}"
         );
     }
 
@@ -2576,7 +2731,7 @@ mod tests {
             stream: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -2610,7 +2765,7 @@ mod tests {
             public_hosts: vec!["node.example.com".to_string()],
             blossom: None,
         };
-        let app = build_router(cfg, Arc::new(kernel));
+        let app = build_router(cfg, Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -2651,7 +2806,7 @@ mod tests {
             info: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -2680,7 +2835,7 @@ mod tests {
             info: Some(Ok(sample_info(true, None))),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -2711,7 +2866,7 @@ mod tests {
             info: Some(Ok(sample_info(false, Some("syncing")))),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -2743,7 +2898,7 @@ mod tests {
             info: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -2779,7 +2934,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -2815,7 +2970,7 @@ mod tests {
             accumulator: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -2853,7 +3008,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let pk = hex32(0xaa);
         let res = app
             .oneshot(
@@ -2892,7 +3047,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let pk = hex32(0xbb);
         let res = app
             .oneshot(
@@ -2936,7 +3091,7 @@ mod tests {
             nullifier_path: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let pk = hex32(0xcc);
         let res = app
             .oneshot(
@@ -2982,7 +3137,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -3096,7 +3251,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let body = serde_json::json!({
             "subject": subject_bech,
             "asset_id": encode_hex(&asset),
@@ -3123,6 +3278,63 @@ mod tests {
         assert_eq!(kernel.attest_calls.load(Ordering::SeqCst), 1);
     }
 
+    /// Without the status gate, any non-empty job_id would be admitted as 202
+    /// even when JobHandle.status is not `"accepted"`.
+    #[tokio::test]
+    async fn attest_balance_non_accepted_status_is_500() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x11u8; 32];
+        let expiry = 1_700_000_060u64;
+        let asset = [0x22u8; 32];
+        let ceiling_enc = ceiling_encoding(None, None).unwrap();
+        let request_hash = attest_request_hash(&subject_raw, &asset, &ceiling_enc);
+        let cb = chan_bind_for_host(host);
+        let chal = ownership_challenge_message(
+            ChallengeDomain::AttestBalance.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+            &request_hash,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+
+        let kernel = Arc::new(ScriptedKernel {
+            attest: Some(Ok(JobHandle {
+                job_id: "attest-job-bad".into(),
+                status: "proving".into(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone()).expect("router");
+        let body = serde_json::json!({
+            "subject": subject_bech,
+            "asset_id": encode_hex(&asset),
+            "challenge": {
+                "nonce": encode_hex(&nonce),
+                "expiry": expiry.to_string(),
+            },
+            "ownership_proof": ownership_proof_json(&subject_bech, &pk0, &nkc, &sig),
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/attest/balance")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
+        assert_eq!(kernel.attest_calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn attest_balance_bad_signature_does_not_call_kernel() {
         let host = "node.example.com";
@@ -3139,7 +3351,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let body = serde_json::json!({
             "subject": subject_bech,
             "asset_id": encode_hex(&asset),
@@ -3207,7 +3419,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let body = serde_json::json!({
             "subject": subject_bech,
             "grantee_pk": encode_hex(&grantee),
@@ -3268,7 +3480,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let body = serde_json::json!({
             "subject": subject_bech,
             "asset_id": encode_hex(&asset),
@@ -3321,7 +3533,7 @@ mod tests {
             ..Default::default()
         });
         // test_config serves node.example.com — signature bound to other host.
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let body = serde_json::json!({
             "subject": subject_bech,
             "asset_id": encode_hex(&asset),
@@ -3374,7 +3586,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let body = serde_json::json!({
             "subject": subject_bech,
             "asset_id": encode_hex(&asset_presented),
@@ -3430,7 +3642,7 @@ mod tests {
             attest: Some(Err(crate::kernel::kernel_status_to_api_error(&expired))),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let body = serde_json::json!({
             "subject": subject_bech,
             "asset_id": encode_hex(&asset),
@@ -3470,7 +3682,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let body = serde_json::json!({
             "subject": subject_bech,
             "asset_id": encode_hex(&[0u8; 32]),
@@ -3539,7 +3751,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let body = serde_json::json!({
             "subject": subject_bech,
             "grantee_pk": encode_hex(&grantee),
@@ -3579,7 +3791,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -3608,7 +3820,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel2);
+        let app = build_router(test_config(), kernel2).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -3680,7 +3892,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -3722,7 +3934,7 @@ mod tests {
             pull: Some(Ok(sample_pull_result())),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -3815,7 +4027,7 @@ mod tests {
             ..Default::default()
         });
         // build_router installs an empty subject_ops — subject has no published op.
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let body = serde_json::json!({
             "nonce": encode_hex(&[0x11u8; 32]),
             "expiry": "1700000060",
@@ -4014,7 +4226,7 @@ mod tests {
             pull: Some(Ok(sample_pull_result())),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let asset = [0xABu8; 32];
         let mut body = pull_body_ownership(&subject_bech, &pk0, &nkc, &nonce, expiry, &sig);
         body["scope"] = serde_json::json!({
@@ -4052,7 +4264,7 @@ mod tests {
             pull: Some(Ok(sample_pull_result())),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4093,7 +4305,7 @@ mod tests {
             pull: Some(Ok(sample_pull_result())),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4132,7 +4344,7 @@ mod tests {
             pull: Some(Ok(sample_pull_result())),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4171,7 +4383,7 @@ mod tests {
             pull: Some(Ok(sample_pull_result())),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4216,7 +4428,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4232,7 +4444,7 @@ mod tests {
         assert_eq!(kernel.get_record_calls.load(Ordering::SeqCst), 0);
 
         // Same split on ownership-only account/state.
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4256,7 +4468,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4286,7 +4498,7 @@ mod tests {
             get_record: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4316,7 +4528,7 @@ mod tests {
             get_account_state: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4354,7 +4566,7 @@ mod tests {
             pull: Some(Ok(result)),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel);
+        let app = build_router(test_config(), kernel).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4369,12 +4581,16 @@ mod tests {
             )
             .await
             .unwrap();
+        // Kernel closed-set violation → 500 internal_error. Public message is
+        // always the neutral PUBLIC_INTERNAL_MESSAGE; the field name lives in
+        // the operator cause / logs only (same contract as get_job_unknown_status).
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
         assert_eq!(json["error"], "internal_error");
+        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
         assert!(
-            json["message"].as_str().unwrap().contains("record_type"),
-            "message must name record_type: {}",
+            !json["message"].as_str().unwrap().contains("record_type"),
+            "public wire must not leak kernel field diagnostics: {}",
             json["message"]
         );
     }
@@ -4401,7 +4617,7 @@ mod tests {
             pull: Some(Ok(result)),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel);
+        let app = build_router(test_config(), kernel).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4416,15 +4632,17 @@ mod tests {
             )
             .await
             .unwrap();
+        // Same contract as unknown record_type: 500 + neutral public message.
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
         assert_eq!(json["error"], "internal_error");
+        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
         assert!(
-            json["message"]
+            !json["message"]
                 .as_str()
                 .unwrap()
                 .contains("transition_kind"),
-            "message must name transition_kind: {}",
+            "public wire must not leak kernel field diagnostics: {}",
             json["message"]
         );
     }
@@ -4439,7 +4657,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel);
+        let app = build_router(test_config(), kernel).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4475,7 +4693,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel);
+        let app = build_router(test_config(), kernel).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4513,7 +4731,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel);
+        let app = build_router(test_config(), kernel).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4556,7 +4774,7 @@ mod tests {
             subscribe_receipts: Some(Ok(vec![Ok(r1.clone()), Ok(r2.clone())])),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4660,7 +4878,7 @@ mod tests {
             ))),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
 
         let res = app
             .clone()
@@ -4711,7 +4929,7 @@ mod tests {
             subscribe_receipts: Some(Ok(vec![Ok(sample_receipt(0x01, "1", 1))])),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4737,7 +4955,7 @@ mod tests {
             subscribe_receipts: Some(Ok(vec![Ok(sample_receipt(0x01, "1", 1))])),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4769,7 +4987,7 @@ mod tests {
             subscribe_receipts: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4813,7 +5031,7 @@ mod tests {
             subscribe_receipts: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4849,7 +5067,7 @@ mod tests {
             subscribe_receipts: Some(Ok(vec![Ok(r)])),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4884,7 +5102,7 @@ mod tests {
             subscribe_receipts_hang: true,
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4961,7 +5179,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -4996,7 +5214,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel2.clone());
+        let app = build_router(test_config(), kernel2.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -5050,7 +5268,7 @@ mod tests {
             revoke: Some(Ok(RevokeResult { revoked: true })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -5098,7 +5316,7 @@ mod tests {
             entrust: Some(Ok(EntrustResult { accepted: true })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let bundle = sample_bundle_hex();
         let res = app
             .oneshot(
@@ -5149,7 +5367,7 @@ mod tests {
         });
         let short_hex = "01".to_string() + &"00".repeat(159);
         assert_eq!(short_hex.len(), 320);
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -5186,7 +5404,7 @@ mod tests {
         // 162 bytes → 400, no kernel.
         let long_hex = "01".to_string() + &"00".repeat(161);
         assert_eq!(long_hex.len(), 324);
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -5215,7 +5433,7 @@ mod tests {
         // 161 bytes → forwarded.
         let ok_hex = sample_bundle_hex();
         assert_eq!(ok_hex.len(), OPERATIONAL_BUNDLE_HEX_CHARS);
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -5277,7 +5495,7 @@ mod tests {
             entrust: Some(Ok(EntrustResult { accepted: true })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -5332,7 +5550,7 @@ mod tests {
             revoke: Some(Ok(RevokeResult { revoked: true })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -5371,7 +5589,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let body = serde_json::json!({
             "public_key": hex32(0x11),
             "r": hex32(0x22),
@@ -5416,7 +5634,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel);
+        let app = build_router(test_config(), kernel).expect("router");
         let body = serde_json::json!({
             "public_key": hex32(0x11),
             "r": hex32(0x22),
@@ -5455,7 +5673,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let body = serde_json::json!({
             "public_key": hex32(0x11),
             "r": hex32(0x22),
@@ -5490,8 +5708,9 @@ mod tests {
 
     #[tokio::test]
     async fn unconfigured_blossom_surfaces_remain_404_and_absent_from_discovery() {
-        // test_config has blossom: None — Blossom must stay off the map.
-        // receipts_stream is always-on and must be registered (auth fails closed).
+        // test_config has blossom: None — Blossom must stay completely off the
+        // map: unregistered (bare axum 404, not 404 feature_disabled) and
+        // absent from discovery. receipts_stream is always-on (auth fails closed).
         let app = test_app();
         for path in [
             "/blossom/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -5507,6 +5726,15 @@ mod tests {
                 StatusCode::NOT_FOUND,
                 "unconfigured Blossom surface {path} must not be registered"
             );
+            // Bare axum 404 has no §7.5 JSON body claiming feature_disabled.
+            let bytes = body_bytes(res).await;
+            if let Ok(json) = serde_json::from_slice::<Value>(&bytes) {
+                assert_ne!(
+                    json.get("error").and_then(|e| e.as_str()),
+                    Some("feature_disabled"),
+                    "unconfigured Blossom must be bare 404, not feature_disabled: {json}"
+                );
+            }
         }
         // Always-on receipts stream is registered: missing bearer → 401, not 404.
         let res = app
@@ -5594,7 +5822,7 @@ mod tests {
             )])),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -5629,7 +5857,7 @@ mod tests {
             list_inscriptions: Some(Ok(catalog)),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
 
         // Page 1
         let res = app
@@ -5717,7 +5945,7 @@ mod tests {
             list_inscriptions: Some(Ok(Vec::new())),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -5743,7 +5971,7 @@ mod tests {
             list_inscriptions: Some(Ok(Vec::new())),
             ..Default::default()
         };
-        let app = build_router(test_config(), Arc::new(kernel));
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -5764,7 +5992,7 @@ mod tests {
             list_inscriptions: Some(Ok(Vec::new())),
             ..Default::default()
         });
-        let app = build_router(test_config(), kernel.clone());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
         let res = app
             .oneshot(
                 Request::builder()
@@ -5817,7 +6045,42 @@ mod tests {
                 allowed_upload_ops: ops,
             }),
         };
-        build_router(cfg, Arc::new(UnreachableKernel))
+        build_router(cfg, Arc::new(UnreachableKernel)).expect("router")
+    }
+
+    /// Boot must not panic when the Blossom store root cannot be opened —
+    /// same fail-closed class as other start errors.
+    #[test]
+    fn build_router_blossom_open_failure_is_startup_error_not_panic() {
+        let cfg = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            kernel_addr: "http://127.0.0.1:50051".to_string(),
+            features: BTreeSet::from([Feature::Explorer]),
+            public_hosts: vec!["node.example.com".to_string()],
+            blossom: Some(crate::config::BlossomConfig {
+                // Regular file path cannot be a store root directory.
+                store_root: std::env::temp_dir().join(format!(
+                    "zkcoins-not-a-dir-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                )),
+                max_blob_bytes: 1024,
+                allowed_upload_ops: BTreeSet::new(),
+            }),
+        };
+        // Create a *file* at store_root so open fails "not a directory".
+        let path = cfg.blossom.as_ref().unwrap().store_root.clone();
+        std::fs::write(&path, b"not-a-directory").unwrap();
+        let err = build_router(cfg, Arc::new(UnreachableKernel)).expect_err("must not panic");
+        assert!(
+            err.message.contains("blossom store"),
+            "startup error must name blossom store: {}",
+            err.message
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     fn blossom_sk_pk() -> (bitcoin::secp256k1::SecretKey, [u8; 32]) {
@@ -6051,6 +6314,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Bodies far above the limit (not only max+1) must still answer with the
+    /// §7.5 JSON `payload_too_large` body — not axum's plain-text 413.
+    #[tokio::test]
+    async fn blossom_upload_rejects_far_oversize_with_413_json() {
+        let root = blossom_temp_root("far-oversize");
+        let (sk, pk) = blossom_sk_pk();
+        let mut ops = BTreeSet::new();
+        ops.insert(pk);
+        let max = 16u64;
+        let app = blossom_app(root.clone(), max, ops);
+        // Several times the limit so DefaultBodyLimit trips well past max+1.
+        let body = vec![0xabu8; (max as usize) * 64];
+        let x = crate::blossom::blob_id_of(&body);
+        let auth = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Upload, &x);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/blossom/upload")
+                    .header("content-type", "application/octet-stream")
+                    .header("authorization", &auth)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = body_bytes(res).await;
+        let json: Value = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            panic!(
+                "far-oversize must return §7.5 JSON, not plain text: {e}; body={:?}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        assert_eq!(json["error"], "payload_too_large");
+        assert!(json.get("message").is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Non-tx JSON handlers must also map bad content-type to §7.5 JSON
+    /// (not axum's default 415/422 body).
+    #[tokio::test]
+    async fn post_sign_missing_json_content_type_is_malformed_request() {
+        let kernel = ScriptedKernel {
+            sign: Some(Ok(accepted_job("job-ct"))),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/job-ct/sign")
+                    .body(Body::from(r#"{"signature":"aa","s2c_nonce":"bb"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+    }
+
+    /// Unknown job status from the kernel is fail-closed 500 (not forwarded
+    /// as a non-terminal poll with Retry-After).
+    #[tokio::test]
+    async fn get_job_unknown_status_is_500_internal() {
+        let kernel = ScriptedKernel {
+            get: Some(Ok({
+                let mut j = accepted_job("j-bad");
+                j.status = "not_a_status".into();
+                j
+            })),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/jobs/j-bad")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
+    }
+
     #[tokio::test]
     async fn blossom_upload_rejects_json_content_type_with_415() {
         let root = blossom_temp_root("jsonct");
@@ -6251,8 +6605,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Incomplete pair (blob without uploader note) is not a durable object.
+    ///
+    /// Store recovery on open removes orphans; `exists`/`read`/`size` require
+    /// a complete pair. DELETE therefore answers `404 not_found` (same as GET
+    /// for that address) — not `403 scope_exceeded`. Advertising 403 would
+    /// claim the incomplete orphan is a first-class object while GET returns
+    /// 404 for the same id.
     #[tokio::test]
-    async fn blossom_delete_without_uploader_note_is_403() {
+    async fn blossom_delete_without_uploader_note_is_404() {
         let root = blossom_temp_root("delnonote");
         let (sk, pk) = blossom_sk_pk();
         let mut ops = BTreeSet::new();
@@ -6262,7 +6623,10 @@ mod tests {
         let id = store.put(body, &pk).unwrap();
         std::fs::remove_file(root.join(format!("{}.uploader", crate::hexutil::encode_hex(&id))))
             .unwrap();
+        drop(store);
 
+        // blossom_app opens the store again → recover_incomplete_pairs clears
+        // the orphan before any request runs.
         let app = blossom_app(root.clone(), 1024, ops);
         let auth_del = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Delete, &id);
         let res = app
@@ -6276,14 +6640,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
-        assert_eq!(json["error"], "scope_exceeded");
-        assert!(
-            json["message"].as_str().unwrap().contains("uploader note"),
-            "{}",
-            json["message"]
-        );
+        assert_eq!(json["error"], "not_found");
         let _ = std::fs::remove_dir_all(&root);
     }
 

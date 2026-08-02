@@ -658,10 +658,11 @@ mod tests {
         };
         let err = accumulator_to_json(&tip).expect_err("bad root");
         assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
         assert!(
-            err.body.message.contains("root"),
-            "message must name the field, got {}",
-            err.body.message
+            err.cause().unwrap_or("").contains("root"),
+            "operator cause must name the field, got {:?}",
+            err.cause()
         );
     }
 
@@ -692,10 +693,11 @@ mod tests {
         let ins = sample_inscription(1, 0, 0, "failed", vec![sample_nullifier("pending")]);
         let err = inscription_to_json(&ins).expect_err("failed confirmation");
         assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
         assert!(
-            err.body.message.contains("confirmation_state"),
-            "message must name confirmation_state, got {}",
-            err.body.message
+            err.cause().unwrap_or("").contains("confirmation_state"),
+            "operator cause must name confirmation_state, got {:?}",
+            err.cause()
         );
     }
 
@@ -1088,13 +1090,14 @@ mod tests {
         .await
         .expect_err("reversed triples must fail closed");
         assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
+        let cause = err.cause().unwrap_or("");
         assert!(
-            err.body.message.contains("strictly increasing")
-                && err.body.message.contains("height")
-                && err.body.message.contains("tx_index")
-                && err.body.message.contains("vin_index"),
-            "message must name the triple-order contract, got {}",
-            err.body.message
+            cause.contains("strictly increasing")
+                && cause.contains("height")
+                && cause.contains("tx_index")
+                && cause.contains("vin_index"),
+            "operator cause must name the triple-order contract, got {cause}"
         );
     }
 

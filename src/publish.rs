@@ -21,6 +21,7 @@
 //! HTTP 200.
 
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::hexutil::decode_hex_exact;
 use crate::kernel::kernel_v1::{BlockAnchor, PublishRequest, PublishResult};
 use crate::ownership::parse_u64_decimal;
@@ -89,7 +90,7 @@ pub struct PublishSpendRecordBody {
 /// `POST /v1/publish/spendrecord` → `Publish`.
 pub async fn post_publish_spendrecord(
     State(state): State<AppState>,
-    Json(body): Json<PublishSpendRecordBody>,
+    JsonBody(body): JsonBody<PublishSpendRecordBody>,
 ) -> Result<Response, ApiError> {
     // v1 fee fields are fail-closed: any set field is malformed, never ignored.
     if body.fee_blob_id.is_some() || body.fee_blob_locators.is_some() || body.fee_epk.is_some() {

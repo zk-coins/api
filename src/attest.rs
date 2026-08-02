@@ -9,6 +9,7 @@
 //! already-authenticated subject plus `nonce` / `chan_bind`.
 
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::hexutil::{decode_hex_exact, encode_hex};
 use crate::kernel::kernel_v1::{AttestRequest, JobHandle, PullChallengeRequest};
 use crate::ownership::{
@@ -53,7 +54,7 @@ pub struct AttestBalanceBody {
 /// `POST /v1/attest/balance/challenge` → OpenPullChallenge(action=attest_balance).
 pub async fn post_attest_balance_challenge(
     State(state): State<AppState>,
-    Json(body): Json<AttestChallengeBody>,
+    JsonBody(body): JsonBody<AttestChallengeBody>,
 ) -> Result<Response, ApiError> {
     if body.subject.is_empty() {
         return Err(ApiError::malformed("subject is required"));
@@ -99,7 +100,7 @@ pub async fn post_attest_balance_challenge(
 /// cannot consume the single-use challenge nonce.
 pub async fn post_attest_balance(
     State(state): State<AppState>,
-    Json(body): Json<AttestBalanceBody>,
+    JsonBody(body): JsonBody<AttestBalanceBody>,
 ) -> Result<Response, ApiError> {
     // ---- pure validation + OwnershipProof (no kernel) ----
     let nav_ceiling = match &body.nav_ceiling {
@@ -168,10 +169,18 @@ pub async fn post_attest_balance(
         .await?;
 
     // §7.5 L2894: `202 { job_id }` — no status field on this admit response.
+    // JobHandle.status must still be the admit terminal `"accepted"` (same
+    // contract as POST /v1/tx); any other value is a kernel protocol fault.
     if handle.job_id.is_empty() {
         return Err(ApiError::internal(
             "kernel JobHandle.job_id is empty on AttestBalance success",
         ));
+    }
+    if handle.status != "accepted" {
+        return Err(ApiError::internal(format!(
+            "kernel JobHandle.status must be \"accepted\" on AttestBalance success, got {:?}",
+            handle.status
+        )));
     }
     let body = json!({ "job_id": handle.job_id });
     Ok((StatusCode::ACCEPTED, Json(body)).into_response())

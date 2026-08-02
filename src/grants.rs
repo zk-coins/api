@@ -9,6 +9,7 @@
 //! capability field — only the API edge can enforce this.
 
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::hexutil::{decode_hex_exact, encode_hex};
 use crate::kernel::kernel_v1::{GrantRequest, PullChallengeRequest, Scope};
 use crate::ownership::{
@@ -136,7 +137,7 @@ fn scope_to_proto(scope: &NormalisedScope) -> Scope {
 /// `POST /v1/grants/challenge` → OpenPullChallenge(action=issue_grant).
 pub async fn post_grants_challenge(
     State(state): State<AppState>,
-    Json(body): Json<GrantsChallengeBody>,
+    JsonBody(body): JsonBody<GrantsChallengeBody>,
 ) -> Result<Response, ApiError> {
     if body.subject.is_empty() {
         return Err(ApiError::malformed("subject is required"));
@@ -176,7 +177,7 @@ pub async fn post_grants_challenge(
 /// `POST /v1/grants` → verify OwnershipProof, then IssueViewGrant.
 pub async fn post_grants(
     State(state): State<AppState>,
-    Json(body): Json<IssueGrantBody>,
+    JsonBody(body): JsonBody<IssueGrantBody>,
 ) -> Result<Response, ApiError> {
     // ---- pure validation + OwnershipProof (no kernel) ----
     let subject_raw = decode_zk_address(&body.subject)?;
