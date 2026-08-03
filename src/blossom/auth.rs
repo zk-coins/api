@@ -5,6 +5,9 @@
 //! verifier never reads the system clock itself).
 //!
 //! Wire form: `Authorization: Nostr <base64(event JSON)>`.
+//!
+//! Data permanence (Requirement 12): only **upload** authorization is
+//! defined. There is no `t=delete` action and no DELETE route.
 
 use crate::blossom::base64;
 use crate::error::ApiError;
@@ -20,23 +23,20 @@ pub const REPLAY_WINDOW_SECS: u64 = 300;
 /// Clock-skew allowance: `created_at ≤ now + CLOCK_SKEW_SECS`.
 pub const CLOCK_SKEW_SECS: u64 = 60;
 
-/// Nostr event kind for Blossom upload/delete authorization.
+/// Nostr event kind for Blossom upload authorization.
 pub const BLOSSOM_AUTH_KIND: u64 = 24242;
 
 /// Action tag value for PUT/POST upload.
 pub const TAG_T_UPLOAD: &str = "upload";
-
-/// Action tag value for DELETE.
-pub const TAG_T_DELETE: &str = "delete";
 
 /// Decoded and cryptographically verified kind-24242 event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedAuthEvent {
     /// `op` x-only public key (32 bytes) that signed the event.
     pub op_pubkey: [u8; 32],
-    /// `t` tag: `"upload"` or `"delete"`.
+    /// `t` tag: always `"upload"` for v1 (data permanence — no delete).
     pub action: AuthAction,
-    /// `x` tag: body hash (upload) or target blob id (delete).
+    /// `x` tag: body hash of the upload.
     pub x_tag: [u8; 32],
     /// Parsed `expiration` tag (unix seconds).
     pub expiration: u64,
@@ -49,14 +49,12 @@ pub struct VerifiedAuthEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthAction {
     Upload,
-    Delete,
 }
 
 impl AuthAction {
     pub const fn as_str(self) -> &'static str {
         match self {
             AuthAction::Upload => TAG_T_UPLOAD,
-            AuthAction::Delete => TAG_T_DELETE,
         }
     }
 }
@@ -65,14 +63,12 @@ impl AuthAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequiredAction {
     Upload,
-    Delete,
 }
 
 impl RequiredAction {
     pub const fn as_action(self) -> AuthAction {
         match self {
             RequiredAction::Upload => AuthAction::Upload,
-            RequiredAction::Delete => AuthAction::Delete,
         }
     }
 }
@@ -94,10 +90,9 @@ struct WireEvent {
 /// # Arguments
 ///
 /// * `authorization_header` — full `Authorization` header value
-/// * `required` — method-selected action (`upload` vs `delete`); never from body
-/// * `x_expected` — for upload: `H(actual body)`; for delete: path `blob_id`.
-///   The `x` tag is checked **against this value**, not against any header
-///   claim — that is the whole authorization hinge.
+/// * `required` — method-selected action (upload only under data permanence)
+/// * `x_expected` — `H(actual body)`. The `x` tag is checked **against this
+///   value**, not against any header claim — that is the whole authorization hinge.
 /// * `now_unix` — injected clock (seconds since epoch)
 ///
 /// # Status codes (§7.4)
@@ -246,10 +241,9 @@ fn require_t_tag(tags: &[Vec<String>]) -> Result<AuthAction, ApiError> {
             .ok_or_else(|| ApiError::unauthorized("auth event t tag is missing its value"))?;
         let action = match value {
             TAG_T_UPLOAD => AuthAction::Upload,
-            TAG_T_DELETE => AuthAction::Delete,
             other => {
                 return Err(ApiError::unauthorized(format!(
-                    "auth event t tag must be \"upload\" or \"delete\", got {other:?}"
+                    "auth event t tag must be \"upload\", got {other:?}"
                 )));
             }
         };
@@ -450,18 +444,44 @@ mod tests {
     }
 
     #[test]
-    fn wrong_t_tag_is_401() {
+    fn delete_t_tag_is_401() {
+        // Data permanence: t=delete is not a valid auth action.
         let (sk, pk) = sample_sk_pk();
         let x = [0x11u8; 32];
         let now = 1_700_000_000u64;
-        // Sign as delete, present as upload requirement.
-        let b64 = sign_auth_event_base64(&sk, &pk, AuthAction::Delete, &x, now, now + 60);
+        // Build a valid-looking event with t=delete by signing a custom tag set.
+        use crate::hexutil::encode_hex;
+        use bitcoin::secp256k1::{Keypair, Message, Secp256k1};
+        let pubkey_hex = encode_hex(&pk);
+        let tags = vec![
+            vec!["t".to_string(), "delete".to_string()],
+            vec!["x".to_string(), encode_hex(&x)],
+            vec!["expiration".to_string(), (now + 60).to_string()],
+        ];
+        let content = String::new();
+        let id = compute_event_id(&pubkey_hex, now, BLOSSOM_AUTH_KIND, &tags, &content).unwrap();
+        let secp = Secp256k1::new();
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        let msg = Message::from_digest_slice(&id).unwrap();
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp);
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes.copy_from_slice(sig.as_ref());
+        let event = serde_json::json!({
+            "id": encode_hex(&id),
+            "pubkey": pubkey_hex,
+            "created_at": now,
+            "kind": BLOSSOM_AUTH_KIND,
+            "tags": tags,
+            "content": content,
+            "sig": encode_hex(&sig_bytes),
+        });
+        let b64 = base64::encode(event.to_string().as_bytes());
         let err = verify_blossom_auth(&format!("Nostr {b64}"), RequiredAction::Upload, &x, now)
-            .expect_err("t mismatch");
+            .expect_err("delete t must fail");
         assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
         assert_eq!(err.body.error, "unauthorized");
         assert!(
-            err.body.message.contains("t tag"),
+            err.body.message.contains("t tag") || err.body.message.contains("upload"),
             "cause must name t tag: {}",
             err.body.message
         );

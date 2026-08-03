@@ -13,7 +13,7 @@ Bestandsaufnahme (Worktree `zk-coins/docs-vectors`).
 | Menge | Werte | Fundstelle |
 |---|---|---|
 | API-`features` | `{wallet, explorer, publisher, lightning_bridge, mail_bridge}` | §6.1 L2322, L2333–L2341; §7.5 `/v1/info` L2877 |
-| `GET /` · `endpoints`-Schlüssel | siehe Tabelle unten (29 geschlossene Keys) | §7.5 L2874 |
+| `GET /` · `endpoints`-Schlüssel | siehe Tabelle unten (28 geschlossene Keys) | §7.5; Data Permanence (kein `blossom_delete`) |
 | Kernel-Prozeduren | siehe §7.8-Tabelle | §7.8 L3138–L3159 |
 
 **Feature-Semantik (§6.1):** Jedes Feature ist **off**, bis der Operator es einschaltet.
@@ -66,13 +66,16 @@ eigenes `Kernel`-RPC-Verb in der Procedure-Tabelle).
 | 26 | `POST` | `/v1/bootstrap/revoke` | **Ja** — OwnershipProof (Revoke-Domain) | `wallet` | `RevokeOperationalBundle` | §7.7 L3120; §7.8 L3157; Feature §6.1 L2337 |
 | 27 | `GET` | `/blossom/<sha256>` | Nein (Ciphertext) | `explorer` (blob fetch) | Blossom-Ebene / Kernel-Store — **kein** eigenes Kernel-RPC-Verb (§7.8 L3490) | §7.4 L2804; Feature §6.1 L2338; `endpoints`-Key §7.5 L2874 |
 | 28 | `HEAD` | `/blossom/<sha256>` | Nein | `explorer` (blob fetch) | Blossom-Ebene / Kernel-Store | §7.4 L2805; Feature §6.1 L2338; Key §7.5 L2874 |
-| 29 | `PUT` | `/blossom/upload` | **Ja** — Nostr kind-`24242` Auth-Event | `explorer` / `wallet` (Replica-Upload) | Blossom-Ebene / Kernel-Store | §7.4 L2806, L2821–L2827; Keys §7.5 L2874 |
-| 30 | `POST` | `/blossom/upload` | **Ja** — Nostr kind-`24242` Auth-Event | `explorer` / `wallet` (Replica-Upload) | Blossom-Ebene / Kernel-Store (äquivalent zu PUT) | §7.4 L2806, L2809; Keys §7.5 L2874 |
-| 31 | `DELETE` | `/blossom/<sha256>` | **Ja** — Nostr kind-`24242` Auth-Event (Original-Uploader) | `explorer` / `wallet` | Blossom-Ebene / Kernel-Store | §7.4 L2807, L2821–L2827; Keys §7.5 L2874 |
+| 29 | `PUT` | `/blossom/upload` | **Ja** — Nostr kind-`24242` Auth-Event | `explorer` / `wallet` | Blossom-Ebene / Kernel-Store | §7.4; Keys §7.5; Data Permanence (append-only, Antwort `{ blob_id }`) |
+| 30 | `POST` | `/blossom/upload` | **Ja** — Nostr kind-`24242` Auth-Event | `explorer` / `wallet` | Blossom-Ebene / Kernel-Store (äquivalent zu PUT) | §7.4; Keys §7.5 |
 
-### Geschlossene `endpoints`-Schlüssel von `GET /` (§7.5 L2874)
+**Kein** `DELETE /blossom/<sha256>` — Data Permanence (Requirement 12): der Blob-Store
+ist append-only; empfangene Daten werden nie gelöscht. `ReplicaReceiptV1` / §4.6
+Dual-Commit und `retention_hold` entfallen mit der Spec.
 
-Genau diese 29 Keys — wörtlich, vollständig:
+### Geschlossene `endpoints`-Schlüssel von `GET /` (§7.5)
+
+Genau diese 28 Keys — wörtlich, vollständig:
 
 | Key | Typischer Pfad |
 |---|---|
@@ -104,9 +107,8 @@ Genau diese 29 Keys — wörtlich, vollständig:
 | `blossom_get` | `/blossom/<sha256>` |
 | `blossom_head` | `/blossom/<sha256>` |
 | `blossom_upload` | `/blossom/upload` |
-| `blossom_delete` | `/blossom/<sha256>` |
 
-Spec-Regel (§7.5 L2874): Ein Producer emittiert **genau** die geschlossene Schlüsselmenge
+Spec-Regel (§7.5): Ein Producer emittiert **genau** die geschlossene Schlüsselmenge
 für die Oberflächen, die dieses Deployment exponiert, und **MUST** Keys für nicht
 beworbene optionale Rollen weglassen. Unbekannte Keys beim Lesen ignorieren.
 
@@ -116,13 +118,13 @@ beworbene optionale Rollen weglassen. Unbekannte Keys beim Lesen ignorieren.
 
 | Kategorie | Anzahl |
 |---|---|
-| HTTP-Endpunkte (Method+Path) in der Tabelle oben | **31** |
+| HTTP-Endpunkte (Method+Path) in der Tabelle oben | **30** |
 | davon in §7.5-Haupttext (ohne §7.4/§7.6/§7.7) | **22** |
 | + Publisher §7.6 | **1** |
 | + Bootstrap §7.7 | **3** |
-| + Blossom §7.4 (GET/HEAD/PUT/POST/DELETE) | **5** |
-| Geschlossene `endpoints`-Keys | **29** |
-| Capability-gebunden (Ownership / Grant / Session / Nostr-Auth) | **13** (#14, #16, #18–22, #25–26, #29–31) |
+| + Blossom §7.4 (GET/HEAD/PUT/POST; kein DELETE) | **4** |
+| Geschlossene `endpoints`-Keys | **28** |
+| Capability-gebunden (Ownership / Grant / Session / Nostr-Auth) | **12** (#14, #16, #18–22, #25–26, #29–30) |
 | Challenge-Aussteller ohne Capability | **4** (#13, #15, #17, #24) |
 | API-lokal | **2** (`GET /`, `GET /health`) |
 
@@ -131,15 +133,15 @@ beworbene optionale Rollen weglassen. Unbekannte Keys beim Lesen ignorieren.
 | Feature | Endpunkte | Nummern |
 |---|---|---|
 | immer (API-Prozess) | 4 | #1–#4 |
-| `wallet` | 19 | #8–#22, #24–#26 (+ Blossom-Upload/Delete geteilt) |
-| `explorer` | 3 Chain + Blossom-Fetch (+ Upload/Delete geteilt) | #5–#7, #27–#28 (+ #29–#31 geteilt) |
+| `wallet` | 19 | #8–#22, #24–#26 (+ Blossom-Upload geteilt) |
+| `explorer` | 3 Chain + Blossom-Fetch (+ Upload geteilt) | #5–#7, #27–#28 (+ #29–#30 geteilt) |
 | `publisher` | 1 | #23 |
 | `lightning_bridge` | 0 in §7.5 | Erweiterung `/lightning-bridge` |
 | `mail_bridge` | 0 in §7.5 | Erweiterung `/mail-bridge` |
 
-Blossom-Upload/Delete (#29–#31) sind weder rein `wallet` noch rein `explorer` in der
+Blossom-Upload (#29–#30) sind weder rein `wallet` noch rein `explorer` in der
 Feature-Tabelle §6.1; sie gehören zur öffentlichen Blossom-Ebene (§7.4) und werden von
-Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Replica-/Blob-Pfad).
+Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Blob-Pfad).
 
 ---
 
@@ -149,7 +151,7 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Replica-/Blob-Pfad).
 |---|---|
 | `GET /health` | **implementiert** — `200` mit Body `"ok"` |
 | `GET /health/ready` | **implementiert** — Readiness aus Kernel-`GetInfo` (`ready` / `ready_reason`); Body-Form `{ ready, reason? }`, nie die generische Fehlerform. Bei fehlgeschlagenem `GetInfo` (z. B. fehlende `ChainIdentity` im node): **503** `{ ready: false, reason: "dependency_unavailable" }` — nie grünes `ready: true`. |
-| `GET /` | **implementiert** — `{ name, version, endpoints }` mit **genau** den Flächen, die dieser Prozess registriert (`ServedSurface`). Inventur der 29 Keys in `CLOSED_ENDPOINT_KEYS`; unregistrierte Keys werden weggelassen. |
+| `GET /` | **implementiert** — `{ name, version, endpoints }` mit **genau** den Flächen, die dieser Prozess registriert (`ServedSurface`). Inventur der 28 Keys in `CLOSED_ENDPOINT_KEYS`; unregistrierte Keys werden weggelassen. |
 | `GET /v1/info` | **implementiert** — Kernel-`GetInfo` + API-eigene `features` aus `ZKCOINS_FEATURES` (`kernel_parts` bleibt intern). |
 | `GET /v1/chain/accumulator` | **implementiert** — `GetAccumulator`; `root` ist pass-through der Kernel-`nav_root`, keine Nachrechnung. |
 | `GET /v1/chain/inscriptions` | **implementiert** — `ListInscriptions` (Server-Stream → eine Seite); Triple-Cursor ganz-oder-gar-nicht; leerer Katalog → leere Liste (kein 404). |
@@ -173,14 +175,15 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Replica-/Blob-Pfad).
 | `POST /v1/bootstrap/entrust` | **implementiert** — OwnershipProof (Entrust-Domain) + Bundle-Längenprüfung (161 B), dann `EntrustOperationalBundle`; Bundle wird nie geloggt |
 | `POST /v1/bootstrap/revoke` | **implementiert** — OwnershipProof (Revoke-Domain), dann `RevokeOperationalBundle` |
 | `POST /v1/publish/spendrecord` | **implementiert** — `Publish`; Ablehnung → HTTP 200 `{accepted:false, reason}`; v1-Fee-Felder → 400 |
-| `GET`/`HEAD`/`DELETE /blossom/<sha256>`, `PUT`/`POST /blossom/upload` | **implementiert** wenn `ZKCOINS_BLOSSOM_STORE` gesetzt — API-lokaler inhaltsadressierter Store (§7.4); kein Kernel-RPC; ohne Store unregistriert |
+| `GET`/`HEAD /blossom/<sha256>`, `PUT`/`POST /blossom/upload` | **implementiert** wenn `ZKCOINS_BLOSSOM_STORE` gesetzt — API-lokaler append-only Store (§7.4 / Data Permanence); kein Kernel-RPC; ohne Store unregistriert; **kein** DELETE |
 | alle übrigen Method+Path | **nicht registriert** — kein Handler, kein `todo!()`, kein Platzhalter |
 
 **Bewusst nicht beworben:**
 
 | Key | Warum |
 |---|---|
-| `blossom_*` (ohne `ZKCOINS_BLOSSOM_STORE`) | §7.4; die vier Schlüssel werden **nur** advertised, wenn der inhaltsadressierte Store konfiguriert ist. |
+| `blossom_*` (ohne `ZKCOINS_BLOSSOM_STORE`) | §7.4; die drei Schlüssel (`get`/`head`/`upload`) werden **nur** advertised, wenn der inhaltsadressierte Store konfiguriert ist. |
+| `blossom_delete` | Data Permanence — existiert nicht mehr in der Inventur. |
 
 Router und Discovery teilen eine Quelle (`ServedSurface` in `src/routes.rs`): die
 aktive Mengen folgt `Config::features` und dem Blossom-Store; eine neue
@@ -198,8 +201,8 @@ ausschließlich über `google.rpc.ErrorInfo` (`domain`, `reason`,
 
 | Lücke | Warum |
 |---|---|
-| Blossom `ReplicaReceiptV1` | §4.6 Dual-Commit (Blob + Delivery-Event) fehlt; Upload antwortet ehrlich nur mit `{ blob_id }` — kein `receipt`. |
 | — | Feature-Gating (§6.1 / §7.5) ist aktiv: `ServedSurface::active` filtert nach `ZKCOINS_FEATURES` + Blossom-Store; deaktivierte Flächen sind unregistriert (HTTP 404) und fehlen in `GET /`. |
+| — | Data Permanence: Blossom ist append-only (`PUT`/`POST`/`GET`/`HEAD` only); Upload → `{ blob_id }` ohne `receipt`; kein `retention_hold`, kein Orphan-Prune. |
 
 ---
 
@@ -216,6 +219,6 @@ ausschließlich über `google.rpc.ErrorInfo` (`domain`, `reason`,
 
 | Variable | Bedeutung |
 |---|---|
-| `ZKCOINS_BLOSSOM_STORE` | Wurzelverzeichnis des inhaltsadressierten Blob-Stores. **Abwesend** ⇒ die vier Blossom-Keys bleiben unbeworben und unmontiert. **Kein Default-Pfad**, kein `/tmp`-Rückfall. Leer gesetzt → Startfehler. |
+| `ZKCOINS_BLOSSOM_STORE` | Wurzelverzeichnis des inhaltsadressierten Blob-Stores. **Abwesend** ⇒ die drei Blossom-Keys (`get`/`head`/`upload`) bleiben unbeworben und unmontiert. **Kein Default-Pfad**, kein `/tmp`-Rückfall. Leer gesetzt → Startfehler. |
 | `ZKCOINS_BLOSSOM_MAX_BLOB_BYTES` | Pflicht-Begleiter wenn der Store gesetzt ist: ausgewiesene Upload-Obergrenze (`> 0`). Body darüber → `413 payload_too_large`. |
 | `ZKCOINS_BLOSSOM_ALLOWED_OPS` | Pflicht-Begleiter wenn der Store gesetzt ist: komma-separierte lowercase-hex-32B-`op`-Pubkeys (gepaarte Konten + Replikations-Peers). Darf leer sein (dann ist jeder Upload `403`). |

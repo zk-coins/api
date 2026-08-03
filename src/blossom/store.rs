@@ -1,5 +1,13 @@
 //! Content-addressed blob store on the local filesystem (§7.4 / §4.2.1).
 //!
+//! ## Data permanence (Requirement 12)
+//!
+//! The store is **append-only**. Received bytes are never deleted by this
+//! process: there is no public DELETE, no retention sweep, no orphan prune on
+//! open, and no post-install rollback of an installed content-addressed object.
+//! Temp files used during a single `put` may be cleaned up (they are not
+//! durable names).
+//!
 //! ## Address = content
 //!
 //! `blob_id = SHA-256(body)` (lowercase hex). The on-disk filename is that
@@ -19,30 +27,26 @@
 //! ## Blob + note pair
 //!
 //! A durable object is the pair `(blob, note)`. Install order is blob then
-//! note; if note install fails after blob install, the blob we just created
-//! is rolled back. A crash between the two can leave a blob without a note
-//! — **incomplete**. `put` refuses while incomplete (no new note on an
-//! orphan). Recovery on `open` removes incomplete pairs under the root write
-//! lock. A complete pair is never reported for an incomplete address, so a
-//! foreign retry cannot inherit DELETE ownership.
+//! note. A crash between the two can leave a blob without a note —
+//! **incomplete**. `put` refuses while incomplete (no new note on a partial
+//! write; fail-closed). Incomplete pairs are **left on disk** (data permanence);
+//! they are never auto-pruned. A complete pair is only reported when both
+//! files exist.
 //!
 //! ## Concurrency (single process)
 //!
-//! - **Root `RwLock`:** recovery takes a write lock; put / delete_if_uploader
-//!   take a read lock so recovery cannot run while mutations are in flight.
-//! - **Per-blob `Mutex`:** put and delete_if_uploader for the same content
-//!   address are serialised. Parallel idempotent uploads of the same bytes
-//!   all succeed (loser waits for the complete pair). Lock map entries are
-//!   removed when no waiter holds the Arc anymore — so DELETE/`NotFound` on
-//!   unboundedly many ids cannot grow process memory without bound.
+//! - **Root `RwLock`:** reserved for future exclusive operators; `put` takes a
+//!   read lock so exclusive work cannot interleave with mutation.
+//! - **Per-blob `Mutex`:** concurrent puts of the same content address are
+//!   serialised. Parallel idempotent uploads of the same bytes all succeed
+//!   (loser waits for the complete pair). Lock map entries are removed when
+//!   no waiter holds the Arc anymore — so one-shot id touches cannot grow
+//!   process memory without bound.
 //!
 //! ## BLOSSOM_MULTI_INSTANCE_BOUNDARY (named follow-up; not fixed here)
 //!
 //! The locks above are **process-local** only. Multiple API processes sharing
-//! one store root are **not** coordinated by this implementation: recovery on
-//! one instance can race a put on another (e.g. A installs blob before note,
-//! B's recovery deletes the orphan, A then installs the note and reports
-//! success), and `delete_if_uploader` is not cross-process atomic. Safe
+//! one store root are **not** coordinated by this implementation. Safe
 //! multi-instance deployment requires either single-writer affinity to the
 //! store root or an external shared lock manager / atomic blob+note
 //! publication — do not scale out against a shared filesystem without that.
@@ -64,34 +68,24 @@ pub const BLOB_ID_HEX_LEN: usize = 64;
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Outcome of [`BlobStore::delete_if_uploader`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeleteIfUploader {
-    /// Complete pair removed under matching uploader.
-    Deleted,
-    /// No complete pair (or vanished under the lock).
-    NotFound,
-    /// Complete pair exists but uploader does not match.
-    WrongUploader,
-}
-
 /// Content-addressed store rooted at `root`.
 #[derive(Debug)]
 pub struct BlobStore {
     root: PathBuf,
-    /// See module docs — recovery (write) vs put/delete (read).
+    /// See module docs — exclusive operators (write) vs put (read).
     root_lock: RwLock<()>,
-    /// Per-blob serialisation of put / delete_if_uploader.
+    /// Per-blob serialisation of put.
     ///
     /// Entries are created on demand and **removed** when the last holder
     /// finishes (`release_blob_lock`), so the map cannot grow unboundedly
-    /// from DELETE-on-missing or other one-shot id touches.
+    /// from one-shot id touches.
     blob_locks: Mutex<HashMap<[u8; 32], Arc<Mutex<()>>>>,
 }
 
 impl BlobStore {
     /// Open (or create) a store at `root`. No default path — the caller must
-    /// supply a configured root. Runs incomplete-pair recovery before return.
+    /// supply a configured root. Does **not** prune incomplete pairs (data
+    /// permanence).
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, ApiError> {
         let root = root.into();
         fs::create_dir_all(&root).map_err(|e| {
@@ -112,13 +106,11 @@ impl BlobStore {
                 root.display()
             )));
         }
-        let store = Self {
+        Ok(Self {
             root,
             root_lock: RwLock::new(()),
             blob_locks: Mutex::new(HashMap::new()),
-        };
-        store.recover_incomplete_pairs()?;
-        Ok(store)
+        })
     }
 
     /// Filesystem root (tests / diagnostics).
@@ -261,7 +253,7 @@ impl BlobStore {
     }
 
     /// Read the original uploader's `op` pubkey, or `None` if the note is
-    /// absent. DELETE treats absence as refuse (fail-closed).
+    /// absent. Incomplete pairs are fail-closed for readers (`exists`/`read`).
     pub fn read_uploader(&self, id: &[u8; 32]) -> Result<Option<[u8; 32]>, ApiError> {
         let path = self.uploader_path(id);
         let text = match fs::read_to_string(&path) {
@@ -287,14 +279,14 @@ impl BlobStore {
 
     /// Store `body` under `blob_id = H(body)`. Idempotent when a **complete**
     /// pair already exists: body is not rewritten and the uploader note is
-    /// left alone (first-uploader wins for DELETE).
+    /// left alone (first-uploader wins).
     ///
     /// Concurrent puts of the same content are serialised on a per-blob lock;
     /// losers that observe a complete pair return success.
     pub fn put(&self, body: &[u8], uploader_op: &[u8; 32]) -> Result<[u8; 32], ApiError> {
         let id: [u8; 32] = Sha256::digest(body).into();
 
-        // Root read lock: recovery (write) cannot run while put is active.
+        // Root read lock: exclusive operators (write) cannot run while put is active.
         let _root = self.root_lock.read().unwrap_or_else(|e| e.into_inner());
         self.with_blob_lock(&id, || self.put_locked(body, uploader_op, &id))
     }
@@ -314,13 +306,12 @@ impl BlobStore {
         }
 
         // Incomplete pair under the exclusive blob lock can only be a
-        // crash leftover — refuse so foreign retry cannot claim ownership.
-        // Operator re-open recovery clears orphans.
+        // crash leftover — refuse so a foreign retry cannot claim ownership.
+        // Data permanence: incomplete objects are never auto-pruned.
         if final_path.is_file() || note_path.is_file() {
             return Err(ApiError::internal(
                 "blossom store: incomplete blob/note pair present; \
-                 refuse put so a foreign retry cannot claim DELETE ownership \
-                 (run store open recovery or remove the orphan)",
+                 refuse put (data permanence: incomplete objects are never deleted)",
             ));
         }
 
@@ -357,7 +348,7 @@ impl BlobStore {
                 }
                 return Err(ApiError::internal(
                     "blossom store: blob slot occupied without complete pair; \
-                     refuse put (run recovery)",
+                     refuse put (data permanence: incomplete objects are never deleted)",
                 ));
             }
             Err(e) => {
@@ -375,137 +366,22 @@ impl BlobStore {
                 if note_path.is_file() {
                     Ok(*id)
                 } else {
-                    let _ = fs::remove_file(&final_path);
+                    // Data permanence: do not roll back the installed blob.
                     Err(ApiError::internal(format!(
-                        "blossom store: install note race on {}: {e}",
+                        "blossom store: install note race on {} (blob retained): {e}",
                         note_path.display()
                     )))
                 }
             }
             Err(e) => {
-                let _ = fs::remove_file(&final_path);
+                // Data permanence: do not roll back the installed blob.
+                // Incomplete pair remains; subsequent put refuses.
                 Err(ApiError::internal(format!(
-                    "blossom store: install note {}: {e}",
+                    "blossom store: install note {} (blob retained): {e}",
                     note_path.display()
                 )))
             }
         }
-    }
-
-    /// Atomically check uploader identity and delete the complete pair under
-    /// the same per-blob lock (closes TOCTOU between auth read and delete).
-    pub fn delete_if_uploader(
-        &self,
-        id: &[u8; 32],
-        expected_uploader: &[u8; 32],
-    ) -> Result<DeleteIfUploader, ApiError> {
-        let _root = self.root_lock.read().unwrap_or_else(|e| e.into_inner());
-        self.with_blob_lock(id, || {
-            if !self.exists(id) {
-                return Ok(DeleteIfUploader::NotFound);
-            }
-            let Some(actual) = self.read_uploader(id)? else {
-                // Incomplete: refuse as not found for DELETE surface (fail-closed
-                // at handler if note missing is preferred as scope_exceeded —
-                // without a complete pair there is nothing to authorise).
-                return Ok(DeleteIfUploader::NotFound);
-            };
-            if &actual != expected_uploader {
-                return Ok(DeleteIfUploader::WrongUploader);
-            }
-            self.delete_pair_locked(id)?;
-            Ok(DeleteIfUploader::Deleted)
-        })
-    }
-
-    /// Delete blob and uploader note. Returns `true` if the blob existed.
-    /// Prefer [`delete_if_uploader`] for authorised DELETE.
-    pub fn delete(&self, id: &[u8; 32]) -> Result<bool, ApiError> {
-        let _root = self.root_lock.read().unwrap_or_else(|e| e.into_inner());
-        self.with_blob_lock(id, || {
-            let existed = self.exists(id);
-            self.delete_pair_locked(id)?;
-            Ok(existed)
-        })
-    }
-
-    fn delete_pair_locked(&self, id: &[u8; 32]) -> Result<(), ApiError> {
-        let blob = self.blob_path(id);
-        let note = self.uploader_path(id);
-        match fs::remove_file(&blob) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(ApiError::internal(format!(
-                    "blossom store: delete {}: {e}",
-                    blob.display()
-                )));
-            }
-        }
-        match fs::remove_file(&note) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(ApiError::internal(format!(
-                    "blossom store: delete uploader note {}: {e}",
-                    note.display()
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// Remove incomplete pairs under the store root. Holds the **root write
-    /// lock** for the entire scan so no put/delete can interleave.
-    fn recover_incomplete_pairs(&self) -> Result<(), ApiError> {
-        let _root = self.root_lock.write().unwrap_or_else(|e| e.into_inner());
-        let rd = fs::read_dir(&self.root).map_err(|e| {
-            ApiError::internal(format!(
-                "blossom store: read_dir {}: {e}",
-                self.root.display()
-            ))
-        })?;
-        let mut blob_hexes = Vec::new();
-        let mut note_hexes = Vec::new();
-        for entry in rd {
-            let entry = entry
-                .map_err(|e| ApiError::internal(format!("blossom store: read_dir entry: {e}")))?;
-            let name = match entry.file_name().into_string() {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            if name.len() == BLOB_ID_HEX_LEN
-                && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-            {
-                if entry.path().is_file() {
-                    blob_hexes.push(name);
-                }
-                continue;
-            }
-            if let Some(hex) = name.strip_suffix(".uploader") {
-                if hex.len() == BLOB_ID_HEX_LEN
-                    && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-                    && entry.path().is_file()
-                {
-                    note_hexes.push(hex.to_string());
-                }
-            }
-        }
-        for hex in &blob_hexes {
-            let note = self.root.join(format!("{hex}.uploader"));
-            if !note.is_file() {
-                let blob = self.root.join(hex);
-                let _ = fs::remove_file(&blob);
-            }
-        }
-        for hex in &note_hexes {
-            let blob = self.root.join(hex);
-            if !blob.is_file() {
-                let note = self.root.join(format!("{hex}.uploader"));
-                let _ = fs::remove_file(&note);
-            }
-        }
-        Ok(())
     }
 
     /// Test/diagnostic: list names of regular files directly under the root.
@@ -644,8 +520,9 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Incomplete pairs refuse put and are never auto-pruned on re-open.
     #[test]
-    fn incomplete_blob_without_note_refuses_put_and_open_recovers() {
+    fn incomplete_blob_without_note_refuses_put_and_survives_reopen() {
         let root = temp_root();
         let store = BlobStore::open(&root).expect("open");
         let body = b"orphan-blob-body";
@@ -658,82 +535,56 @@ mod tests {
             .put(body, &uploader)
             .expect_err("put must refuse incomplete");
         assert_eq!(err.body.error, "internal_error");
+        assert!(
+            store.blob_path(&id).is_file(),
+            "data permanence: incomplete blob must remain on disk"
+        );
         drop(store);
-        let store = BlobStore::open(&root).expect("re-open recovers");
-        assert!(!store.blob_path(&id).is_file());
-        let id2 = store.put(body, &uploader).expect("put after recovery");
-        assert_eq!(id2, id);
+        let store = BlobStore::open(&root).expect("re-open must not prune");
+        assert!(
+            store.blob_path(&id).is_file(),
+            "re-open must not delete incomplete pairs"
+        );
+        let err2 = store
+            .put(body, &uploader)
+            .expect_err("still incomplete after re-open");
+        assert_eq!(err2.body.error, "internal_error");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Complete objects stay readable after open; no path deletes them.
+    #[test]
+    fn complete_pair_survives_reopen() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let body = b"durable-blob";
+        let uploader = [0x44u8; 32];
+        let id = store.put(body, &uploader).expect("put");
+        drop(store);
+        let store = BlobStore::open(&root).expect("re-open");
+        assert!(store.exists(&id));
+        assert_eq!(store.read(&id).unwrap().unwrap(), body);
         assert_eq!(store.read_uploader(&id).unwrap().unwrap(), uploader);
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// One-shot put of many distinct ids must not retain per-id lock map entries.
     #[test]
-    fn open_recovers_incomplete_pairs() {
-        let root = temp_root();
-        fs::create_dir_all(&root).unwrap();
-        let body = b"recover-me";
-        let id = blob_id_of(body);
-        let hex = BlobStore::blob_id_hex(&id);
-        fs::write(root.join(&hex), body).unwrap();
-        let store = BlobStore::open(&root).expect("open");
-        assert!(!store.blob_path(&id).is_file());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn delete_if_uploader_matches_and_refuses_foreign() {
-        let root = temp_root();
-        let store = BlobStore::open(&root).expect("open");
-        let body = b"owned-blob";
-        let owner = [0x44u8; 32];
-        let foreign = [0x55u8; 32];
-        let id = store.put(body, &owner).expect("put");
-        assert_eq!(
-            store.delete_if_uploader(&id, &foreign).unwrap(),
-            DeleteIfUploader::WrongUploader
-        );
-        assert!(store.exists(&id));
-        assert_eq!(
-            store.delete_if_uploader(&id, &owner).unwrap(),
-            DeleteIfUploader::Deleted
-        );
-        assert!(!store.exists(&id));
-        assert_eq!(
-            store.delete_if_uploader(&id, &owner).unwrap(),
-            DeleteIfUploader::NotFound
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// DELETE/`NotFound` on distinct missing ids must not retain per-id lock
-    /// map entries (unbounded memory growth / external DoS surface).
-    #[test]
-    fn delete_not_found_does_not_retain_blob_lock_entries() {
+    fn put_does_not_retain_blob_lock_entries() {
         let root = temp_root();
         let store = BlobStore::open(&root).expect("open");
         let op = [0x66u8; 32];
         assert_eq!(store.blob_lock_entry_count(), 0);
-        for i in 0..128u32 {
-            let mut id = [0u8; 32];
-            id[0..4].copy_from_slice(&i.to_le_bytes());
-            assert_eq!(
-                store.delete_if_uploader(&id, &op).unwrap(),
-                DeleteIfUploader::NotFound
-            );
+        for i in 0..64u32 {
+            let mut body = [0u8; 8];
+            body[0..4].copy_from_slice(&i.to_le_bytes());
+            store.put(&body, &op).expect("put");
         }
         assert_eq!(
             store.blob_lock_entry_count(),
             0,
-            "NotFound must release per-blob lock map entries"
+            "put must release per-blob lock map entries"
         );
-        // put + delete of a real blob must also leave the map empty.
-        let id = store.put(b"cleanup-after-real-blob", &op).expect("put");
-        assert_eq!(store.blob_lock_entry_count(), 0);
-        assert_eq!(
-            store.delete_if_uploader(&id, &op).unwrap(),
-            DeleteIfUploader::Deleted
-        );
-        assert_eq!(store.blob_lock_entry_count(), 0);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -772,7 +623,7 @@ mod tests {
         assert_eq!(
             store.read_uploader(&id).unwrap().unwrap(),
             note,
-            "first complete uploader must win DELETE ownership"
+            "first complete uploader note must win"
         );
         let _ = fs::remove_dir_all(&root);
     }

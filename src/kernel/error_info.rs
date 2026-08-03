@@ -86,11 +86,8 @@ const RPC_ERROR_TRIPLES: &[RpcErrorTriple] = &[
         http_status: 409,
         grpc: Code::FailedPrecondition,
     },
-    RpcErrorTriple {
-        reason: "retention_hold",
-        http_status: 409,
-        grpc: Code::FailedPrecondition,
-    },
+    // `retention_hold` removed with data permanence (Requirement 12): the
+    // Blossom store is append-only; there is no DELETE refusal path.
     RpcErrorTriple {
         reason: "dependency_not_final",
         http_status: 409,

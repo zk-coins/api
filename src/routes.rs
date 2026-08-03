@@ -30,7 +30,7 @@ use crate::state::AppState;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, head, post, put};
+use axum::routing::{get, head, post, put};
 use axum::{Json, Router};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -56,9 +56,10 @@ impl std::error::Error for StartupError {}
 
 /// Closed `endpoints` key set from specification §7.5 (`GET /` row).
 ///
-/// Full inventory of the 29 logical names a conforming producer may emit.
-/// Order matches the spec listing (line 2874). This constant is the reference
-/// for surfaces not yet built; it is **not** what `GET /` returns.
+/// Full inventory of the 28 logical names a conforming producer may emit
+/// (data permanence: no `blossom_delete`). Order matches the closed §7.5
+/// listing. This constant is the reference for surfaces not yet built; it is
+/// **not** what `GET /` returns.
 ///
 /// Path parameters use the §7.5 advertised form `<name>` (one path segment).
 /// That string is what `GET /` emits. Axum 0.7 / matchit 0.7 do **not** treat
@@ -99,7 +100,6 @@ pub const CLOSED_ENDPOINT_KEYS: &[(&str, &str)] = &[
     ("blossom_get", "/blossom/<sha256>"),
     ("blossom_head", "/blossom/<sha256>"),
     ("blossom_upload", "/blossom/upload"),
-    ("blossom_delete", "/blossom/<sha256>"),
 ];
 
 /// Surfaces this process actually registers (and therefore advertises on `GET /`).
@@ -128,7 +128,7 @@ pub const CLOSED_ENDPOINT_KEYS: &[(&str, &str)] = &[
 /// | `chain_*` | `explorer` |
 /// | `tx`, `jobs*`, `attest_*`, `grants_*`, `pull*`, `record`, `proof`, `account_state`, `receipts_stream`, `bootstrap_*` | `wallet` |
 /// | `publish_spendrecord` | `publisher` |
-/// | `blossom_*` | `ZKCOINS_BLOSSOM_STORE` **and** (`wallet` **or** `explorer`) |
+/// | `blossom_get` / `blossom_head` / `blossom_upload` | `ZKCOINS_BLOSSOM_STORE` **and** (`wallet` **or** `explorer`) |
 ///
 /// `lightning_bridge` / `mail_bridge` open no §7.5 inventory paths (extension
 /// docs only) and therefore add no variants here.
@@ -165,7 +165,6 @@ enum ServedSurface {
     BlossomGet,
     BlossomHead,
     BlossomUpload,
-    BlossomDelete,
 }
 
 impl ServedSurface {
@@ -202,17 +201,13 @@ impl ServedSurface {
         ServedSurface::BlossomGet,
         ServedSurface::BlossomHead,
         ServedSurface::BlossomUpload,
-        ServedSurface::BlossomDelete,
     ];
 
     /// Whether this surface is a Blossom inventory key.
     fn is_blossom(self) -> bool {
         matches!(
             self,
-            ServedSurface::BlossomGet
-                | ServedSurface::BlossomHead
-                | ServedSurface::BlossomUpload
-                | ServedSurface::BlossomDelete
+            ServedSurface::BlossomGet | ServedSurface::BlossomHead | ServedSurface::BlossomUpload
         )
     }
 
@@ -256,12 +251,11 @@ impl ServedSurface {
             ServedSurface::PublishSpendrecord => features.contains(&Feature::Publisher),
 
             // §7.4 Blossom: store must be configured, and at least one of
-            // `wallet` / `explorer` must be on (rest-surface #27–#31; blob fetch
-            // is listed under explorer, upload/delete under both).
+            // `wallet` / `explorer` must be on (blob fetch under explorer,
+            // upload under both). No DELETE — data permanence.
             ServedSurface::BlossomGet
             | ServedSurface::BlossomHead
-            | ServedSurface::BlossomUpload
-            | ServedSurface::BlossomDelete => {
+            | ServedSurface::BlossomUpload => {
                 blossom_configured
                     && (features.contains(&Feature::Wallet)
                         || features.contains(&Feature::Explorer))
@@ -309,7 +303,6 @@ impl ServedSurface {
             ServedSurface::BlossomGet => "blossom_get",
             ServedSurface::BlossomHead => "blossom_head",
             ServedSurface::BlossomUpload => "blossom_upload",
-            ServedSurface::BlossomDelete => "blossom_delete",
         }
     }
 
@@ -357,10 +350,10 @@ impl ServedSurface {
             ServedSurface::BootstrapRevoke => {
                 router.route(&path, post(bootstrap::post_bootstrap_revoke))
             }
-            // GET / HEAD / DELETE share `/blossom/:sha256`; axum merges methods.
+            // GET / HEAD share `/blossom/:sha256`; axum merges methods.
+            // No DELETE — data permanence (append-only store).
             ServedSurface::BlossomGet => router.route(&path, get(blossom::get_blob)),
             ServedSurface::BlossomHead => router.route(&path, head(blossom::head_blob)),
-            ServedSurface::BlossomDelete => router.route(&path, delete(blossom::delete_blob)),
             ServedSurface::BlossomUpload => {
                 // Cap buffering at the advertised max. Bodies above that are
                 // rejected by LimitedBytes / DefaultBodyLimit as §7.5
@@ -404,7 +397,6 @@ impl ServedSurface {
             | ServedSurface::ReceiptsStream
             | ServedSurface::BlossomGet => router.route(&path, get(feature_disabled_handler)),
             ServedSurface::BlossomHead => router.route(&path, head(feature_disabled_handler)),
-            ServedSurface::BlossomDelete => router.route(&path, delete(feature_disabled_handler)),
             ServedSurface::Tx
             | ServedSurface::JobsSign
             | ServedSurface::JobsCancel
@@ -807,20 +799,19 @@ mod tests {
         "blossom_get",
         "blossom_head",
         "blossom_upload",
-        "blossom_delete",
     ];
 
     #[test]
     fn closed_endpoint_keys_inventory_matches_spec() {
         assert_eq!(
             CLOSED_ENDPOINT_KEYS.len(),
-            29,
-            "CLOSED_ENDPOINT_KEYS must list all 29 §7.5 closed keys"
+            28,
+            "CLOSED_ENDPOINT_KEYS must list all 28 §7.5 closed keys (no blossom_delete)"
         );
         assert_eq!(
             SPEC_CLOSED_KEYS.len(),
-            29,
-            "spec key list fixture must stay in sync with §7.5 L2874"
+            28,
+            "spec key list fixture must stay in sync with closed inventory"
         );
         for (i, (key, path)) in CLOSED_ENDPOINT_KEYS.iter().enumerate() {
             assert_eq!(
@@ -842,7 +833,11 @@ mod tests {
         }
         let keys: BTreeSet<&str> = CLOSED_ENDPOINT_KEYS.iter().map(|(k, _)| *k).collect();
         assert!(!keys.contains(""), "empty discovery key is invalid");
-        assert_eq!(keys.len(), 29, "closed keys must be unique");
+        assert_eq!(keys.len(), 28, "closed keys must be unique");
+        assert!(
+            !keys.contains("blossom_delete"),
+            "data permanence: blossom_delete must not be in the inventory"
+        );
     }
 
     #[test]
@@ -960,17 +955,16 @@ mod tests {
             Some("/v1/publish/spendrecord")
         );
         // Blossom stays off discovery without ZKCOINS_BLOSSOM_STORE.
-        for absent in [
-            "blossom_get",
-            "blossom_head",
-            "blossom_upload",
-            "blossom_delete",
-        ] {
+        for absent in ["blossom_get", "blossom_head", "blossom_upload"] {
             assert!(
                 !endpoints.contains_key(absent),
                 "unconfigured Blossom surface {absent} must stay unadvertised"
             );
         }
+        assert!(
+            !endpoints.contains_key("blossom_delete"),
+            "data permanence: blossom_delete must never be advertised"
+        );
         assert_eq!(
             endpoints["receipts_stream"].as_str(),
             Some("/v1/receipts/stream"),
@@ -6623,93 +6617,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Data permanence: DELETE is not registered. Path may match GET/HEAD so
+    /// axum answers 405 Method Not Allowed; a bare 404 is also acceptable if
+    /// the method is not merged onto the route table. The stored blob must
+    /// remain readable after any DELETE attempt.
     #[tokio::test]
-    async fn blossom_partial_binding_headers_are_400() {
-        let root = blossom_temp_root("partialhdr");
+    async fn blossom_delete_is_not_registered_and_blob_persists() {
+        let root = blossom_temp_root("delgone");
         let (sk, pk) = blossom_sk_pk();
         let mut ops = BTreeSet::new();
         ops.insert(pk);
         let app = blossom_app(root.clone(), 1024, ops);
-        let body = b"with-partial-headers";
-        let x = crate::blossom::blob_id_of(body);
-        let auth = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Upload, &x);
-        let res = app
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/blossom/upload")
-                    .header("content-type", "application/octet-stream")
-                    .header("authorization", &auth)
-                    .header(
-                        "x-zkcoins-event-id",
-                        crate::hexutil::encode_hex(&[0x11; 32]),
-                    )
-                    .body(Body::from(body.to_vec()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
-        assert_eq!(json["error"], "malformed_request");
-        assert!(
-            json["message"].as_str().unwrap().contains("all together"),
-            "{}",
-            json["message"]
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test]
-    async fn blossom_invalid_retention_is_400() {
-        let root = blossom_temp_root("badret");
-        let (sk, pk) = blossom_sk_pk();
-        let mut ops = BTreeSet::new();
-        ops.insert(pk);
-        let app = blossom_app(root.clone(), 1024, ops);
-        let body = b"bad-retention";
-        let x = crate::blossom::blob_id_of(body);
-        let auth = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Upload, &x);
-        let res = app
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/blossom/upload")
-                    .header("content-type", "application/octet-stream")
-                    .header("authorization", &auth)
-                    .header(
-                        "x-zkcoins-event-id",
-                        crate::hexutil::encode_hex(&[0x11; 32]),
-                    )
-                    .header(
-                        "x-zkcoins-attempt-nonce",
-                        crate::hexutil::encode_hex(&[0x22; 32]),
-                    )
-                    .header("x-zkcoins-retention", "forever")
-                    .body(Body::from(body.to_vec()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
-        assert_eq!(json["error"], "malformed_request");
-        assert!(
-            json["message"].as_str().unwrap().contains("Retention"),
-            "{}",
-            json["message"]
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test]
-    async fn blossom_delete_by_original_uploader_succeeds() {
-        let root = blossom_temp_root("delok");
-        let (sk, pk) = blossom_sk_pk();
-        let mut ops = BTreeSet::new();
-        ops.insert(pk);
-        let app = blossom_app(root.clone(), 1024, ops);
-        let body = b"to-be-deleted";
+        let body = b"must-survive-delete-attempt";
         let x = crate::blossom::blob_id_of(body);
         let auth_up = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Upload, &x);
         let res = app
@@ -6726,113 +6645,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["blob_id"], crate::hexutil::encode_hex(&x));
+        assert!(
+            json.get("receipt").is_none(),
+            "upload must not emit receipt, got {json}"
+        );
 
-        let auth_del = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Delete, &x);
-        let res = app
+        let del = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("DELETE")
                     .uri(format!("/blossom/{}", crate::hexutil::encode_hex(&x)))
-                    .header("authorization", &auth_del)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        assert!(body_bytes(res).await.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
-    }
+        assert!(
+            del.status() == StatusCode::METHOD_NOT_ALLOWED || del.status() == StatusCode::NOT_FOUND,
+            "DELETE must not succeed; got {}",
+            del.status()
+        );
 
-    #[tokio::test]
-    async fn blossom_delete_by_foreign_op_is_403() {
-        use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
-        let root = blossom_temp_root("delforeign");
-        let (sk, pk) = blossom_sk_pk();
-        let mut ops = BTreeSet::new();
-        ops.insert(pk);
-        let secp = Secp256k1::new();
-        let sk2 = SecretKey::from_slice(&[0x8bu8; 32]).unwrap();
-        let kp2 = Keypair::from_secret_key(&secp, &sk2);
-        let (xonly2, _) = kp2.x_only_public_key();
-        let pk2 = xonly2.serialize();
-
-        let app = blossom_app(root.clone(), 1024, ops);
-        let body = b"owned-by-pk";
-        let x = crate::blossom::blob_id_of(body);
-        let auth_up = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Upload, &x);
-        let res = app
-            .clone()
+        let get = app
             .oneshot(
                 Request::builder()
-                    .method("PUT")
-                    .uri("/blossom/upload")
-                    .header("content-type", "application/octet-stream")
-                    .header("authorization", &auth_up)
-                    .body(Body::from(body.to_vec()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-
-        let auth_del = blossom_auth(&sk2, &pk2, crate::blossom::AuthAction::Delete, &x);
-        let res = app
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
                     .uri(format!("/blossom/{}", crate::hexutil::encode_hex(&x)))
-                    .header("authorization", &auth_del)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
-        assert_eq!(json["error"], "scope_exceeded");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Incomplete pair (blob without uploader note) is not a durable object.
-    ///
-    /// Store recovery on open removes orphans; `exists`/`read`/`size` require
-    /// a complete pair. DELETE therefore answers `404 not_found` (same as GET
-    /// for that address) — not `403 scope_exceeded`. Advertising 403 would
-    /// claim the incomplete orphan is a first-class object while GET returns
-    /// 404 for the same id.
-    #[tokio::test]
-    async fn blossom_delete_without_uploader_note_is_404() {
-        let root = blossom_temp_root("delnonote");
-        let (sk, pk) = blossom_sk_pk();
-        let mut ops = BTreeSet::new();
-        ops.insert(pk);
-        let store = crate::blossom::BlobStore::open(&root).unwrap();
-        let body = b"orphan";
-        let id = store.put(body, &pk).unwrap();
-        std::fs::remove_file(root.join(format!("{}.uploader", crate::hexutil::encode_hex(&id))))
-            .unwrap();
-        drop(store);
-
-        // blossom_app opens the store again → recover_incomplete_pairs clears
-        // the orphan before any request runs.
-        let app = blossom_app(root.clone(), 1024, ops);
-        let auth_del = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Delete, &id);
-        let res = app
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/blossom/{}", crate::hexutil::encode_hex(&id)))
-                    .header("authorization", &auth_del)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
-        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
-        assert_eq!(json["error"], "not_found");
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(
+            body_bytes(get).await,
+            body,
+            "blob must remain after DELETE attempt"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6855,7 +6706,7 @@ mod tests {
             assert!(!endpoints.contains_key(k), "{k} unadvertised without store");
         }
 
-        // With store: present.
+        // With store: get/head/upload present; delete never advertised.
         let root = blossom_temp_root("disc");
         let app = blossom_app(root.clone(), 1024, BTreeSet::new());
         let res = app
@@ -6867,18 +6718,23 @@ mod tests {
         assert_eq!(endpoints["blossom_get"], "/blossom/<sha256>");
         assert_eq!(endpoints["blossom_head"], "/blossom/<sha256>");
         assert_eq!(endpoints["blossom_upload"], "/blossom/upload");
-        assert_eq!(endpoints["blossom_delete"], "/blossom/<sha256>");
+        assert!(
+            !endpoints.contains_key("blossom_delete"),
+            "data permanence: blossom_delete must never be advertised"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Receipt-binding headers are ignored (no §4.6); upload still returns
+    /// only `{ blob_id }` with no `receipt` field.
     #[tokio::test]
-    async fn blossom_binding_headers_valid_still_omit_receipt() {
+    async fn blossom_upload_ignores_legacy_binding_headers_and_omits_receipt() {
         let root = blossom_temp_root("bindok");
         let (sk, pk) = blossom_sk_pk();
         let mut ops = BTreeSet::new();
         ops.insert(pk);
         let app = blossom_app(root.clone(), 1024, ops);
-        let body = b"with-valid-binding";
+        let body = b"with-legacy-binding-headers";
         let x = crate::blossom::blob_id_of(body);
         let auth = blossom_auth(&sk, &pk, crate::blossom::AuthAction::Upload, &x);
         let res = app
@@ -6905,7 +6761,17 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
         assert_eq!(json["blob_id"], crate::hexutil::encode_hex(&x));
-        assert!(json.get("receipt").is_none());
+        assert!(
+            json.get("receipt").is_none(),
+            "receipt must be absent, got {json}"
+        );
+        // Object keys are exactly blob_id (no optional receipt key).
+        let obj = json.as_object().expect("object");
+        assert_eq!(
+            obj.keys().collect::<Vec<_>>(),
+            vec!["blob_id"],
+            "upload body must be only {{ blob_id }}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

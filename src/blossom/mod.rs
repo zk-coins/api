@@ -1,18 +1,16 @@
 //! §7.4 Blossom blob store — API-local, content-addressed, no kernel RPC.
 //!
-//! Four routes, one filesystem store. Discovery keys
-//! `blossom_get` / `blossom_head` / `blossom_upload` / `blossom_delete` are
-//! advertised **if and only if** `ZKCOINS_BLOSSOM_STORE` is configured.
+//! Three routes, one filesystem store. Discovery keys
+//! `blossom_get` / `blossom_head` / `blossom_upload` are advertised **if and
+//! only if** `ZKCOINS_BLOSSOM_STORE` is configured.
 //!
-//! ## `ReplicaReceiptV1` — not issued
+//! ## Data permanence (Requirement 12)
 //!
-//! §4.6 dual-commit replication (delivery event + blob) is **not** implemented
-//! in this process. Successful upload responses are therefore exactly
-//! `{ "blob_id": <hex32> }` — the optional `receipt` field is **absent**
-//! (not `null`, not `{}`). The three `X-ZkCoins-*` binding headers are still
-//! validated when present (all-or-nothing, closed enum, hex width) so a broken
-//! value cannot pass unnoticed; they produce no receipt and no other side
-//! effect until §4.6 lands.
+//! The store is **append-only**. There is **no** `DELETE` route, no retention
+//! hold, and no server-side prune of received blobs. Successful upload
+//! responses are exactly `{ "blob_id": <hex32> }` — there is no `receipt`
+//! field (`ReplicaReceiptV1` / §4.6 dual-commit replication was removed from
+//! the spec). Upload remains ACL-gated (paired accounts + configured peers).
 
 mod auth;
 mod base64;
@@ -24,11 +22,11 @@ pub use auth::{
     verify_blossom_auth, AuthAction, RequiredAction, VerifiedAuthEvent, CLOCK_SKEW_SECS,
     REPLAY_WINDOW_SECS,
 };
-pub use store::{blob_id_of, BlobStore, DeleteIfUploader};
+pub use store::{blob_id_of, BlobStore};
 
 use crate::error::ApiError;
 use crate::extract::LimitedBytes;
-use crate::hexutil::{decode_hex_exact, encode_hex};
+use crate::hexutil::encode_hex;
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -63,8 +61,8 @@ impl BlossomState {
 // Wire types
 // ---------------------------------------------------------------------------
 
-/// Successful upload body. `receipt` is intentionally not a field — §4.6 is
-/// absent, so serde never emits it (honest omission, not `null`).
+/// Successful upload body. No `receipt` field — data permanence / no §4.6
+/// dual-commit; serde never emits the key (honest omission, not `null`).
 #[derive(Debug, Serialize)]
 struct UploadResponse {
     blob_id: String,
@@ -94,16 +92,6 @@ async fn store_put(
     tokio::task::spawn_blocking(move || store.put(&body, &uploader))
         .await
         .map_err(|e| ApiError::internal(format!("blossom store put join: {e}")))?
-}
-
-async fn store_delete_if_uploader(
-    store: Arc<BlobStore>,
-    id: [u8; 32],
-    expected: [u8; 32],
-) -> Result<DeleteIfUploader, ApiError> {
-    tokio::task::spawn_blocking(move || store.delete_if_uploader(&id, &expected))
-        .await
-        .map_err(|e| ApiError::internal(format!("blossom store delete_if_uploader join: {e}")))?
 }
 
 // ---------------------------------------------------------------------------
@@ -175,10 +163,6 @@ pub async fn upload_blob(
         )));
     }
 
-    // Binding headers: all three or none; validate when present.
-    // §4.6 receipt is not issued — validation only (see module docs).
-    validate_binding_headers(&headers)?;
-
     // Server computes blob_id = H(body); never trusts a client claim.
     let body_hash = blob_id_of(&body);
 
@@ -201,7 +185,6 @@ pub async fn upload_blob(
     let id = store_put(Arc::clone(&blossom.store), body, verified.op_pubkey).await?;
     debug_assert_eq!(id, body_hash);
 
-    // Honest response without receipt (§4.6 absent).
     Ok((
         StatusCode::OK,
         Json(UploadResponse {
@@ -209,37 +192,6 @@ pub async fn upload_blob(
         }),
     )
         .into_response())
-}
-
-/// `DELETE /blossom/<sha256>` — original uploader only.
-///
-/// Auth event is verified first; ownership check and deletion run as one
-/// store operation ([`BlobStore::delete_if_uploader`]) under the same
-/// per-blob lock so a concurrent re-upload cannot swap ownership mid-flight.
-pub async fn delete_blob(
-    State(state): State<AppState>,
-    Path(sha256): Path<String>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    let blossom = require_blossom(&state)?;
-    let id = BlobStore::parse_blob_id(&sha256)?;
-
-    let auth_header = headers
-        .get(header::AUTHORIZATION)
-        .ok_or_else(|| ApiError::unauthorized("missing Authorization header for blossom delete"))?
-        .to_str()
-        .map_err(|_| ApiError::unauthorized("Authorization header is not valid UTF-8"))?;
-
-    let now = unix_now();
-    let verified = verify_blossom_auth(auth_header, RequiredAction::Delete, &id, now)?;
-
-    match store_delete_if_uploader(Arc::clone(&blossom.store), id, verified.op_pubkey).await? {
-        DeleteIfUploader::Deleted => Ok(StatusCode::OK.into_response()),
-        DeleteIfUploader::NotFound => Err(ApiError::not_found(format!("blob {sha256} not found"))),
-        DeleteIfUploader::WrongUploader => Err(ApiError::scope_exceeded(
-            "delete op key is not the original uploader of this blob",
-        )),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -274,72 +226,6 @@ fn require_octet_stream(headers: &HeaderMap) -> Result<(), ApiError> {
         )));
     }
     Ok(())
-}
-
-/// `X-ZkCoins-Event-Id`, `X-ZkCoins-Attempt-Nonce`, `X-ZkCoins-Retention` —
-/// all three present, or all three absent. Partial set → 400. Invalid hex /
-/// width / retention enum → 400.
-///
-/// When all three are valid, they are accepted and **discarded**: this process
-/// does not issue `ReplicaReceiptV1` (§4.6 dual-commit is absent). Validation
-/// exists so a broken value cannot pass unnoticed.
-fn validate_binding_headers(headers: &HeaderMap) -> Result<(), ApiError> {
-    const H_EVENT: &str = "x-zkcoins-event-id";
-    const H_NONCE: &str = "x-zkcoins-attempt-nonce";
-    const H_RETENTION: &str = "x-zkcoins-retention";
-
-    let event = header_str(headers, H_EVENT)?;
-    let nonce = header_str(headers, H_NONCE)?;
-    let retention = header_str(headers, H_RETENTION)?;
-
-    match (event.is_some(), nonce.is_some(), retention.is_some()) {
-        (false, false, false) => Ok(()),
-        (true, true, true) => {
-            let event = event.expect("checked");
-            let nonce = nonce.expect("checked");
-            let retention = retention.expect("checked");
-            parse_hex32_lower(event, "X-ZkCoins-Event-Id")?;
-            parse_hex32_lower(nonce, "X-ZkCoins-Attempt-Nonce")?;
-            match retention {
-                "indefinite" | "policy" => {}
-                other => {
-                    return Err(ApiError::malformed(format!(
-                        "X-ZkCoins-Retention must be \"indefinite\" or \"policy\", got {other:?}"
-                    )));
-                }
-            }
-            // Validated; no receipt follows.
-            Ok(())
-        }
-        _ => Err(ApiError::malformed(
-            "X-ZkCoins-Event-Id, X-ZkCoins-Attempt-Nonce, and X-ZkCoins-Retention \
-             must be supplied all together or not at all",
-        )),
-    }
-}
-
-fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, ApiError> {
-    match headers.get(name) {
-        None => Ok(None),
-        Some(v) => {
-            let s = v
-                .to_str()
-                .map_err(|_| ApiError::malformed(format!("{name} header is not valid UTF-8")))?;
-            Ok(Some(s))
-        }
-    }
-}
-
-fn parse_hex32_lower(s: &str, field: &str) -> Result<[u8; 32], ApiError> {
-    if s.len() != 64 || !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-        return Err(ApiError::malformed(format!(
-            "{field} must be exactly 64 lowercase hex characters"
-        )));
-    }
-    let v = decode_hex_exact(s, 32).map_err(|e| ApiError::malformed(format!("{field}: {e}")))?;
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&v);
-    Ok(out)
 }
 
 fn unix_now() -> u64 {

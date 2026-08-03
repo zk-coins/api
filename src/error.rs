@@ -62,8 +62,8 @@ impl ApiError {
         Self::new(StatusCode::UNAUTHORIZED, "unauthorized", message)
     }
 
-    /// §7.5 `scope_exceeded` / 403 — foreign-uploader DELETE, non-peer
-    /// replication PUT, resolved-scope violation.
+    /// §7.5 `scope_exceeded` / 403 — non-peer Blossom upload, resolved-scope
+    /// violation.
     pub fn scope_exceeded(message: impl Into<String>) -> Self {
         Self::new(StatusCode::FORBIDDEN, "scope_exceeded", message)
     }
