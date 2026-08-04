@@ -474,6 +474,8 @@ pub struct IssuanceJson {
     pub decimals: u32,
     pub issuance_version: u32,
     pub amount: String,
+    /// Genesis spend key `Pk₀` (32-byte lowercase hex); required for both versions.
+    pub creator_pubkey: String,
     #[serde(default)]
     pub cap_total: Option<String>,
     #[serde(default)]
@@ -976,6 +978,7 @@ fn json_to_issuance(iss: IssuanceJson) -> Result<Issuance, ApiError> {
     if iss.issuance_version != 1 && iss.issuance_version != 2 {
         return Err(ApiError::malformed("issuance_version must be 1 or 2"));
     }
+    let creator_pubkey = decode_hex_field(&iss.creator_pubkey, 32, "creator_pubkey")?;
     if iss.issuance_version == 2 {
         let cap = match iss.cap_total {
             Some(c) => c,
@@ -998,6 +1001,7 @@ fn json_to_issuance(iss: IssuanceJson) -> Result<Issuance, ApiError> {
             amount: iss.amount,
             cap_total: cap,
             terms_salt: salt,
+            creator_pubkey,
         })
     } else {
         if iss.cap_total.is_some() || iss.terms_salt.is_some() {
@@ -1012,6 +1016,7 @@ fn json_to_issuance(iss: IssuanceJson) -> Result<Issuance, ApiError> {
             amount: iss.amount,
             cap_total: String::new(),
             terms_salt: Vec::new(),
+            creator_pubkey,
         })
     }
 }
@@ -1279,7 +1284,8 @@ mod tests {
                 "name": "TestCoin",
                 "decimals": 8,
                 "issuance_version": 1,
-                "amount": "1000"
+                "amount": "1000",
+                "creator_pubkey": hex32(0x44)
             }
         })
     }

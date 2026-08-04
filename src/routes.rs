@@ -1897,7 +1897,8 @@ mod tests {
                 "name": "TestCoin",
                 "decimals": 8,
                 "issuance_version": 1,
-                "amount": "1000"
+                "amount": "1000",
+                "creator_pubkey": hex32(0x44)
             }
         })
     }

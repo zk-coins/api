@@ -104,7 +104,13 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 zkcoins \
     && useradd --system --uid 10001 --gid zkcoins \
-        --home-dir /data --create-home --shell /usr/sbin/nologin zkcoins
+        --home-dir /data --create-home --shell /usr/sbin/nologin zkcoins \
+    # Pre-create the Blossom store dir owned by the runtime user so a fresh
+    # named volume mounted at /data/blossom inherits writable ownership
+    # (Docker seeds a new volume from the image path; without this the mount
+    # is root-owned and the non-root process gets EACCES on blob writes).
+    && mkdir -p /data/blossom \
+    && chown zkcoins:zkcoins /data/blossom
 
 COPY --from=builder /app/target/release/api /usr/local/bin/zkcoins-api
 
