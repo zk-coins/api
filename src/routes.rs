@@ -4890,7 +4890,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
-        assert_eq!(json["send_counter"], "7");
+        assert_eq!(json["send_counter"], 7);
         assert_eq!(
             json["current_pubkey"].as_str().unwrap().len(),
             64,

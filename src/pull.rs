@@ -674,7 +674,7 @@ pub async fn get_account_state(
     }
     body.insert(
         "send_counter".into(),
-        Value::String(view.send_counter.to_string()),
+        Value::Number(view.send_counter.into()),
     );
     body.insert(
         "current_pubkey".into(),
