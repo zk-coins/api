@@ -309,6 +309,10 @@ pub struct TransitionRequestJson {
     #[serde(default)]
     pub fold_coin_ids: Option<Vec<String>>,
     #[serde(default)]
+    /// Recipient's genesis Pk₀ (32-byte lowercase hex, x-only); required for
+    /// a genesis receive (no prior transition), MUST be absent otherwise (§7.5).
+    pub genesis_pubkey: Option<String>,
+    #[serde(default)]
     pub issuance: Option<IssuanceJson>,
 }
 
@@ -773,6 +777,11 @@ fn json_to_transition(body: TransitionRequestJson) -> Result<TransitionRequest, 
         None => Vec::new(),
     };
 
+    let genesis_pubkey = match body.genesis_pubkey {
+        Some(hex) => decode_hex_field(&hex, 32, "genesis_pubkey")?,
+        None => Vec::new(),
+    };
+
     let output_templates = match body.output_templates {
         Some(list) => {
             let mut out = Vec::with_capacity(list.len());
@@ -811,6 +820,11 @@ fn json_to_transition(body: TransitionRequestJson) -> Result<TransitionRequest, 
             if issuance.is_some() {
                 return Err(ApiError::malformed("kind=send must not carry issuance"));
             }
+            if !genesis_pubkey.is_empty() {
+                return Err(ApiError::malformed(
+                    "kind=send must not carry genesis_pubkey",
+                ));
+            }
         }
         "mint" => {
             if !input_coins.is_empty() {
@@ -828,6 +842,11 @@ fn json_to_transition(body: TransitionRequestJson) -> Result<TransitionRequest, 
             }
             if issuance.is_none() {
                 return Err(ApiError::malformed("kind=mint requires issuance"));
+            }
+            if !genesis_pubkey.is_empty() {
+                return Err(ApiError::malformed(
+                    "kind=mint must not carry genesis_pubkey",
+                ));
             }
         }
         "receive" => {
@@ -868,6 +887,7 @@ fn json_to_transition(body: TransitionRequestJson) -> Result<TransitionRequest, 
         fee_address: String::new(),
         fold_coin_ids,
         issuance,
+        genesis_pubkey,
         idempotency_key: String::new(),
     })
 }
@@ -1925,5 +1945,49 @@ mod tests {
         let parsed: TransitionRequestJson = serde_json::from_value(mint_json()).expect("parse");
         let req = json_to_transition(parsed).expect("convert");
         assert!(req.output_templates[0].delivery.is_none());
+    }
+
+    #[test]
+    fn mint_must_not_carry_genesis_pubkey() {
+        let mut v = mint_json();
+        v["genesis_pubkey"] = serde_json::json!(hex32(0xD0));
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("mint + genesis_pubkey");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("must not carry genesis_pubkey"),
+            "message must name the forbidden field, got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn send_must_not_carry_genesis_pubkey() {
+        let mut v = send_two_outputs_with_deliveries();
+        v["genesis_pubkey"] = serde_json::json!(hex32(0xD0));
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("send + genesis_pubkey");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("must not carry genesis_pubkey"),
+            "message must name the forbidden field, got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn receive_with_genesis_pubkey_parses() {
+        let v = serde_json::json!({
+            "kind": "receive",
+            "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "next_pubkey": hex32(0x11),
+            "npk_rand": hex32(0x22),
+            "fold_coin_ids": [hex32(0x33)],
+            "genesis_pubkey": hex32(0xD0),
+        });
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let req = json_to_transition(parsed).expect("receive with genesis_pubkey");
+        assert_eq!(req.kind, "receive");
+        assert_eq!(req.genesis_pubkey, vec![0xD0u8; 32]);
     }
 }
