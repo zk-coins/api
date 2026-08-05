@@ -5320,10 +5320,18 @@ mod tests {
     use crate::bootstrap::{OPERATIONAL_BUNDLE_HEX_CHARS, OPERATIONAL_BUNDLE_LEN};
     use crate::ownership::{ENTRUST_CHALLENGE_DOMAIN, REVOKE_CHALLENGE_DOMAIN};
 
-    /// Canonical 161-byte version-0x01 bundle as hex (322 chars). Secrets are
-    /// zeros — only length/form matters at the API edge in these tests.
+    /// Canonical 161-byte version-0x01 bundle as hex (322 chars).
+    /// `op` at offset 65..97 must be a valid nonzero secp256k1 scalar so a
+    /// successful entrust can derive + insert its x-only pubkey.
     fn sample_bundle_hex() -> String {
-        format!("01{}", "00".repeat(160))
+        let mut bytes = [0u8; OPERATIONAL_BUNDLE_LEN];
+        bytes[0] = 0x01;
+        // op field (offset 65..97, §7.7): must be a valid nonzero secp256k1
+        // scalar now that a successful entrust derives + inserts its
+        // x-only pubkey into subject_ops. All-zero (the prior fixture) is
+        // an invalid secret key and would make the derivation step fail.
+        bytes[65..97].copy_from_slice(&[0x99u8; 32]);
+        encode_hex(&bytes)
     }
 
     fn bootstrap_ownership_body(
@@ -5651,6 +5659,165 @@ mod tests {
         assert_eq!(req.subject, subject_bech);
         assert_eq!(req.nonce, nonce.to_vec());
         assert_eq!(req.chan_bind, cb.to_vec());
+    }
+
+    #[tokio::test]
+    async fn entrust_success_populates_subject_ops_and_unblocks_grant_pull() {
+        use crate::ownership::{
+            encode_grant_asset_ids, encode_view_grant, grant_message_digest, ResolvedScope,
+            GRANT_VERSION,
+        };
+        use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
+        use sha2::{Digest, Sha256};
+
+        let host = "node.example.com";
+        let secp = Secp256k1::new();
+
+        // ---- entrust: real ownership identity + a bundle whose op field is
+        // a known, valid secp256k1 scalar ----
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let entrust_nonce = [0x77u8; 32];
+        let entrust_expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        let entrust_chal = pull_challenge_message(
+            ChallengeDomain::Entrust.as_str(),
+            &entrust_nonce,
+            &cb,
+            &subject_raw,
+            entrust_expiry,
+        );
+        let entrust_sig = ownership_fixtures::sign_chal(&sk, &entrust_chal);
+
+        let op_sk = SecretKey::from_slice(&[0x99u8; 32]).unwrap();
+        let op_kp = Keypair::from_secret_key(&secp, &op_sk);
+
+        let mut bundle_bytes = [0u8; OPERATIONAL_BUNDLE_LEN];
+        bundle_bytes[0] = 0x01;
+        bundle_bytes[65..97].copy_from_slice(&[0x99u8; 32]);
+        let bundle_hex = encode_hex(&bundle_bytes);
+
+        let kernel = Arc::new(ScriptedKernel {
+            entrust: Some(Ok(EntrustResult { accepted: true })),
+            pull: Some(Ok(sample_pull_result())),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone()).expect("router");
+
+        let entrust_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bootstrap/entrust")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        bootstrap_ownership_body(
+                            &subject_bech,
+                            &pk0,
+                            &nkc,
+                            &entrust_nonce,
+                            entrust_expiry,
+                            &entrust_sig,
+                            Some(&bundle_hex),
+                        )
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(entrust_res.status(), StatusCode::OK);
+        let entrust_json: Value = serde_json::from_slice(&body_bytes(entrust_res).await).unwrap();
+        assert_eq!(entrust_json["accepted"], true);
+        assert_eq!(kernel.entrust_calls.load(Ordering::SeqCst), 1);
+
+        // ---- grant pull: grantee holds an op-signed grant for `subject`.
+        // Before this fix this always 401ed ("subject_ops directory has no
+        // entry"). Must now succeed since entrust just installed op_pk for
+        // subject_raw in the SAME router's AppState. ----
+        let grantee_sk = SecretKey::from_slice(&[0x66u8; 32]).unwrap();
+        let grantee_kp = Keypair::from_secret_key(&secp, &grantee_sk);
+        let (grantee_xonly, _) = grantee_kp.x_only_public_key();
+        let grantee_pk = grantee_xonly.serialize();
+        let grant_scope = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![[0x01u8; 32]],
+            not_before: 100,
+            not_after: 9_000_000_000,
+        };
+        let grant_expiry = 4_000_000_000u64;
+        let grant_nonce = [0x88u8; 16];
+        let asset_enc =
+            encode_grant_asset_ids(grant_scope.all_assets, &grant_scope.asset_ids).unwrap();
+        let (grant_message, _) = grant_message_digest(
+            GRANT_VERSION,
+            &subject_raw,
+            &grantee_pk,
+            &asset_enc,
+            grant_scope.not_before,
+            grant_scope.not_after,
+            grant_expiry,
+            &grant_nonce,
+        );
+        let grant_msg = Message::from_digest_slice(&grant_message).unwrap();
+        let op_sig = secp.sign_schnorr_no_aux_rand(&grant_msg, &op_kp);
+        let mut op_sig_bytes = [0u8; 64];
+        op_sig_bytes.copy_from_slice(op_sig.as_ref());
+        let grant_bech = encode_view_grant(
+            &subject_raw,
+            &grantee_pk,
+            &grant_scope,
+            grant_expiry,
+            &grant_nonce,
+            &op_sig_bytes,
+        )
+        .unwrap();
+
+        let pull_nonce = [0x99u8; 32];
+        let pull_expiry = 1_700_000_060u64;
+        let mut chal_pre = Vec::new();
+        chal_pre.extend_from_slice(PULL_CHALLENGE_DOMAIN.as_bytes());
+        chal_pre.extend_from_slice(&pull_nonce);
+        chal_pre.extend_from_slice(&cb);
+        chal_pre.extend_from_slice(&subject_raw);
+        chal_pre.extend_from_slice(&pull_expiry.to_be_bytes());
+        let chal: [u8; 32] = Sha256::digest(&chal_pre).into();
+        let chal_msg = Message::from_digest_slice(&chal).unwrap();
+        let grantee_sig = secp.sign_schnorr_no_aux_rand(&chal_msg, &grantee_kp);
+        let mut grantee_sig_bytes = [0u8; 64];
+        grantee_sig_bytes.copy_from_slice(grantee_sig.as_ref());
+
+        let pull_body = serde_json::json!({
+            "nonce": encode_hex(&pull_nonce),
+            "expiry": pull_expiry.to_string(),
+            "proof": {
+                "type": "grant",
+                "grant": grant_bech,
+                "grantee_pk": encode_hex(&grantee_pk),
+                "signature": encode_hex(&grantee_sig_bytes),
+            }
+        });
+        let pull_res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull")
+                    .header("content-type", "application/json")
+                    .body(Body::from(pull_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = pull_res.status();
+        let resp_body = body_bytes(pull_res).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "grant pull must no longer 401 for a missing subject_ops entry \
+             now that entrust populates it; body={}",
+            String::from_utf8_lossy(&resp_body)
+        );
+        assert_eq!(kernel.pull_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

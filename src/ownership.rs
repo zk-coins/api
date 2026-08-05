@@ -771,16 +771,28 @@ pub struct VerifiedGrant {
 
 /// Process-local map of subject address → published `op_pubkey`.
 ///
-/// §5.1(b) step 1 requires the subject's **published** op. Until Nostr
-/// kind-30420 profile resolution (with the §4.3 address binding) is wired,
-/// this directory is the sole API-edge source. It starts **empty**: every
-/// GrantProof fails closed at the op-signature step. Entries may be installed
-/// only after an authenticated path has bound `op_pubkey` to the subject
-/// (tests install fixtures; a future profile-resolution worker writes here).
+/// §5.1(b) step 1 requires the subject's **published** op. Population
+/// happens at `POST /v1/bootstrap/entrust`: when the kernel accepts a
+/// subject's entrust, the api derives the x-only public key from the
+/// `op` field (byte offset 65..97 of the §7.7 Operational Bundle) of the
+/// bundle the subject itself submitted under an authenticated
+/// OwnershipProof, and installs it under that subject's address. That is
+/// the legitimate binding — the subject authenticates as itself and hands
+/// over exactly the key material GrantProof needs for step-1 verification.
+/// No new trust assumption; no foreign claim about another subject.
+///
+/// The directory is **process-local, not durable**: it starts empty on
+/// every boot (like the kernel-side `BundleStore`), so GrantProof for a
+/// subject fails closed at §5.1(b) step 1 until that subject re-entrusts
+/// in this process. Tests may still install fixtures directly. Nostr
+/// kind-30420 profile resolution (with the §4.3 address binding) may
+/// become an additional population source later; it is not required for
+/// the entrust path above.
 ///
 /// Not a config default and not an operator free-form setting for foreign
 /// subjects — a forged entry would make grants verify under an attacker's
-/// key (see the §4.3 binding threat).
+/// key (see the §4.3 binding threat). The entrust path upholds this: only
+/// the subject that authenticated itself gets its own op installed.
 #[derive(Debug, Default)]
 pub struct SubjectOpDirectory {
     inner: RwLock<HashMap<[u8; 32], [u8; 32]>>,

@@ -36,6 +36,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -223,6 +224,20 @@ pub async fn post_bootstrap_entrust(
     let bundle_bytes = parse_operational_bundle_hex(&bundle)?;
     drop(bundle);
 
+    // Copy out the `op` secret (§7.7 layout offset 65..97 — the operational
+    // signing key, NOT the unrelated `op_secret` nav_rand field at
+    // 129..161) before `bundle_bytes` moves into the kernel request below.
+    // Only the derived PUBLIC key is ever installed into subject_ops, and
+    // only after the kernel confirms the entrust succeeded (see below) —
+    // this is just a byte copy so the value survives that move.
+    let op_secret_bytes: [u8; 32] = bundle_bytes
+        .get(65..97)
+        .ok_or_else(|| {
+            ApiError::internal("operational bundle too short to hold the op secret at [65..97]")
+        })?
+        .try_into()
+        .map_err(|_| ApiError::internal("op secret slice is not exactly 32 bytes"))?;
+
     // GrantProof arm → 401; Ownership arm carries the subject (no outer field).
     let ownership_proof = ownership_proof.require_ownership()?;
     let subject = ownership_proof.subject.clone();
@@ -249,6 +264,23 @@ pub async fn post_bootstrap_entrust(
             chan_bind: verified.chan_bind.to_vec(),
         })
         .await?;
+
+    // Population point (Requirement 9(c)): the kernel just accepted THIS
+    // subject's own entrusted bundle under an authenticated OwnershipProof
+    // — this is the moment the api co-located with the node legitimately
+    // learns the subject's real op_pubkey. Only on success; a rejected
+    // entrust must never seed the directory with an unconfirmed key.
+    if result.accepted {
+        let secp = Secp256k1::new();
+        let op_sk = SecretKey::from_slice(&op_secret_bytes).map_err(|_| {
+            ApiError::internal("entrusted bundle op field is not a valid secp256k1 secret key")
+        })?;
+        let op_kp = Keypair::from_secret_key(&secp, &op_sk);
+        let (op_xonly, _parity) = op_kp.x_only_public_key();
+        state
+            .subject_ops
+            .insert(verified.subject_raw, op_xonly.serialize());
+    }
 
     let body = json!({ "accepted": result.accepted });
     Ok((StatusCode::OK, Json(body)).into_response())
