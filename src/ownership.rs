@@ -816,6 +816,13 @@ impl SubjectOpDirectory {
         let guard = self.inner.read().expect("subject_ops lock poisoned");
         guard.get(subject).copied()
     }
+
+    /// Remove the published op for `subject` (§7.7 revoke cease-use). No-op
+    /// (not an error) if the subject has no cached entry.
+    pub fn remove(&self, subject: &[u8; 32]) {
+        let mut guard = self.inner.write().expect("subject_ops lock poisoned");
+        guard.remove(subject);
+    }
 }
 
 /// Node-local revocation set for `grant_id` (§5.2 — forward-only).
@@ -1634,6 +1641,25 @@ mod tests {
             SessionAuthority::Ownership.as_str(),
             SessionAuthority::Grant.as_str()
         );
+    }
+
+    #[test]
+    fn subject_op_directory_remove_clears_entry() {
+        let dir = SubjectOpDirectory::new();
+        let subject = [0x11u8; 32];
+        let op_pk = [0x22u8; 32];
+        dir.insert(subject, op_pk);
+        assert_eq!(dir.get(&subject), Some(op_pk));
+        dir.remove(&subject);
+        assert_eq!(dir.get(&subject), None);
+    }
+
+    #[test]
+    fn subject_op_directory_remove_absent_subject_is_noop() {
+        let dir = SubjectOpDirectory::new();
+        let subject = [0x33u8; 32];
+        dir.remove(&subject);
+        assert_eq!(dir.get(&subject), None);
     }
 
     #[test]

@@ -315,6 +315,13 @@ pub async fn post_bootstrap_revoke(
         })
         .await?;
 
+    // §7.7 cease-use: drop the cached op so grant proofs under the revoked
+    // key fail closed immediately (no process restart required). Only when
+    // the kernel actually revoked — a no-op revoke must not clear a live op.
+    if result.revoked {
+        state.subject_ops.remove(&verified.subject_raw);
+    }
+
     let body = json!({ "revoked": result.revoked });
     Ok((StatusCode::OK, Json(body)).into_response())
 }
