@@ -26,6 +26,7 @@ dependencies = [
  "bech32",
  "bitcoin",
  "futures-util",
+ "getrandom",
  "http-body-util",
  "kernel-proto",
  "prost",

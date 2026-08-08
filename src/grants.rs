@@ -1,9 +1,11 @@
-//! View-grant REST surface (§7.5 L2895–L2896).
+//! View-grant REST surface (§7.5 L2895–L2896 / §5.2).
 //!
 //! | Method | Path | Kernel |
 //! |---|---|---|
 //! | `POST` | `/v1/grants/challenge` | `OpenPullChallenge` action=`issue_grant` |
 //! | `POST` | `/v1/grants` | `IssueViewGrant` (after OwnershipProof) |
+//! | `POST` | `/v1/grants/revoke/challenge` | none (api-local store) |
+//! | `POST` | `/v1/grants/revoke` | none (api-local `revoked_grants`) |
 //!
 //! A GrantProof is rejected here (no-escalation). The kernel message has no
 //! capability field — only the API edge can enforce this.
@@ -13,9 +15,11 @@ use crate::extract::JsonBody;
 use crate::hexutil::{decode_hex_exact, encode_hex};
 use crate::kernel::kernel_v1::{GrantRequest, PullChallengeRequest, Scope};
 use crate::ownership::{
-    decode_zk_address, encode_grant_asset_ids, issue_grant_request_hash, parse_u64_decimal,
-    validate_resolved_scope, verify_ownership_proof, ChallengeDomain, ChallengeEcho,
-    OwnerOnlyProofJson, ResolvedScope, ISSUE_GRANT_CHALLENGE_DOMAIN, SCOPE_NOT_AFTER_UNBOUNDED,
+    decode_view_grant, decode_zk_address, encode_grant_asset_ids, encode_zk_address_public,
+    issue_grant_request_hash, parse_u64_decimal, validate_resolved_scope, verify_ownership_proof,
+    verify_simple_ownership_proof, ChallengeDomain, ChallengeEcho, OwnerOnlyProofJson,
+    ResolvedScope, ISSUE_GRANT_CHALLENGE_DOMAIN, REVOKE_GRANT_CHALLENGE_DOMAIN,
+    SCOPE_NOT_AFTER_UNBOUNDED,
 };
 use crate::state::AppState;
 use axum::extract::State;
@@ -53,6 +57,37 @@ pub struct IssueGrantBody {
     pub expiry: String,
     pub challenge: ChallengeEcho,
     pub ownership_proof: OwnerOnlyProofJson,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GrantsRevokeChallengeBody {
+    pub subject: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GrantRevokeNonce {
+    pub nonce: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GrantsRevokeBody {
+    pub challenge: GrantRevokeNonce,
+    pub ownership_proof: OwnerOnlyProofJson,
+    pub grant: String,
+}
+
+/// §5.1 RECOMMENDED challenge TTL, gespiegelt von
+/// `node/src/kernel/bootstrap/challenges.rs::CHALLENGE_TTL_SECS` (60s) — die
+/// gleiche Grössenordnung wie jede andere Challenge in diesem System, auch
+/// wenn dieser Store rein api-lokal ist.
+const GRANT_REVOKE_CHALLENGE_TTL_SECS: u64 = 60;
+
+fn unix_now() -> Result<u64, ApiError> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| ApiError::internal("system clock is before Unix epoch"))
 }
 
 // ---------------------------------------------------------------------------
@@ -243,5 +278,93 @@ pub async fn post_grants(
         ));
     }
     let body = json!({ "grant": result.grant });
+    Ok((StatusCode::OK, Json(body)).into_response())
+}
+
+/// `POST /v1/grants/revoke/challenge` — issue a fresh single-use nonce for
+/// grant revocation. Rein api-lokal, kein Kernel-Dial (§5.2).
+pub async fn post_grants_revoke_challenge(
+    State(state): State<AppState>,
+    JsonBody(body): JsonBody<GrantsRevokeChallengeBody>,
+) -> Result<Response, ApiError> {
+    if body.subject.is_empty() {
+        return Err(ApiError::malformed("subject is required"));
+    }
+    let subject_raw = decode_zk_address(&body.subject)?;
+    let now = unix_now()?;
+    let expiry = now.saturating_add(GRANT_REVOKE_CHALLENGE_TTL_SECS);
+    let nonce = state.grant_revoke_challenges.issue(subject_raw, expiry);
+
+    let body = json!({
+        "nonce": encode_hex(&nonce),
+        "expiry": expiry.to_string(),
+        "domain": REVOKE_GRANT_CHALLENGE_DOMAIN,
+    });
+    Ok((StatusCode::OK, Json(body)).into_response())
+}
+
+/// `POST /v1/grants/revoke` — verify OwnershipProof under RevokeGrant domain
+/// and grant→subject binding, then populate `revoked_grants`. Rein api-lokal,
+/// KEIN Kernel-Dial an irgendeiner Stelle (§5.2).
+pub async fn post_grants_revoke(
+    State(state): State<AppState>,
+    JsonBody(body): JsonBody<GrantsRevokeBody>,
+) -> Result<Response, ApiError> {
+    // 1. Capability gate — GrantProof-Arm wird mit 401 abgewiesen, bevor der
+    //    Nonce-Store überhaupt angefasst wird (no-escalation, wie überall sonst).
+    let ownership_proof = body.ownership_proof.require_ownership()?;
+
+    // 2. Single-use take — DAS ist der Single-Use-Check. Unbekannt ODER
+    //    bereits verbraucht sehen von aussen identisch aus (401), keine
+    //    Unterscheidung, die Existenz/Timing leakt.
+    let nonce_bytes = decode_hex_exact(&body.challenge.nonce, 32)
+        .map_err(|e| ApiError::malformed(format!("challenge.nonce: {e}")))?;
+    let mut nonce_raw = [0u8; 32];
+    nonce_raw.copy_from_slice(&nonce_bytes);
+    let entry = state
+        .grant_revoke_challenges
+        .take(&nonce_raw)
+        .ok_or_else(|| {
+            ApiError::unauthorized("unknown or already-consumed grant-revoke challenge nonce")
+        })?;
+
+    // 3. Expiry — der Store ist hier der einzige Prüfer (kein Kernel dahinter).
+    let now = unix_now()?;
+    if now > entry.expiry {
+        return Err(ApiError::unauthorized("grant-revoke challenge has expired"));
+    }
+
+    // 4. OwnershipProof unter RevokeGrant-Domain verifizieren. subject UND
+    //    expiry kommen aus `entry` (dem Store), NICHT aus dem Client-Body —
+    //    der Body trägt für `challenge` nur `nonce`, keine `expiry`. chan_bind
+    //    bleibt server-autoritativ (state.public_hosts), wie überall sonst.
+    let subject_bech32 = encode_zk_address_public(&entry.subject)?;
+    let echo = ChallengeEcho {
+        nonce: body.challenge.nonce.clone(),
+        expiry: entry.expiry.to_string(),
+    };
+    let _verified = verify_simple_ownership_proof(
+        ChallengeDomain::RevokeGrant,
+        &subject_bech32,
+        &echo,
+        &ownership_proof,
+        state.public_hosts.as_slice(),
+    )?;
+
+    // 5. Grant decodieren + grant→subject-Bindung (DoS-Schutz): eine fremde
+    //    grant_id darf nicht revozierbar sein, nur weil jemand ein gültiges
+    //    OwnershipProof für SEIN EIGENES subject vorlegt.
+    let grant = decode_view_grant(&body.grant)?;
+    if grant.subject != entry.subject {
+        return Err(ApiError::unauthorized(
+            "grant.subject does not match the authenticated revoke subject",
+        ));
+    }
+
+    // 6. Population — der einzige Schreibzugriff auf revoked_grants in dieser
+    //    Datei. KEIN Kernel-Dial an irgendeiner Stelle in diesem Handler.
+    state.revoked_grants.revoke(grant.grant_id);
+
+    let body = json!({ "revoked": true });
     Ok((StatusCode::OK, Json(body)).into_response())
 }

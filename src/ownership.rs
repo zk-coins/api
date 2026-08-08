@@ -54,6 +54,11 @@ pub const ENTRUST_CHALLENGE_DOMAIN: &str = "zkCoins/v1/EntrustChallenge";
 /// `node/src/kernel/bootstrap/challenges.rs`.
 pub const REVOKE_CHALLENGE_DOMAIN: &str = "zkCoins/v1/RevokeChallenge";
 
+/// api-local — §5.2 grant revocation has no kernel-side challenge (the
+/// kernel does not know about grants). Issued and redeemed entirely by
+/// `GrantRevokeChallengeStore`.
+pub const REVOKE_GRANT_CHALLENGE_DOMAIN: &str = "zkCoins/v1/RevokeGrantChallenge";
+
 /// §7.5 `request_hash` tag for `POST /v1/attest/balance`.
 pub const ATTEST_BALANCE_REQUEST_TAG: &str = "zkCoins/v1/AttestBalance";
 
@@ -100,6 +105,8 @@ pub enum ChallengeDomain {
     Entrust,
     /// `POST /v1/bootstrap/revoke` — no `request_hash` (§7.7).
     Revoke,
+    /// `POST /v1/grants/revoke` — api-local, no kernel Redeem (§5.2).
+    RevokeGrant,
 }
 
 impl ChallengeDomain {
@@ -111,6 +118,7 @@ impl ChallengeDomain {
             ChallengeDomain::IssueGrant => ISSUE_GRANT_CHALLENGE_DOMAIN,
             ChallengeDomain::Entrust => ENTRUST_CHALLENGE_DOMAIN,
             ChallengeDomain::Revoke => REVOKE_CHALLENGE_DOMAIN,
+            ChallengeDomain::RevokeGrant => REVOKE_GRANT_CHALLENGE_DOMAIN,
         }
     }
 
@@ -118,7 +126,10 @@ impl ChallengeDomain {
     pub const fn is_simple(self) -> bool {
         matches!(
             self,
-            ChallengeDomain::Pull | ChallengeDomain::Entrust | ChallengeDomain::Revoke
+            ChallengeDomain::Pull
+                | ChallengeDomain::Entrust
+                | ChallengeDomain::Revoke
+                | ChallengeDomain::RevokeGrant
         )
     }
 }
@@ -849,6 +860,61 @@ impl RevokedGrantSet {
     }
 }
 
+/// A single issued-but-not-yet-consumed grant-revoke challenge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChallengeEntry {
+    pub subject: [u8; 32],
+    pub expiry: u64,
+}
+
+/// Single-use, api-local challenge store for `POST /v1/grants/revoke` (§5.2).
+///
+/// Grant revocation is enforced entirely inside this process — the kernel has
+/// no concept of grants and therefore no Redeem RPC that could consume this
+/// nonce for us. This store IS the single-use and expiry enforcement for the
+/// grant-revoke action, analogous to `SubjectOpDirectory` / `RevokedGrantSet`:
+/// process-local, starts empty on every boot, no durability.
+#[derive(Debug, Default)]
+pub struct GrantRevokeChallengeStore {
+    inner: RwLock<HashMap<[u8; 32], ChallengeEntry>>,
+}
+
+impl GrantRevokeChallengeStore {
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Issue a fresh single-use nonce bound to `subject` and `expiry`.
+    /// Nonce is 32 CSPRNG bytes (`getrandom::fill`) — no fixed-nonce fallback,
+    /// no weak RNG. A broken system CSPRNG is an unrecoverable process
+    /// invariant violation (same class as a poisoned lock elsewhere in this
+    /// file) and panics loudly rather than silently degrading the nonce.
+    pub fn issue(&self, subject: [u8; 32], expiry: u64) -> [u8; 32] {
+        let mut nonce = [0u8; 32];
+        getrandom::fill(&mut nonce)
+            .expect("system CSPRNG must be available to issue a grant-revoke challenge nonce");
+        let mut guard = self
+            .inner
+            .write()
+            .expect("grant_revoke_challenges lock poisoned");
+        guard.insert(nonce, ChallengeEntry { subject, expiry });
+        nonce
+    }
+
+    /// Atomically remove and return the entry for `nonce` — this IS the
+    /// single-use check. `None` covers both "never issued" and "already
+    /// consumed"; callers must not distinguish the two in the response.
+    pub fn take(&self, nonce: &[u8; 32]) -> Option<ChallengeEntry> {
+        let mut guard = self
+            .inner
+            .write()
+            .expect("grant_revoke_challenges lock poisoned");
+        guard.remove(nonce)
+    }
+}
+
 /// Verify an OwnershipProof for domains **without** `request_hash`
 /// (Pull / Entrust / Revoke — §5.1 L1916 / §7.7).
 ///
@@ -1490,9 +1556,38 @@ mod tests {
         );
         assert!(ChallengeDomain::Entrust.is_simple());
         assert!(ChallengeDomain::Revoke.is_simple());
+        assert!(ChallengeDomain::RevokeGrant.is_simple());
         assert!(ChallengeDomain::Pull.is_simple());
         assert!(!ChallengeDomain::AttestBalance.is_simple());
         assert!(!ChallengeDomain::IssueGrant.is_simple());
+        assert_eq!(
+            ChallengeDomain::RevokeGrant.as_str(),
+            REVOKE_GRANT_CHALLENGE_DOMAIN
+        );
+    }
+
+    #[test]
+    fn grant_revoke_challenge_store_issue_distinct_and_take_is_single_use() {
+        let store = GrantRevokeChallengeStore::new();
+        let subject = [0xABu8; 32];
+        let expiry = 1_700_000_060u64;
+        let n1 = store.issue(subject, expiry);
+        let n2 = store.issue(subject, expiry);
+        assert_ne!(n1, n2, "CSPRNG nonces must be distinct across issues");
+
+        let entry = store
+            .take(&n1)
+            .expect("first take must return issued entry");
+        assert_eq!(entry.subject, subject);
+        assert_eq!(entry.expiry, expiry);
+        assert!(
+            store.take(&n1).is_none(),
+            "second take must be None (single-use)"
+        );
+        assert!(
+            store.take(&[0u8; 32]).is_none(),
+            "never-issued nonce must be None"
+        );
     }
 
     #[test]

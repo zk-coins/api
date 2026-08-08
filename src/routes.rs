@@ -56,7 +56,7 @@ impl std::error::Error for StartupError {}
 
 /// Closed `endpoints` key set from specification §7.5 (`GET /` row).
 ///
-/// Full inventory of the 28 logical names a conforming producer may emit
+/// Full inventory of the 30 logical names a conforming producer may emit
 /// (data permanence: no `blossom_delete`). Order matches the closed §7.5
 /// listing. This constant is the reference for surfaces not yet built; it is
 /// **not** what `GET /` returns.
@@ -100,6 +100,8 @@ pub const CLOSED_ENDPOINT_KEYS: &[(&str, &str)] = &[
     ("blossom_get", "/blossom/<sha256>"),
     ("blossom_head", "/blossom/<sha256>"),
     ("blossom_upload", "/blossom/upload"),
+    ("grants_revoke_challenge", "/v1/grants/revoke/challenge"),
+    ("grants_revoke", "/v1/grants/revoke"),
 ];
 
 /// Surfaces this process actually registers (and therefore advertises on `GET /`).
@@ -126,7 +128,7 @@ pub const CLOSED_ENDPOINT_KEYS: &[(&str, &str)] = &[
 /// |---|---|
 /// | `health`, `health_ready`, `info` | always (API process) |
 /// | `chain_*` | `explorer` |
-/// | `tx`, `jobs*`, `attest_*`, `grants_*`, `pull*`, `record`, `proof`, `account_state`, `receipts_stream`, `bootstrap_*` | `wallet` |
+/// | `tx`, `jobs*`, `attest_*`, `grants_*`, `grants_revoke*`, `pull*`, `record`, `proof`, `account_state`, `receipts_stream`, `bootstrap_*` | `wallet` |
 /// | `publish_spendrecord` | `publisher` |
 /// | `blossom_get` / `blossom_head` / `blossom_upload` | `ZKCOINS_BLOSSOM_STORE` **and** (`wallet` **or** `explorer`) |
 ///
@@ -165,6 +167,8 @@ enum ServedSurface {
     BlossomGet,
     BlossomHead,
     BlossomUpload,
+    GrantsRevokeChallenge,
+    GrantsRevoke,
 }
 
 impl ServedSurface {
@@ -201,6 +205,8 @@ impl ServedSurface {
         ServedSurface::BlossomGet,
         ServedSurface::BlossomHead,
         ServedSurface::BlossomUpload,
+        ServedSurface::GrantsRevokeChallenge,
+        ServedSurface::GrantsRevoke,
     ];
 
     /// Whether this surface is a Blossom inventory key.
@@ -245,7 +251,9 @@ impl ServedSurface {
             | ServedSurface::ReceiptsStream
             | ServedSurface::BootstrapChallenge
             | ServedSurface::BootstrapEntrust
-            | ServedSurface::BootstrapRevoke => features.contains(&Feature::Wallet),
+            | ServedSurface::BootstrapRevoke
+            | ServedSurface::GrantsRevokeChallenge
+            | ServedSurface::GrantsRevoke => features.contains(&Feature::Wallet),
 
             // `publisher` — hand-off endpoint (§6.1 L2339; rest-surface #23).
             ServedSurface::PublishSpendrecord => features.contains(&Feature::Publisher),
@@ -303,6 +311,8 @@ impl ServedSurface {
             ServedSurface::BlossomGet => "blossom_get",
             ServedSurface::BlossomHead => "blossom_head",
             ServedSurface::BlossomUpload => "blossom_upload",
+            ServedSurface::GrantsRevokeChallenge => "grants_revoke_challenge",
+            ServedSurface::GrantsRevoke => "grants_revoke",
         }
     }
 
@@ -371,6 +381,10 @@ impl ServedSurface {
                         .layer(DefaultBodyLimit::max(limit)),
                 )
             }
+            ServedSurface::GrantsRevokeChallenge => {
+                router.route(&path, post(grants::post_grants_revoke_challenge))
+            }
+            ServedSurface::GrantsRevoke => router.route(&path, post(grants::post_grants_revoke)),
         }
     }
 
@@ -409,7 +423,9 @@ impl ServedSurface {
             | ServedSurface::PublishSpendrecord
             | ServedSurface::BootstrapChallenge
             | ServedSurface::BootstrapEntrust
-            | ServedSurface::BootstrapRevoke => router.route(&path, post(feature_disabled_handler)),
+            | ServedSurface::BootstrapRevoke
+            | ServedSurface::GrantsRevokeChallenge
+            | ServedSurface::GrantsRevoke => router.route(&path, post(feature_disabled_handler)),
             ServedSurface::BlossomUpload => router.route(
                 &path,
                 put(feature_disabled_handler).post(feature_disabled_handler),
@@ -554,6 +570,7 @@ pub fn build_router(config: Config, kernel: KernelHandle) -> Result<Router, Star
         blossom: blossom_state,
         subject_ops: Arc::new(crate::ownership::SubjectOpDirectory::new()),
         revoked_grants: Arc::new(crate::ownership::RevokedGrantSet::new()),
+        grant_revoke_challenges: Arc::new(crate::ownership::GrantRevokeChallengeStore::new()),
     };
 
     // Register every inventory surface as `Router<AppState>`, then bind state
@@ -799,18 +816,20 @@ mod tests {
         "blossom_get",
         "blossom_head",
         "blossom_upload",
+        "grants_revoke_challenge",
+        "grants_revoke",
     ];
 
     #[test]
     fn closed_endpoint_keys_inventory_matches_spec() {
         assert_eq!(
             CLOSED_ENDPOINT_KEYS.len(),
-            28,
-            "CLOSED_ENDPOINT_KEYS must list all 28 §7.5 closed keys (no blossom_delete)"
+            30,
+            "CLOSED_ENDPOINT_KEYS must list all 30 §7.5 closed keys (no blossom_delete)"
         );
         assert_eq!(
             SPEC_CLOSED_KEYS.len(),
-            28,
+            30,
             "spec key list fixture must stay in sync with closed inventory"
         );
         for (i, (key, path)) in CLOSED_ENDPOINT_KEYS.iter().enumerate() {
@@ -833,7 +852,7 @@ mod tests {
         }
         let keys: BTreeSet<&str> = CLOSED_ENDPOINT_KEYS.iter().map(|(k, _)| *k).collect();
         assert!(!keys.contains(""), "empty discovery key is invalid");
-        assert_eq!(keys.len(), 28, "closed keys must be unique");
+        assert_eq!(keys.len(), 30, "closed keys must be unique");
         assert!(
             !keys.contains("blossom_delete"),
             "data permanence: blossom_delete must not be in the inventory"
@@ -935,8 +954,10 @@ mod tests {
                 "bootstrap_challenge",
                 "bootstrap_entrust",
                 "bootstrap_revoke",
+                "grants_revoke_challenge",
+                "grants_revoke",
             ]),
-            "test_config (wallet+explorer+publisher, no blossom) advertises 25 keys"
+            "test_config (wallet+explorer+publisher, no blossom) advertises 27 keys"
         );
         assert_eq!(
             endpoints["bootstrap_challenge"].as_str(),
@@ -988,6 +1009,14 @@ mod tests {
             Some("/v1/grants/challenge")
         );
         assert_eq!(endpoints["grants"].as_str(), Some("/v1/grants"));
+        assert_eq!(
+            endpoints["grants_revoke_challenge"].as_str(),
+            Some("/v1/grants/revoke/challenge")
+        );
+        assert_eq!(
+            endpoints["grants_revoke"].as_str(),
+            Some("/v1/grants/revoke")
+        );
         assert_eq!(
             endpoints["pull_challenge"].as_str(),
             Some("/v1/pull/challenge")
@@ -4334,6 +4363,7 @@ mod tests {
             blossom: None,
             subject_ops,
             revoked_grants: Arc::new(RevokedGrantSet::new()),
+            grant_revoke_challenges: Arc::new(crate::ownership::GrantRevokeChallengeStore::new()),
         };
         let app = {
             let mut router = Router::new().route("/", get(root));
@@ -7339,5 +7369,533 @@ mod tests {
             "upload body must be only {{ blob_id }}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // §5.2 Grant revocation — api-local store + REST (no kernel dial)
+    // -----------------------------------------------------------------------
+
+    /// Build a structurally valid, op-signed zkgrant for `subject`.
+    fn test_signed_zkgrant(
+        subject: &[u8; 32],
+        op_sk_seed: u8,
+        grantee_sk_seed: u8,
+        grant_nonce_seed: u8,
+    ) -> (String, [u8; 32], [u8; 32], Keypair) {
+        use crate::ownership::{
+            encode_grant_asset_ids, encode_view_grant, grant_message_digest, ResolvedScope,
+            GRANT_VERSION,
+        };
+
+        let secp = Secp256k1::new();
+        let op_sk = SecretKey::from_slice(&[op_sk_seed; 32]).unwrap();
+        let op_kp = Keypair::from_secret_key(&secp, &op_sk);
+        let (op_xonly, _) = op_kp.x_only_public_key();
+        let op_pk = op_xonly.serialize();
+        let grantee_sk = SecretKey::from_slice(&[grantee_sk_seed; 32]).unwrap();
+        let grantee_kp = Keypair::from_secret_key(&secp, &grantee_sk);
+        let (grantee_xonly, _) = grantee_kp.x_only_public_key();
+        let grantee_pk = grantee_xonly.serialize();
+        let grant_scope = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![[0x01u8; 32]],
+            not_before: 100,
+            not_after: 9_000_000_000,
+        };
+        let grant_expiry = 4_000_000_000u64;
+        let grant_nonce = [grant_nonce_seed; 16];
+        let asset_enc =
+            encode_grant_asset_ids(grant_scope.all_assets, &grant_scope.asset_ids).unwrap();
+        let (grant_message, _) = grant_message_digest(
+            GRANT_VERSION,
+            subject,
+            &grantee_pk,
+            &asset_enc,
+            grant_scope.not_before,
+            grant_scope.not_after,
+            grant_expiry,
+            &grant_nonce,
+        );
+        let msg = Message::from_digest_slice(&grant_message).unwrap();
+        let op_sig = secp.sign_schnorr_no_aux_rand(&msg, &op_kp);
+        let mut op_sig_bytes = [0u8; 64];
+        op_sig_bytes.copy_from_slice(op_sig.as_ref());
+        let grant_bech = encode_view_grant(
+            subject,
+            &grantee_pk,
+            &grant_scope,
+            grant_expiry,
+            &grant_nonce,
+            &op_sig_bytes,
+        )
+        .unwrap();
+        (grant_bech, op_pk, grantee_pk, grantee_kp)
+    }
+
+    async fn issue_grant_revoke_challenge(
+        app: &axum::Router,
+        subject_bech: &str,
+    ) -> (String, u64, [u8; 32]) {
+        use crate::ownership::REVOKE_GRANT_CHALLENGE_DOMAIN;
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants/revoke/challenge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "subject": subject_bech }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["domain"], REVOKE_GRANT_CHALLENGE_DOMAIN);
+        let nonce_hex = json["nonce"].as_str().expect("nonce").to_string();
+        let expiry: u64 = json["expiry"]
+            .as_str()
+            .expect("expiry")
+            .parse()
+            .expect("expiry decimal");
+        let nonce_bytes = crate::hexutil::decode_hex_exact(&nonce_hex, 32).expect("nonce hex");
+        let mut nonce_raw = [0u8; 32];
+        nonce_raw.copy_from_slice(&nonce_bytes);
+        (nonce_hex, expiry, nonce_raw)
+    }
+
+    fn grant_revoke_ownership_body(
+        nonce_hex: &str,
+        subject_bech: &str,
+        pk0: &[u8; 32],
+        nkc: &[u8; 32],
+        sig: &[u8; 64],
+        grant_bech: &str,
+    ) -> Value {
+        serde_json::json!({
+            "challenge": { "nonce": nonce_hex },
+            "ownership_proof": ownership_proof_json(subject_bech, pk0, nkc, sig),
+            "grant": grant_bech,
+        })
+    }
+
+    #[tokio::test]
+    async fn grants_revoke_happy_path_populates_revoked_set_and_blocks_pull() {
+        use crate::ownership::{
+            pull_challenge_message, GrantRevokeChallengeStore, RevokedGrantSet, SubjectOpDirectory,
+            PULL_CHALLENGE_DOMAIN, REVOKE_GRANT_CHALLENGE_DOMAIN,
+        };
+        use bitcoin::secp256k1::{Message, Secp256k1};
+        use sha2::{Digest, Sha256};
+
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let (grant_bech, op_pk, grantee_pk, grantee_kp) =
+            test_signed_zkgrant(&subject_raw, 0x55, 0x66, 0x77);
+
+        let subject_ops = Arc::new(SubjectOpDirectory::new());
+        subject_ops.insert(subject_raw, op_pk);
+        let revoked_grants = Arc::new(RevokedGrantSet::new());
+        let grant_revoke_challenges = Arc::new(GrantRevokeChallengeStore::new());
+
+        // ScriptedKernel with no fields scripted — any accidental kernel dial panics.
+        let kernel = Arc::new(ScriptedKernel::default());
+        let config = test_config();
+        let state = AppState {
+            kernel: kernel.clone(),
+            features: config.features.clone(),
+            public_hosts: Arc::new(config.public_hosts.clone()),
+            blossom: None,
+            subject_ops,
+            revoked_grants: revoked_grants.clone(),
+            grant_revoke_challenges,
+        };
+        let app = {
+            let mut router = Router::new().route("/", get(root));
+            for surface in ServedSurface::active(&config.features, false) {
+                router = surface.register(router, None);
+            }
+            router.with_state(state)
+        };
+
+        let (nonce_hex, expiry, nonce_raw) =
+            issue_grant_revoke_challenge(&app, &subject_bech).await;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            REVOKE_GRANT_CHALLENGE_DOMAIN,
+            &nonce_raw,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        let revoke_body =
+            grant_revoke_ownership_body(&nonce_hex, &subject_bech, &pk0, &nkc, &sig, &grant_bech);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(revoke_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["revoked"], true);
+
+        // Enforcement coupling: same grant_id via GrantProof on /v1/pull → 401.
+        let challenge_nonce = [0x11u8; 32];
+        let chal_expiry = 1_700_000_060u64;
+        let mut chal_pre = Vec::new();
+        chal_pre.extend_from_slice(PULL_CHALLENGE_DOMAIN.as_bytes());
+        chal_pre.extend_from_slice(&challenge_nonce);
+        chal_pre.extend_from_slice(&cb);
+        chal_pre.extend_from_slice(&subject_raw);
+        chal_pre.extend_from_slice(&chal_expiry.to_be_bytes());
+        let pull_chal: [u8; 32] = Sha256::digest(&chal_pre).into();
+        let secp = Secp256k1::new();
+        let chal_msg = Message::from_digest_slice(&pull_chal).unwrap();
+        let grantee_sig = secp.sign_schnorr_no_aux_rand(&chal_msg, &grantee_kp);
+        let mut grantee_sig_bytes = [0u8; 64];
+        grantee_sig_bytes.copy_from_slice(grantee_sig.as_ref());
+
+        let pull_body = serde_json::json!({
+            "nonce": encode_hex(&challenge_nonce),
+            "expiry": chal_expiry.to_string(),
+            "proof": {
+                "type": "grant",
+                "grant": grant_bech,
+                "grantee_pk": encode_hex(&grantee_pk),
+                "signature": encode_hex(&grantee_sig_bytes),
+            }
+        });
+        let pull_res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull")
+                    .header("content-type", "application/json")
+                    .body(Body::from(pull_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pull_res.status(), StatusCode::UNAUTHORIZED);
+        let pull_json: Value = serde_json::from_slice(&body_bytes(pull_res).await).unwrap();
+        assert_eq!(pull_json["error"], "unauthorized");
+        assert!(
+            pull_json["message"].as_str().unwrap().contains("revoked"),
+            "message must name revocation: {}",
+            pull_json["message"]
+        );
+        assert_eq!(
+            kernel.pull_calls.load(Ordering::SeqCst),
+            0,
+            "revoked grant must not dial the kernel"
+        );
+    }
+
+    #[tokio::test]
+    async fn grants_revoke_foreign_grant_is_unauthorized_and_does_not_populate() {
+        use crate::ownership::{
+            pull_challenge_message, GrantRevokeChallengeStore, RevokedGrantSet, SubjectOpDirectory,
+            REVOKE_GRANT_CHALLENGE_DOMAIN,
+        };
+
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        // Grant bound to a different subject (DoS target).
+        let foreign_subject = [0x10u8; 32];
+        let (grant_bech, _op_pk, _grantee_pk, _grantee_kp) =
+            test_signed_zkgrant(&foreign_subject, 0x55, 0x66, 0x77);
+        // grant_id is H(grant_message); decode to read it after failed revoke.
+        let foreign_grant_id = crate::ownership::decode_view_grant(&grant_bech)
+            .expect("valid zkgrant")
+            .grant_id;
+
+        let revoked_grants = Arc::new(RevokedGrantSet::new());
+        let grant_revoke_challenges = Arc::new(GrantRevokeChallengeStore::new());
+        let kernel = Arc::new(ScriptedKernel::default());
+        let config = test_config();
+        let state = AppState {
+            kernel: kernel.clone(),
+            features: config.features.clone(),
+            public_hosts: Arc::new(config.public_hosts.clone()),
+            blossom: None,
+            subject_ops: Arc::new(SubjectOpDirectory::new()),
+            revoked_grants: revoked_grants.clone(),
+            grant_revoke_challenges,
+        };
+        let app = {
+            let mut router = Router::new().route("/", get(root));
+            for surface in ServedSurface::active(&config.features, false) {
+                router = surface.register(router, None);
+            }
+            router.with_state(state)
+        };
+
+        let (nonce_hex, expiry, nonce_raw) =
+            issue_grant_revoke_challenge(&app, &subject_bech).await;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            REVOKE_GRANT_CHALLENGE_DOMAIN,
+            &nonce_raw,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        let body =
+            grant_revoke_ownership_body(&nonce_hex, &subject_bech, &pk0, &nkc, &sig, &grant_bech);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+        assert!(
+            !revoked_grants.contains(&foreign_grant_id),
+            "foreign grant_id must not enter revoked_grants on failed binding check"
+        );
+    }
+
+    #[tokio::test]
+    async fn grants_revoke_nonce_is_single_use() {
+        use crate::ownership::{pull_challenge_message, REVOKE_GRANT_CHALLENGE_DOMAIN};
+
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let (grant_bech, _, _, _) = test_signed_zkgrant(&subject_raw, 0x55, 0x66, 0x77);
+
+        let kernel = Arc::new(ScriptedKernel::default());
+        let app = build_router(test_config(), kernel).expect("router");
+
+        let (nonce_hex, expiry, nonce_raw) =
+            issue_grant_revoke_challenge(&app, &subject_bech).await;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            REVOKE_GRANT_CHALLENGE_DOMAIN,
+            &nonce_raw,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        let body =
+            grant_revoke_ownership_body(&nonce_hex, &subject_bech, &pk0, &nkc, &sig, &grant_bech);
+
+        let res1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res1.status(), StatusCode::OK);
+
+        let res2 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res2.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res2).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn grants_revoke_expired_challenge_is_unauthorized() {
+        use crate::ownership::{
+            pull_challenge_message, GrantRevokeChallengeStore, RevokedGrantSet, SubjectOpDirectory,
+            REVOKE_GRANT_CHALLENGE_DOMAIN,
+        };
+
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let (grant_bech, _, _, _) = test_signed_zkgrant(&subject_raw, 0x55, 0x66, 0x77);
+
+        let challenges = Arc::new(GrantRevokeChallengeStore::new());
+        let past_expiry = 1u64;
+        let nonce_raw = challenges.issue(subject_raw, past_expiry);
+        let nonce_hex = encode_hex(&nonce_raw);
+
+        let kernel = Arc::new(ScriptedKernel::default());
+        let config = test_config();
+        let state = AppState {
+            kernel: kernel.clone(),
+            features: config.features.clone(),
+            public_hosts: Arc::new(config.public_hosts.clone()),
+            blossom: None,
+            subject_ops: Arc::new(SubjectOpDirectory::new()),
+            revoked_grants: Arc::new(RevokedGrantSet::new()),
+            grant_revoke_challenges: challenges,
+        };
+        let app = {
+            let mut router = Router::new().route("/", get(root));
+            for surface in ServedSurface::active(&config.features, false) {
+                router = surface.register(router, None);
+            }
+            router.with_state(state)
+        };
+
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            REVOKE_GRANT_CHALLENGE_DOMAIN,
+            &nonce_raw,
+            &cb,
+            &subject_raw,
+            past_expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        let body =
+            grant_revoke_ownership_body(&nonce_hex, &subject_bech, &pk0, &nkc, &sig, &grant_bech);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn grants_revoke_unknown_nonce_is_unauthorized() {
+        let (_sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let (grant_bech, _, _, _) = test_signed_zkgrant(&subject_raw, 0x55, 0x66, 0x77);
+        // Never issued via /challenge — take fails before any other check.
+        let nonce = [0u8; 32];
+        // Dummy signature (never verified — take fails first).
+        let sig = [0u8; 64];
+        let body = grant_revoke_ownership_body(
+            &encode_hex(&nonce),
+            &subject_bech,
+            &pk0,
+            &nkc,
+            &sig,
+            &grant_bech,
+        );
+
+        let app = build_router(test_config(), Arc::new(ScriptedKernel::default())).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn grants_revoke_malformed_zkgrant_is_400() {
+        use crate::ownership::{pull_challenge_message, REVOKE_GRANT_CHALLENGE_DOMAIN};
+
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+
+        let kernel = Arc::new(ScriptedKernel::default());
+        let app = build_router(test_config(), kernel).expect("router");
+
+        let (nonce_hex, expiry, nonce_raw) =
+            issue_grant_revoke_challenge(&app, &subject_bech).await;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            REVOKE_GRANT_CHALLENGE_DOMAIN,
+            &nonce_raw,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        let body =
+            grant_revoke_ownership_body(&nonce_hex, &subject_bech, &pk0, &nkc, &sig, "not-a-grant");
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+    }
+
+    #[tokio::test]
+    async fn grants_revoke_surface_disabled_without_wallet_feature() {
+        let app =
+            build_router(test_config_no_features(), Arc::new(UnreachableKernel)).expect("router");
+
+        for path in ["/v1/grants/revoke/challenge", "/v1/grants/revoke"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::NOT_FOUND,
+                "disabled wallet surface {path} must not be served"
+            );
+            let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+            assert_eq!(
+                json["error"], "feature_disabled",
+                "disabled known route {path} must carry feature_disabled, got {json}"
+            );
+        }
     }
 }

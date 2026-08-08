@@ -8,7 +8,7 @@
 use crate::blossom::BlossomState;
 use crate::config::Feature;
 use crate::kernel::KernelHandle;
-use crate::ownership::{RevokedGrantSet, SubjectOpDirectory};
+use crate::ownership::{GrantRevokeChallengeStore, RevokedGrantSet, SubjectOpDirectory};
 use axum::extract::FromRef;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -31,6 +31,9 @@ pub struct AppState {
     pub subject_ops: Arc<SubjectOpDirectory>,
     /// Forward-only grant revocation set (§5.2).
     pub revoked_grants: Arc<RevokedGrantSet>,
+    /// Single-use, api-local challenge nonce store for `POST /v1/grants/revoke`
+    /// (§5.2) — no kernel dial; see `GrantRevokeChallengeStore`.
+    pub grant_revoke_challenges: Arc<GrantRevokeChallengeStore>,
 }
 
 impl FromRef<AppState> for KernelHandle {
