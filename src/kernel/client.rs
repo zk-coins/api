@@ -9,6 +9,7 @@ use crate::error::ApiError;
 use crate::kernel::error_info::{kernel_status_to_api_error_for, KernelProcedure};
 use crate::kernel::pb::kernel_v1::kernel_client::KernelClient as TonicKernelClient;
 use crate::kernel::pb::kernel_v1::{
+    GetTokenProvenanceRequest, TokenProvenance,
     AccountStateRequest, AccountStateResult, AccumulatorTip, AttestRequest, Challenge,
     CoinProofBlob, CoinProofRequest, EntrustRequest, EntrustResult, GetAccumulatorRequest,
     GetInfoRequest, GrantRequest, GrantResult, Info, Inscription, Job, JobEvent, JobHandle,
@@ -36,6 +37,11 @@ const SESSION_AUTHORITY_METADATA: &str = "x-zkcoins-session-authority";
 /// + bootstrap + publish).
 #[async_trait]
 pub trait KernelRpc: Send + Sync {
+    async fn get_token_provenance(
+        &self,
+        req: GetTokenProvenanceRequest,
+    ) -> Result<TokenProvenance, ApiError>;
+
     async fn submit_transition(&self, req: TransitionRequest) -> Result<JobHandle, ApiError>;
 
     async fn get_job(&self, req: JobRequest) -> Result<Job, ApiError>;
@@ -181,6 +187,18 @@ pub fn connect_lazy(kernel_addr: &str) -> Result<KernelClient, ClientBuildError>
 
 #[async_trait]
 impl KernelRpc for KernelClient {
+    async fn get_token_provenance(
+        &self,
+        req: GetTokenProvenanceRequest,
+    ) -> Result<TokenProvenance, ApiError> {
+        let mut client = self.inner.clone();
+        let response = client
+            .get_token_provenance(Request::new(req))
+            .await
+            .map_err(map_for(KernelProcedure::GetTokenProvenance))?;
+        Ok(response.into_inner())
+    }
+
     async fn submit_transition(&self, req: TransitionRequest) -> Result<JobHandle, ApiError> {
         let mut client = self.inner.clone();
         let response = client

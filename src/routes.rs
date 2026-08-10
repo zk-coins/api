@@ -26,6 +26,7 @@ use crate::jobs;
 use crate::kernel::KernelHandle;
 use crate::publish;
 use crate::pull;
+use crate::provenance;
 use crate::state::AppState;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
@@ -102,6 +103,7 @@ pub const CLOSED_ENDPOINT_KEYS: &[(&str, &str)] = &[
     ("blossom_upload", "/blossom/upload"),
     ("grants_revoke_challenge", "/v1/grants/revoke/challenge"),
     ("grants_revoke", "/v1/grants/revoke"),
+    ("token_provenance", "/v1/token/<asset_id>/provenance"),
 ];
 
 /// Surfaces this process actually registers (and therefore advertises on `GET /`).
@@ -139,6 +141,7 @@ pub const CLOSED_ENDPOINT_KEYS: &[(&str, &str)] = &[
 /// the active set derived by [`ServedSurface::active`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServedSurface {
+    TokenProvenance,
     Health,
     HealthReady,
     Info,
@@ -177,6 +180,7 @@ impl ServedSurface {
     /// Activation is decided per entry by [`ServedSurface::is_active`]; this
     /// list is **not** what `GET /` returns.
     const ALL: &[ServedSurface] = &[
+        ServedSurface::TokenProvenance,
         ServedSurface::Health,
         ServedSurface::HealthReady,
         ServedSurface::Info,
@@ -226,6 +230,7 @@ impl ServedSurface {
         match self {
             // Always-on API process surface (§7.5 L2874–L2877; rest-surface #1–#4).
             ServedSurface::Health | ServedSurface::HealthReady | ServedSurface::Info => true,
+            ServedSurface::TokenProvenance => true, // always-on, never features-gated — §6.4/§4.6 Class B
 
             // `explorer` — public chain projection (§6.1 L2338; rest-surface #5–#7).
             ServedSurface::ChainAccumulator
@@ -284,6 +289,7 @@ impl ServedSurface {
     fn discovery_key(self) -> &'static str {
         match self {
             ServedSurface::Health => "health",
+            ServedSurface::TokenProvenance => "token_provenance",
             ServedSurface::HealthReady => "health_ready",
             ServedSurface::Info => "info",
             ServedSurface::ChainAccumulator => "chain_accumulator",
@@ -326,6 +332,9 @@ impl ServedSurface {
             ServedSurface::Health => router.route(&path, get(health)),
             ServedSurface::HealthReady => router.route(&path, get(info::health_ready)),
             ServedSurface::Info => router.route(&path, get(info::get_info)),
+            ServedSurface::TokenProvenance => {
+                router.route(&path, get(provenance::get_token_provenance))
+            }
             ServedSurface::ChainAccumulator => router.route(&path, get(chain::get_accumulator)),
             ServedSurface::ChainInscriptions => router.route(&path, get(chain::list_inscriptions)),
             ServedSurface::ChainNullifier => router.route(&path, get(chain::get_nullifier)),
@@ -396,7 +405,10 @@ impl ServedSurface {
     fn register_disabled(self, router: Router<AppState>) -> Router<AppState> {
         let path = advertised_path_to_axum_matcher(closed_path(self.discovery_key()));
         match self {
-            ServedSurface::Health | ServedSurface::HealthReady | ServedSurface::Info => {
+            ServedSurface::Health
+            | ServedSurface::HealthReady
+            | ServedSurface::Info
+            | ServedSurface::TokenProvenance => {
                 // Always-on surfaces are never disabled.
                 router
             }
@@ -610,6 +622,205 @@ async fn root(State(state): State<AppState>) -> Json<RootResponse> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn token_provenance_v1_held_is_public_schema() {
+        let asset_id_hex = crate::hexutil::encode_hex(&[0xaa; 32]);
+        let app = build_router(
+            test_config_no_features(),
+            Arc::new(ScriptedKernel {
+                token_provenance: Some(Ok(crate::kernel::kernel_v1::TokenProvenance {
+                    issuance_version: 1,
+                    creator_pubkey: vec![0x11; 32],
+                    name: b"MyToken".to_vec(),
+                    decimals: 8,
+                    cap_total: String::new(),
+                    terms_salt: Vec::new(),
+                })),
+                ..Default::default()
+            }),
+        ).expect("router");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/token/{asset_id_hex}/provenance"))
+                    .body(Body::empty())
+                    .expect("valid provenance request"),
+            )
+            .await
+            .expect("provenance response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("valid provenance JSON");
+        assert_eq!(json["asset_id"], asset_id_hex);
+        assert_eq!(json["issuance_version"], 1);
+        assert_eq!(json["creator_pubkey"].as_str().map(str::len), Some(64));
+        assert_eq!(json["name"], crate::hexutil::encode_hex(b"MyToken"));
+        assert_eq!(json["decimals"], 8);
+        assert!(json.get("cap_total").is_none());
+        assert!(json.get("terms_salt").is_none());
+    }
+
+    #[tokio::test]
+    async fn token_provenance_v2_held_includes_v2_terms() {
+        let asset_id_hex = crate::hexutil::encode_hex(&[0xbb; 32]);
+        let app = build_router(
+            test_config_no_features(),
+            Arc::new(ScriptedKernel {
+                token_provenance: Some(Ok(crate::kernel::kernel_v1::TokenProvenance {
+                    issuance_version: 2,
+                    creator_pubkey: vec![0x11; 32],
+                    name: b"MyToken".to_vec(),
+                    decimals: 8,
+                    cap_total: "123456789012345678901234567890".to_string(),
+                    terms_salt: vec![0x22; 32],
+                })),
+                ..Default::default()
+            }),
+        ).expect("router");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/token/{asset_id_hex}/provenance"))
+                    .body(Body::empty())
+                    .expect("valid provenance request"),
+            )
+            .await
+            .expect("provenance response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("valid provenance JSON");
+        assert_eq!(json["asset_id"], asset_id_hex);
+        assert_eq!(json["issuance_version"], 2);
+        assert_eq!(json["creator_pubkey"].as_str().map(str::len), Some(64));
+        assert_eq!(json["name"], crate::hexutil::encode_hex(b"MyToken"));
+        assert_eq!(json["decimals"], 8);
+        assert_eq!(
+            json["cap_total"].as_str(),
+            Some("123456789012345678901234567890")
+        );
+        assert_eq!(json["terms_salt"].as_str().map(str::len), Some(64));
+    }
+
+    #[tokio::test]
+    async fn token_provenance_kernel_not_found_is_404() {
+        let status = encode_kernel_error_status(
+            Code::NotFound,
+            "token provenance not held",
+            "not_found",
+            404,
+        );
+        let app = build_router(
+            test_config_no_features(),
+            Arc::new(ScriptedKernel {
+                token_provenance: Some(Err(crate::kernel::kernel_status_to_api_error(
+                    &status,
+                ))),
+                ..Default::default()
+            }),
+        ).expect("router");
+        let asset_id_hex = crate::hexutil::encode_hex(&[0xcc; 32]);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/token/{asset_id_hex}/provenance"))
+                    .body(Body::empty())
+                    .expect("valid provenance request"),
+            )
+            .await
+            .expect("provenance response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = body_bytes(response).await;
+        assert!(String::from_utf8_lossy(&body).contains("not_found"));
+    }
+
+    #[tokio::test]
+    async fn token_provenance_malformed_asset_id_fails_before_kernel_call() {
+        let kernel = Arc::new(ScriptedKernel::default());
+        let app = build_router(test_config_no_features(), kernel.clone()).expect("router");
+
+        for width in [31, 33] {
+            let asset_id_hex = crate::hexutil::encode_hex(&vec![0xdd; width]);
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/token/{asset_id_hex}/provenance"))
+                        .body(Body::empty())
+                        .expect("valid provenance request"),
+                )
+                .await
+                .expect("provenance response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = body_bytes(response).await;
+            assert!(String::from_utf8_lossy(&body).contains("malformed_request"));
+        }
+
+        assert_eq!(kernel.token_provenance_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn token_provenance_is_never_feature_gated() {
+        let asset_id_hex = crate::hexutil::encode_hex(&[0xee; 32]);
+        let held_app = build_router(
+            test_config_no_features(),
+            Arc::new(ScriptedKernel {
+                token_provenance: Some(Ok(crate::kernel::kernel_v1::TokenProvenance {
+                    issuance_version: 1,
+                    creator_pubkey: vec![0x11; 32],
+                    name: b"MyToken".to_vec(),
+                    decimals: 8,
+                    cap_total: String::new(),
+                    terms_salt: Vec::new(),
+                })),
+                ..Default::default()
+            }),
+        ).expect("router");
+        let held_response = held_app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/token/{asset_id_hex}/provenance"))
+                    .body(Body::empty())
+                    .expect("valid provenance request"),
+            )
+            .await
+            .expect("provenance response");
+        assert_eq!(held_response.status(), StatusCode::OK);
+
+        let status = encode_kernel_error_status(
+            Code::NotFound,
+            "token provenance not held",
+            "not_found",
+            404,
+        );
+        let missing_app = build_router(
+            test_config_no_features(),
+            Arc::new(ScriptedKernel {
+                token_provenance: Some(Err(crate::kernel::kernel_status_to_api_error(
+                    &status,
+                ))),
+                ..Default::default()
+            }),
+        ).expect("router");
+        let missing_response = missing_app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/token/{asset_id_hex}/provenance"))
+                    .body(Body::empty())
+                    .expect("valid provenance request"),
+            )
+            .await
+            .expect("provenance response");
+        assert_eq!(missing_response.status(), StatusCode::NOT_FOUND);
+        let body = body_bytes(missing_response).await;
+        assert!(String::from_utf8_lossy(&body).contains("not_found"));
+        assert!(!String::from_utf8_lossy(&body).contains("feature_disabled"));
+    }
+
     use super::*;
     use crate::config::{Config, Feature};
     use crate::error::ApiError;
@@ -665,6 +876,15 @@ mod tests {
 
     #[async_trait]
     impl KernelRpc for UnreachableKernel {
+        async fn get_token_provenance(
+            &self,
+            _req: crate::kernel::kernel_v1::GetTokenProvenanceRequest,
+        ) -> Result<crate::kernel::kernel_v1::TokenProvenance, ApiError> {
+            Err(ApiError::internal(
+                "test double: get_token_provenance not configured",
+            ))
+        }
+
         async fn submit_transition(&self, _req: TransitionRequest) -> Result<JobHandle, ApiError> {
             Err(ApiError::internal("test double: submit not configured"))
         }
@@ -818,18 +1038,19 @@ mod tests {
         "blossom_upload",
         "grants_revoke_challenge",
         "grants_revoke",
+        "token_provenance",
     ];
 
     #[test]
     fn closed_endpoint_keys_inventory_matches_spec() {
         assert_eq!(
             CLOSED_ENDPOINT_KEYS.len(),
-            30,
-            "CLOSED_ENDPOINT_KEYS must list all 30 §7.5 closed keys (no blossom_delete)"
+            31,
+            "CLOSED_ENDPOINT_KEYS must list all 31 §7.5 closed keys (no blossom_delete)"
         );
         assert_eq!(
             SPEC_CLOSED_KEYS.len(),
-            30,
+            31,
             "spec key list fixture must stay in sync with closed inventory"
         );
         for (i, (key, path)) in CLOSED_ENDPOINT_KEYS.iter().enumerate() {
@@ -852,7 +1073,7 @@ mod tests {
         }
         let keys: BTreeSet<&str> = CLOSED_ENDPOINT_KEYS.iter().map(|(k, _)| *k).collect();
         assert!(!keys.contains(""), "empty discovery key is invalid");
-        assert_eq!(keys.len(), 30, "closed keys must be unique");
+        assert_eq!(keys.len(), 31, "closed keys must be unique");
         assert!(
             !keys.contains("blossom_delete"),
             "data permanence: blossom_delete must not be in the inventory"
@@ -956,8 +1177,9 @@ mod tests {
                 "bootstrap_revoke",
                 "grants_revoke_challenge",
                 "grants_revoke",
+                "token_provenance",
             ]),
-            "test_config (wallet+explorer+publisher, no blossom) advertises 27 keys"
+            "test_config (wallet+explorer+publisher, no blossom) advertises 28 keys"
         );
         assert_eq!(
             endpoints["bootstrap_challenge"].as_str(),
@@ -1108,7 +1330,7 @@ mod tests {
     fn concrete_path_param(name: &str) -> &'static str {
         match name {
             "job_id" => "00000000-0000-4000-8000-000000000001",
-            "pubkey" | "sha256" | "coin_id" | "record_id" => {
+            "pubkey" | "sha256" | "coin_id" | "record_id" | "asset_id" => {
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             }
             other => panic!(
@@ -1428,9 +1650,10 @@ mod tests {
         // Always-on process surfaces remain.
         assert!(endpoints.contains_key("health"));
         assert!(endpoints.contains_key("info"));
+        assert!(endpoints.contains_key("token_provenance"));
         assert_eq!(
             endpoints.len(),
-            3,
+            4,
             "no-features config must advertise only health, health_ready, info; got {:?}",
             endpoints.keys().collect::<Vec<_>>()
         );
@@ -1565,6 +1788,9 @@ mod tests {
 
     #[derive(Default)]
     struct ScriptedKernel {
+        token_provenance:
+            Option<Result<crate::kernel::kernel_v1::TokenProvenance, ApiError>>,
+        token_provenance_calls: AtomicUsize,
         submit: Option<Result<JobHandle, ApiError>>,
         get: Option<Result<Job, ApiError>>,
         stream: Option<Result<Vec<Result<JobEvent, ApiError>>, ApiError>>,
@@ -1628,6 +1854,18 @@ mod tests {
 
     #[async_trait]
     impl KernelRpc for ScriptedKernel {
+        async fn get_token_provenance(
+            &self,
+            _req: crate::kernel::kernel_v1::GetTokenProvenanceRequest,
+        ) -> Result<crate::kernel::kernel_v1::TokenProvenance, ApiError> {
+            self.token_provenance_calls.fetch_add(1, Ordering::SeqCst);
+            match &self.token_provenance {
+                Some(Ok(value)) => Ok(value.clone()),
+                Some(Err(error)) => Err(error.clone()),
+                None => Err(ApiError::internal("get_token_provenance not scripted")),
+            }
+        }
+
         async fn submit_transition(&self, req: TransitionRequest) -> Result<JobHandle, ApiError> {
             self.submit_calls.fetch_add(1, Ordering::SeqCst);
             *self.last_submit.lock().unwrap() = Some(req);

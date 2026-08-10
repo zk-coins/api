@@ -144,6 +144,7 @@ const RPC_ERROR_TRIPLES: &[RpcErrorTriple] = &[
 /// Kernel procedure names for per-RPC allowed-error sets (§7.8 table).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelProcedure {
+    GetTokenProvenance,
     GetInfo,
     GetAccumulator,
     ListInscriptions,
@@ -172,6 +173,9 @@ impl KernelProcedure {
     /// into `internal_error` or procedure-specific codes only).
     fn allowed_reasons(self) -> &'static [&'static str] {
         match self {
+            Self::GetTokenProvenance => &[
+                "malformed_request", "not_found", "rate_limited", "internal_error",
+            ],
             Self::GetInfo | Self::GetAccumulator => &["internal_error"],
             Self::ListInscriptions => &[
                 "bounds_exceeded",

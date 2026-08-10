@@ -68,6 +68,7 @@ eigenes `Kernel`-RPC-Verb in der Procedure-Tabelle).
 | 28 | `HEAD` | `/blossom/<sha256>` | Nein | `explorer` (blob fetch) | Blossom-Ebene / Kernel-Store | §7.4 L2805; Feature §6.1 L2338; Key §7.5 L2874 |
 | 29 | `PUT` | `/blossom/upload` | **Ja** — Nostr kind-`24242` Auth-Event | `explorer` / `wallet` | Blossom-Ebene / Kernel-Store | §7.4; Keys §7.5; Data Permanence (append-only, Antwort `{ blob_id }`) |
 | 30 | `POST` | `/blossom/upload` | **Ja** — Nostr kind-`24242` Auth-Event | `explorer` / `wallet` | Blossom-Ebene / Kernel-Store (äquivalent zu PUT) | §7.4; Keys §7.5 |
+| 31 | `GET` | `/v1/token/<asset_id>/provenance` | Nein (offen, unauthentifiziert) | **immer** — nicht feature-gated | `GetTokenProvenance` — offene Class-B-Provenienz; self-verifying; `404 not_found` wenn der Node keine Terms für `asset_id` hält | §7.5; §7.8; §4.6 Class B |
 
 **Kein** `DELETE /blossom/<sha256>` — Data Permanence (Requirement 12): der Blob-Store
 ist append-only; empfangene Daten werden nie gelöscht. `ReplicaReceiptV1` / §4.6
@@ -107,6 +108,7 @@ Genau diese 28 Keys — wörtlich, vollständig:
 | `blossom_get` | `/blossom/<sha256>` |
 | `blossom_head` | `/blossom/<sha256>` |
 | `blossom_upload` | `/blossom/upload` |
+| `token_provenance` | `/v1/token/<asset_id>/provenance` |
 
 Spec-Regel (§7.5): Ein Producer emittiert **genau** die geschlossene Schlüsselmenge
 für die Oberflächen, die dieses Deployment exponiert, und **MUST** Keys für nicht

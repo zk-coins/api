@@ -803,6 +803,13 @@ mod tests {
 
     #[async_trait]
     impl KernelRpc for CatalogKernel {
+        async fn get_token_provenance(
+            &self,
+            _req: crate::kernel::kernel_v1::GetTokenProvenanceRequest,
+        ) -> Result<crate::kernel::kernel_v1::TokenProvenance, ApiError> {
+            Err(ApiError::internal("not used"))
+        }
+
         async fn submit_transition(
             &self,
             _req: crate::kernel::kernel_v1::TransitionRequest,
