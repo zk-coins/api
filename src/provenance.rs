@@ -71,10 +71,22 @@ fn token_provenance_to_json(
         )?),
     );
     body.insert("name".to_owned(), json!(encode_hex(&provenance.name)));
-    body.insert("decimals".to_owned(), json!(provenance.decimals));
+    let decimals = u8::try_from(provenance.decimals).map_err(|_| {
+        ApiError::internal(format!(
+            "kernel returned token provenance decimals {} exceeding the §7.5 u8 range",
+            provenance.decimals
+        ))
+    })?;
+    body.insert("decimals".to_owned(), json!(decimals));
 
     if provenance.issuance_version == 2 {
-        body.insert("cap_total".to_owned(), json!(&provenance.cap_total));
+        let cap_total = provenance.cap_total.parse::<u128>().map_err(|_| {
+            ApiError::internal(format!(
+                "kernel returned token provenance cap_total {:?} that is not a decimal u128",
+                provenance.cap_total
+            ))
+        })?;
+        body.insert("cap_total".to_owned(), json!(cap_total.to_string()));
         body.insert(
             "terms_salt".to_owned(),
             json!(require_hex32(
@@ -116,6 +128,22 @@ mod tests {
     fn token_provenance_rejects_unknown_issuance_version() {
         let mut provenance = valid_v1();
         provenance.issuance_version = 3;
+        assert!(token_provenance_to_json(&[0xaa; 32], &provenance).is_err());
+    }
+
+    #[test]
+    fn token_provenance_rejects_decimals_exceeding_u8() {
+        let mut provenance = valid_v1();
+        provenance.decimals = 256; // §7.5 decimals is u8; a wider kernel value must fail closed
+        assert!(token_provenance_to_json(&[0xaa; 32], &provenance).is_err());
+    }
+
+    #[test]
+    fn token_provenance_rejects_non_u128_cap_total() {
+        let mut provenance = valid_v1();
+        provenance.issuance_version = 2;
+        provenance.cap_total = "not-a-number".to_owned();
+        provenance.terms_salt = vec![0x22; 32];
         assert!(token_provenance_to_json(&[0xaa; 32], &provenance).is_err());
     }
 

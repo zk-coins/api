@@ -13,7 +13,7 @@ Bestandsaufnahme (Worktree `zk-coins/docs-vectors`).
 | Menge | Werte | Fundstelle |
 |---|---|---|
 | API-`features` | `{wallet, explorer, publisher, lightning_bridge, mail_bridge}` | §6.1 L2322, L2333–L2341; §7.5 `/v1/info` L2877 |
-| `GET /` · `endpoints`-Schlüssel | siehe Tabelle unten (28 geschlossene Keys) | §7.5; Data Permanence (kein `blossom_delete`) |
+| `GET /` · `endpoints`-Schlüssel | siehe Tabelle unten (29 geschlossene Keys) | §7.5; Data Permanence (kein `blossom_delete`) |
 | Kernel-Prozeduren | siehe §7.8-Tabelle | §7.8 L3138–L3159 |
 
 **Feature-Semantik (§6.1):** Jedes Feature ist **off**, bis der Operator es einschaltet.
@@ -76,7 +76,7 @@ Dual-Commit und `retention_hold` entfallen mit der Spec.
 
 ### Geschlossene `endpoints`-Schlüssel von `GET /` (§7.5)
 
-Genau diese 28 Keys — wörtlich, vollständig:
+Genau diese 29 Keys — wörtlich, vollständig:
 
 | Key | Typischer Pfad |
 |---|---|
@@ -120,12 +120,12 @@ beworbene optionale Rollen weglassen. Unbekannte Keys beim Lesen ignorieren.
 
 | Kategorie | Anzahl |
 |---|---|
-| HTTP-Endpunkte (Method+Path) in der Tabelle oben | **30** |
+| HTTP-Endpunkte (Method+Path) in der Tabelle oben | **31** |
 | davon in §7.5-Haupttext (ohne §7.4/§7.6/§7.7) | **22** |
 | + Publisher §7.6 | **1** |
 | + Bootstrap §7.7 | **3** |
 | + Blossom §7.4 (GET/HEAD/PUT/POST; kein DELETE) | **4** |
-| Geschlossene `endpoints`-Keys | **28** |
+| Geschlossene `endpoints`-Keys | **29** |
 | Capability-gebunden (Ownership / Grant / Session / Nostr-Auth) | **12** (#14, #16, #18–22, #25–26, #29–30) |
 | Challenge-Aussteller ohne Capability | **4** (#13, #15, #17, #24) |
 | API-lokal | **2** (`GET /`, `GET /health`) |
@@ -134,7 +134,7 @@ beworbene optionale Rollen weglassen. Unbekannte Keys beim Lesen ignorieren.
 
 | Feature | Endpunkte | Nummern |
 |---|---|---|
-| immer (API-Prozess) | 4 | #1–#4 |
+| immer (API-Prozess) | 5 | #1–#4, #31 |
 | `wallet` | 19 | #8–#22, #24–#26 (+ Blossom-Upload geteilt) |
 | `explorer` | 3 Chain + Blossom-Fetch (+ Upload geteilt) | #5–#7, #27–#28 (+ #29–#30 geteilt) |
 | `publisher` | 1 | #23 |
@@ -177,6 +177,7 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Blob-Pfad).
 | `POST /v1/bootstrap/entrust` | **implementiert** — OwnershipProof (Entrust-Domain) + Bundle-Längenprüfung (161 B), dann `EntrustOperationalBundle`; Bundle wird nie geloggt |
 | `POST /v1/bootstrap/revoke` | **implementiert** — OwnershipProof (Revoke-Domain), dann `RevokeOperationalBundle` |
 | `POST /v1/publish/spendrecord` | **implementiert** — `Publish`; Ablehnung → HTTP 200 `{accepted:false, reason}`; v1-Fee-Felder → 400 |
+| `GET /v1/token/<asset_id>/provenance` | **implementiert** — `GetTokenProvenance`-Pass-through; offen/unauthentifiziert, nie feature-gated; §7.5-JSON (`name` hex, v1/v2, `cap_total` u128-Dezimalstring, `terms_salt` hex); `404 not_found` ohne Terms; kein Leak (nur IssuanceTerms-Preimage). |
 | `GET`/`HEAD /blossom/<sha256>`, `PUT`/`POST /blossom/upload` | **implementiert** wenn `ZKCOINS_BLOSSOM_STORE` gesetzt — API-lokaler append-only Store (§7.4 / Data Permanence); kein Kernel-RPC; ohne Store unregistriert; **kein** DELETE |
 | alle übrigen Method+Path | **nicht registriert** — kein Handler, kein `todo!()`, kein Platzhalter |
 
