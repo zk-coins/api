@@ -5472,6 +5472,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pull_ownership_empty_session_is_500() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x11u8; 32];
+        let expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            ChallengeDomain::Pull.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+
+        let kernel = Arc::new(ScriptedKernel {
+            pull: Some(Ok(ProtoPullResult {
+                session: String::new(),
+                records: vec![],
+                session_expiry: 1,
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        pull_body_ownership(&subject_bech, &pk0, &nkc, &nonce, expiry, &sig)
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
+    }
+
+    #[tokio::test]
     async fn get_record_returns_binary_octet_stream() {
         let kernel = Arc::new(ScriptedKernel {
             get_record: Some(Ok(RecordBlob {
@@ -5501,6 +5546,33 @@ mod tests {
         );
         let body = body_bytes(res).await;
         assert_eq!(body, b"canonical-record-bytes");
+    }
+
+    #[tokio::test]
+    async fn get_record_empty_canonical_is_500() {
+        let kernel = Arc::new(ScriptedKernel {
+            get_record: Some(Ok(RecordBlob {
+                canonical: vec![],
+                record_type: "coinproof".into(),
+                transition_kind: String::new(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/record/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
     }
 
     #[tokio::test]
@@ -5548,6 +5620,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_account_state_empty_bytes_is_500() {
+        let kernel = Arc::new(ScriptedKernel {
+            get_account_state: Some(Ok(AccountStateResult {
+                account_state: vec![],
+                state_head: vec![0xBBu8; 32],
+                head_record_id: vec![0xCCu8; 32],
+                send_counter: 7,
+                current_pubkey: vec![0xDDu8; 32],
+                last_nullifier_pk: vec![0xEEu8; 32],
+                last_nullifier_r: vec![0xFFu8; 32],
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/account/state")
+                    .header("authorization", "Bearer own-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn get_account_state_state_head_wrong_len_is_500() {
+        let kernel = Arc::new(ScriptedKernel {
+            get_account_state: Some(Ok(AccountStateResult {
+                account_state: vec![0xAAu8; 16],
+                state_head: vec![0xBBu8; 16],
+                head_record_id: vec![0xCCu8; 32],
+                send_counter: 7,
+                current_pubkey: vec![0xDDu8; 32],
+                last_nullifier_pk: vec![0xEEu8; 32],
+                last_nullifier_r: vec![0xFFu8; 32],
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/account/state")
+                    .header("authorization", "Bearer own-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn get_account_state_mixed_last_nullifier_is_500() {
+        let kernel = Arc::new(ScriptedKernel {
+            get_account_state: Some(Ok(AccountStateResult {
+                account_state: vec![0xAAu8; 16],
+                state_head: vec![0xBBu8; 32],
+                head_record_id: vec![0xCCu8; 32],
+                send_counter: 7,
+                current_pubkey: vec![0xDDu8; 32],
+                last_nullifier_pk: vec![0xEEu8; 32],
+                last_nullifier_r: vec![],
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/account/state")
+                    .header("authorization", "Bearer own-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
+    }
+
+    #[tokio::test]
     async fn get_proof_returns_binary_octet_stream() {
         let kernel = Arc::new(ScriptedKernel {
             get_coin_proof: Some(Ok(CoinProofBlob {
@@ -5574,6 +5739,29 @@ mod tests {
             Some("application/octet-stream")
         );
         assert_eq!(body_bytes(res).await, b"coin-proof-bytes");
+    }
+
+    #[tokio::test]
+    async fn get_proof_empty_canonical_is_500() {
+        let kernel = Arc::new(ScriptedKernel {
+            get_coin_proof: Some(Ok(CoinProofBlob { canonical: vec![] })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/proof/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
     }
 
     // -----------------------------------------------------------------------
