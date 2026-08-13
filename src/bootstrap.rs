@@ -398,4 +398,31 @@ mod tests {
         );
         assert!(!err.body.message.contains(&hex));
     }
+
+    #[test]
+    fn entrust_body_debug_redacts_operational_bundle_hex() {
+        let secret = "ab".repeat(161);
+        let body = BootstrapEntrustBody {
+            challenge: ChallengeEcho {
+                nonce: "00".repeat(32),
+                expiry: "1".into(),
+            },
+            ownership_proof: OwnerOnlyProofJson::Ownership {
+                subject: "unused".into(),
+                public_key: "00".repeat(32),
+                nk_commit: "00".repeat(32),
+                signature: "00".repeat(64),
+            },
+            bundle: secret.clone(),
+        };
+        let dbg = format!("{body:?}");
+        assert!(
+            dbg.contains("<redacted operational bundle hex>"),
+            "Debug must show redaction marker, got {dbg}"
+        );
+        assert!(
+            !dbg.contains(&secret),
+            "Debug must not contain the real bundle hex"
+        );
+    }
 }

@@ -457,17 +457,34 @@ pub fn blob_id_of(body: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::thread;
+
+    static TEMP_ROOT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Restores original permissions on drop so chmod tests leave no sticky mode.
+    struct RestorePerm {
+        path: PathBuf,
+        perm: std::fs::Permissions,
+    }
+
+    impl Drop for RestorePerm {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.path, self.perm.clone());
+        }
+    }
 
     fn temp_root() -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
+        let seq = TEMP_ROOT_SEQ.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "zkcoins-blossom-store-{}-{}",
+            "zkcoins-blossom-store-{}-{}-{}",
             std::process::id(),
-            nanos
+            nanos,
+            seq
         ));
         let _ = fs::remove_dir_all(&root);
         root
@@ -698,6 +715,164 @@ mod tests {
             cause.contains("corrupt") || cause.contains("uploader note"),
             "diagnostic must mention corrupt uploader note, got {cause:?}"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn put_refuses_incomplete_blob_without_note() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let body = b"incomplete-blob";
+        let id = blob_id_of(body);
+        let op = [0x11u8; 32];
+        fs::write(store.blob_path(&id), body).expect("orphan blob");
+        let err = store
+            .put(body, &op)
+            .expect_err("put must refuse incomplete");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("incomplete"),
+            "cause must mention incomplete, got {:?}",
+            err.cause()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn put_refuses_incomplete_note_without_blob() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let body = b"incomplete-note";
+        let id = blob_id_of(body);
+        let op = [0x11u8; 32];
+        fs::write(store.uploader_path(&id), encode_hex(&op).as_bytes()).expect("orphan note");
+        let err = store
+            .put(body, &op)
+            .expect_err("put must refuse incomplete");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("incomplete"),
+            "cause must mention incomplete, got {:?}",
+            err.cause()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_uploader_io_error_other_than_not_found() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let body = b"read-uploader-dir-note-body";
+        let op = [0x11u8; 32];
+        let id = store.put(body, &op).expect("put");
+        let note_path = store.uploader_path(&id);
+        fs::remove_file(&note_path).expect("remove note file");
+        fs::create_dir(&note_path).expect("dir at note path");
+        let err = store
+            .read_uploader(&id)
+            .expect_err("directory note must error");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("uploader note"),
+            "cause must mention uploader note, got {:?}",
+            err.cause()
+        );
+        let _ = fs::remove_dir(&note_path);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_io_error_other_than_not_found() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let body = b"read-chmod-zero-blob-body";
+        let op = [0x11u8; 32];
+        let id = store.put(body, &op).expect("put");
+        let blob = store.blob_path(&id);
+        let original = fs::metadata(&blob).expect("meta").permissions();
+        let _restore = RestorePerm {
+            path: blob.clone(),
+            perm: original,
+        };
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o000)).expect("chmod 0");
+        match store.read(&id) {
+            Ok(Some(_)) => panic!("expected permission error on chmod 0 blob"),
+            Ok(None) => panic!("expected permission error on chmod 0 blob, got None"),
+            Err(err) => {
+                assert_eq!(err.body.error, "internal_error");
+                assert!(
+                    err.cause().unwrap_or("").contains("read"),
+                    "cause must mention read, got {:?}",
+                    err.cause()
+                );
+            }
+        }
+        drop(_restore);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn put_write_blob_temp_fails_when_root_is_readonly() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let original = fs::metadata(&root).expect("meta").permissions();
+        let _restore = RestorePerm {
+            path: root.clone(),
+            perm: original,
+        };
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).expect("readonly root");
+        let op = [0x11u8; 32];
+        match store.put(b"readonly-root-body", &op) {
+            Ok(_) => panic!("readonly root must reject put"),
+            Err(err) => {
+                assert_eq!(err.body.error, "internal_error");
+                assert!(
+                    err.cause().unwrap_or("").contains("write blob temp"),
+                    "cause must mention write blob temp, got {:?}",
+                    err.cause()
+                );
+            }
+        }
+        drop(_restore);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_exclusive_create_new_fails_if_exists() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        let path = root.join("already-exists.tmp");
+        fs::write(&path, b"seed").expect("seed file");
+        let err = write_exclusive(&path, b"x").expect_err("create_new must fail");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_no_replace_already_exists() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        let tmp = root.join("install.tmp");
+        let final_path = root.join("install.final");
+        fs::write(&tmp, b"tmp").expect("tmp");
+        fs::write(&final_path, b"final").expect("final");
+        let err = install_no_replace(&tmp, &final_path).expect_err("must not replace");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(!tmp.exists(), "tmp must be removed on AlreadyExists");
+        assert!(final_path.is_file(), "final must remain");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_no_replace_missing_parent() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        let tmp = root.join("missing-parent.tmp");
+        fs::write(&tmp, b"tmp").expect("tmp");
+        let final_path = root.join("no-such-dir").join("final");
+        let err = install_no_replace(&tmp, &final_path).expect_err("missing parent");
+        assert_ne!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(!tmp.exists(), "tmp must be removed on install error");
         let _ = fs::remove_dir_all(&root);
     }
 }
