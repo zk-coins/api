@@ -21,9 +21,11 @@ pub mod provenance;
 pub mod publish;
 pub mod pull;
 pub mod routes;
+pub mod startup;
 pub mod state;
 
 pub use config::{BlossomConfig, Config, ConfigError, Feature};
 pub use kernel::{connect_lazy, KernelClient, KernelHandle};
 pub use routes::{build_router, StartupError, CLOSED_ENDPOINT_KEYS};
+pub use startup::run;
 pub use state::AppState;
