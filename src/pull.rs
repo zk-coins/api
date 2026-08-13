@@ -1230,6 +1230,56 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // receipt_event_sse_stream
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn receipt_sse_stream_emits_receipt_then_ends() {
+        let r = sample_receipt(0x11, "100", "completed", 1_700_000_000);
+        let src = futures_util::stream::iter(vec![Ok(r)]);
+        let mut out = std::pin::pin!(receipt_event_sse_stream(src));
+        let first = out.next().await.expect("frame").expect("infallible");
+        let expected =
+            receipt_to_sse(&sample_receipt(0x11, "100", "completed", 1_700_000_000)).expect("sse");
+        assert_eq!(format!("{first:?}"), format!("{expected:?}"));
+        assert!(out.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn receipt_sse_stream_invalid_receipt_emits_error_then_ends() {
+        let r = Receipt {
+            coin_id: vec![0x11; 16],
+            asset_id: vec![0xABu8; 32],
+            amount: "100".to_string(),
+            state: "completed".into(),
+            credited_at: 1_700_000_000,
+        };
+        let src = futures_util::stream::iter(vec![Ok(r.clone())]);
+        let mut out = std::pin::pin!(receipt_event_sse_stream(src));
+        let first = out.next().await.expect("frame").expect("infallible");
+        let expected = receipt_stream_break_event(&receipt_to_json(&r).unwrap_err());
+        assert_eq!(format!("{first:?}"), format!("{expected:?}"));
+        assert!(out.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn receipt_sse_stream_kernel_err_emits_error_then_ends() {
+        let src = futures_util::stream::iter(vec![Err(ApiError::unauthorized("x"))]);
+        let mut out = std::pin::pin!(receipt_event_sse_stream(src));
+        let first = out.next().await.expect("frame").expect("infallible");
+        let expected = receipt_stream_break_event(&ApiError::unauthorized("x"));
+        assert_eq!(format!("{first:?}"), format!("{expected:?}"));
+        assert!(out.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn receipt_sse_stream_empty_ends_without_frame() {
+        let src = futures_util::stream::iter(Vec::<Result<Receipt, ApiError>>::new());
+        let mut out = std::pin::pin!(receipt_event_sse_stream(src));
+        assert!(out.next().await.is_none());
+    }
+
+    // -----------------------------------------------------------------------
     // deny_unknown_fields (closed REST request DTOs)
     // -----------------------------------------------------------------------
 
