@@ -423,4 +423,61 @@ mod tests {
         let err = info_to_json(&info, &BTreeSet::new(), None).unwrap_err();
         assert_eq!(err.body.error, "internal_error");
     }
+
+    #[test]
+    fn info_json_rejects_missing_circuit_digest_c() {
+        let mut info = sample_info(true, None);
+        info.circuit_digests.remove("C");
+        let err = info_to_json(&info, &BTreeSet::new(), None).unwrap_err();
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn info_json_rejects_missing_circuit_digest_c_balance() {
+        let mut info = sample_info(true, None);
+        info.circuit_digests.remove("C_balance");
+        let err = info_to_json(&info, &BTreeSet::new(), None).unwrap_err();
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn info_json_rejects_extra_circuit_digest_key() {
+        let mut info = sample_info(true, None);
+        info.circuit_digests
+            .insert("C_extra".to_string(), vec![0x33; 32]);
+        let err = info_to_json(&info, &BTreeSet::new(), None).unwrap_err();
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn info_json_rejects_bootstrap_unknown_network() {
+        let mut info = sample_info(true, None);
+        info.bootstrap.as_mut().unwrap().network = "signet".into();
+        let err = info_to_json(&info, &BTreeSet::new(), None).unwrap_err();
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn info_json_rejects_bootstrap_non_v1_protocol_version() {
+        let mut info = sample_info(true, None);
+        info.bootstrap.as_mut().unwrap().protocol_version = "v2".into();
+        let err = info_to_json(&info, &BTreeSet::new(), None).unwrap_err();
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn info_json_rejects_bootstrap_operator_id_wrong_len() {
+        let mut info = sample_info(true, None);
+        info.bootstrap.as_mut().unwrap().operator_ids[0] = vec![0x33; 31];
+        let err = info_to_json(&info, &BTreeSet::new(), None).unwrap_err();
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn info_json_rejects_bootstrap_manifest_sig_wrong_len() {
+        let mut info = sample_info(true, None);
+        info.bootstrap.as_mut().unwrap().manifest_sig = vec![0x44; 63];
+        let err = info_to_json(&info, &BTreeSet::new(), None).unwrap_err();
+        assert_eq!(err.body.error, "internal_error");
+    }
 }

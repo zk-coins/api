@@ -383,4 +383,19 @@ mod tests {
         );
         assert!(!err.body.message.contains(&hex));
     }
+
+    #[test]
+    fn bundle_non_hex_odd_nibble_does_not_echo_input() {
+        let mut hex = "ee".repeat(161);
+        // Odd index: covers the second nibble of a byte pair.
+        hex.replace_range(101..102, "z");
+        let err = parse_operational_bundle_hex(&hex).expect_err("non-hex odd nibble");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            !err.body.message.contains("z"),
+            "error must not echo the bad nibble: {}",
+            err.body.message
+        );
+        assert!(!err.body.message.contains(&hex));
+    }
 }

@@ -351,6 +351,7 @@ fn hex_nibble(b: u8) -> u8 {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::str::FromStr;
 
     fn getter(map: HashMap<&'static str, &'static str>) -> impl FnMut(&str) -> Option<String> {
         move |k| map.get(k).map(|s| (*s).to_string())
@@ -634,5 +635,167 @@ mod tests {
             cfg.public_hosts.is_empty(),
             "empty PUBLIC_HOST must not invent localhost"
         );
+    }
+
+    #[test]
+    fn feature_all_as_str_and_from_str_roundtrip() {
+        let expected = [
+            "wallet",
+            "explorer",
+            "publisher",
+            "lightning_bridge",
+            "mail_bridge",
+        ];
+        assert_eq!(Feature::ALL.len(), expected.len());
+        for (f, name) in Feature::ALL.iter().zip(expected.iter()) {
+            assert_eq!(f.as_str(), *name);
+            assert_eq!(Feature::from_str(f.as_str()), Ok(*f));
+        }
+    }
+
+    #[test]
+    fn config_error_display_arms() {
+        assert!(ConfigError::EmptyEnv("ZKCOINS_BIND_ADDR")
+            .to_string()
+            .contains("set but empty"));
+        assert!(ConfigError::InvalidBindAddr {
+            value: "x".into(),
+            reason: "bad".into(),
+        }
+        .to_string()
+        .contains("not a valid socket address"));
+        assert!(ConfigError::InvalidBlossomMaxBlobBytes {
+            value: "0".into(),
+            reason: "must be strictly greater than zero".into(),
+        }
+        .to_string()
+        .contains("ZKCOINS_BLOSSOM_MAX_BLOB_BYTES"));
+        assert!(ConfigError::InvalidBlossomAllowedOp {
+            value: "zz".into(),
+            reason: "must be lowercase hex".into(),
+        }
+        .to_string()
+        .contains("ZKCOINS_BLOSSOM_ALLOWED_OPS"));
+    }
+
+    #[test]
+    fn blossom_max_blob_leading_zero_is_error() {
+        let mut get = getter(HashMap::from([
+            (ENV_BIND, "127.0.0.1:8080"),
+            (ENV_KERNEL, "http://127.0.0.1:50051"),
+            (ENV_FEATURES, ""),
+            (ENV_PUBLIC_HOST, ""),
+            (ENV_BLOSSOM_STORE, "/var/lib/zkcoins/blossom"),
+            (ENV_BLOSSOM_MAX_BLOB_BYTES, "01"),
+            (ENV_BLOSSOM_ALLOWED_OPS, ""),
+        ]));
+        let err = Config::from_getter(&mut get).expect_err("leading zero max");
+        match err {
+            ConfigError::InvalidBlossomMaxBlobBytes { value, .. } => {
+                assert_eq!(value, "01");
+            }
+            other => panic!("expected InvalidBlossomMaxBlobBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blossom_max_blob_non_digit_is_error() {
+        let mut get = getter(HashMap::from([
+            (ENV_BIND, "127.0.0.1:8080"),
+            (ENV_KERNEL, "http://127.0.0.1:50051"),
+            (ENV_FEATURES, ""),
+            (ENV_PUBLIC_HOST, ""),
+            (ENV_BLOSSOM_STORE, "/var/lib/zkcoins/blossom"),
+            (ENV_BLOSSOM_MAX_BLOB_BYTES, "12a"),
+            (ENV_BLOSSOM_ALLOWED_OPS, ""),
+        ]));
+        let err = Config::from_getter(&mut get).expect_err("non-digit max");
+        match err {
+            ConfigError::InvalidBlossomMaxBlobBytes { value, .. } => {
+                assert_eq!(value, "12a");
+            }
+            other => panic!("expected InvalidBlossomMaxBlobBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blossom_max_blob_out_of_u64_is_error() {
+        let mut get = getter(HashMap::from([
+            (ENV_BIND, "127.0.0.1:8080"),
+            (ENV_KERNEL, "http://127.0.0.1:50051"),
+            (ENV_FEATURES, ""),
+            (ENV_PUBLIC_HOST, ""),
+            (ENV_BLOSSOM_STORE, "/var/lib/zkcoins/blossom"),
+            (ENV_BLOSSOM_MAX_BLOB_BYTES, "18446744073709551616"),
+            (ENV_BLOSSOM_ALLOWED_OPS, ""),
+        ]));
+        let err = Config::from_getter(&mut get).expect_err("out of u64 max");
+        match err {
+            ConfigError::InvalidBlossomMaxBlobBytes { value, .. } => {
+                assert_eq!(value, "18446744073709551616");
+            }
+            other => panic!("expected InvalidBlossomMaxBlobBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blossom_max_blob_empty_is_empty_env_error() {
+        let mut get = getter(HashMap::from([
+            (ENV_BIND, "127.0.0.1:8080"),
+            (ENV_KERNEL, "http://127.0.0.1:50051"),
+            (ENV_FEATURES, ""),
+            (ENV_PUBLIC_HOST, ""),
+            (ENV_BLOSSOM_STORE, "/var/lib/zkcoins/blossom"),
+            (ENV_BLOSSOM_MAX_BLOB_BYTES, ""),
+            (ENV_BLOSSOM_ALLOWED_OPS, ""),
+        ]));
+        let err = Config::from_getter(&mut get).expect_err("empty max");
+        assert_eq!(err, ConfigError::EmptyEnv(ENV_BLOSSOM_MAX_BLOB_BYTES));
+    }
+
+    #[test]
+    fn blossom_allowed_ops_uppercase_hex_is_error() {
+        let mut get = getter(HashMap::from([
+            (ENV_BIND, "127.0.0.1:8080"),
+            (ENV_KERNEL, "http://127.0.0.1:50051"),
+            (ENV_FEATURES, ""),
+            (ENV_PUBLIC_HOST, ""),
+            (ENV_BLOSSOM_STORE, "/var/lib/zkcoins/blossom"),
+            (ENV_BLOSSOM_MAX_BLOB_BYTES, "1048576"),
+            (
+                ENV_BLOSSOM_ALLOWED_OPS,
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ),
+        ]));
+        let err = Config::from_getter(&mut get).expect_err("uppercase op");
+        match err {
+            ConfigError::InvalidBlossomAllowedOp { value, .. } => {
+                assert_eq!(
+                    value,
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                );
+            }
+            other => panic!("expected InvalidBlossomAllowedOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blossom_allowed_ops_wrong_hex_len_is_error() {
+        let mut get = getter(HashMap::from([
+            (ENV_BIND, "127.0.0.1:8080"),
+            (ENV_KERNEL, "http://127.0.0.1:50051"),
+            (ENV_FEATURES, ""),
+            (ENV_PUBLIC_HOST, ""),
+            (ENV_BLOSSOM_STORE, "/var/lib/zkcoins/blossom"),
+            (ENV_BLOSSOM_MAX_BLOB_BYTES, "1048576"),
+            (ENV_BLOSSOM_ALLOWED_OPS, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        ]));
+        let err = Config::from_getter(&mut get).expect_err("short op hex");
+        match err {
+            ConfigError::InvalidBlossomAllowedOp { value, .. } => {
+                assert_eq!(value, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            }
+            other => panic!("expected InvalidBlossomAllowedOp, got {other:?}"),
+        }
     }
 }
