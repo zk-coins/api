@@ -255,4 +255,54 @@ mod tests {
         let err = publish_result_to_json(&r).unwrap_err();
         assert_eq!(err.body.error, "internal_error");
     }
+
+    #[test]
+    fn accepted_without_batch_eta_is_internal() {
+        let r = PublishResult {
+            accepted: true,
+            reason: None,
+            batch_eta: None,
+        };
+        let err = publish_result_to_json(&r).unwrap_err();
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn rejected_with_batch_eta_is_internal() {
+        let r = PublishResult {
+            accepted: false,
+            reason: Some("policy".into()),
+            batch_eta: Some(1),
+        };
+        let err = publish_result_to_json(&r).unwrap_err();
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn rejected_with_empty_reason_is_internal() {
+        let r = PublishResult {
+            accepted: false,
+            reason: Some("".into()),
+            batch_eta: None,
+        };
+        let err = publish_result_to_json(&r).unwrap_err();
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn rejected_without_reason_is_internal() {
+        let r = PublishResult {
+            accepted: false,
+            reason: None,
+            batch_eta: None,
+        };
+        let err = publish_result_to_json(&r).unwrap_err();
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn parse_u32_decimal_rejects_value_above_u32_max() {
+        let err = parse_u32_decimal("4294967296", "height").unwrap_err();
+        assert_eq!(err.body.error, "malformed_request");
+    }
 }

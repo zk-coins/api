@@ -238,7 +238,38 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::connect_lazy;
+    use crate::ownership::{GrantRevokeChallengeStore, RevokedGrantSet, SubjectOpDirectory};
+    use crate::state::AppState;
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    fn dummy_state() -> AppState {
+        let kernel = Arc::new(connect_lazy("http://127.0.0.1:1").expect("lazy kernel uri"));
+        AppState {
+            kernel,
+            features: BTreeSet::new(),
+            public_hosts: Arc::new(vec!["node.example.com".into()]),
+            blossom: None,
+            subject_ops: Arc::new(SubjectOpDirectory::new()),
+            revoked_grants: Arc::new(RevokedGrantSet::new()),
+            grant_revoke_challenges: Arc::new(GrantRevokeChallengeStore::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn require_blossom_without_configuration_is_internal() {
+        let err = match require_blossom(&dummy_state()) {
+            Err(e) => e,
+            Ok(_) => panic!("unconfigured blossom must err"),
+        };
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(
+            err.cause(),
+            Some("blossom surface reached without configuration")
+        );
+    }
 
     #[test]
     fn require_octet_stream_missing_content_type_is_malformed() {

@@ -393,4 +393,34 @@ mod tests {
         let res = readiness_from_info(&info);
         assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
+
+    #[test]
+    fn readiness_ready_with_nonempty_reason_is_503() {
+        let res = readiness_from_info(&sample_info(true, Some("syncing")));
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn info_json_rejects_unknown_network() {
+        let mut info = sample_info(true, None);
+        info.network = "signet".into();
+        let err = info_to_json(&info, &BTreeSet::new(), None).unwrap_err();
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn info_json_rejects_non_v1_protocol_version() {
+        let mut info = sample_info(true, None);
+        info.protocol_version = "v2".into();
+        let err = info_to_json(&info, &BTreeSet::new(), None).unwrap_err();
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn info_json_rejects_absent_bootstrap() {
+        let mut info = sample_info(true, None);
+        info.bootstrap = None;
+        let err = info_to_json(&info, &BTreeSet::new(), None).unwrap_err();
+        assert_eq!(err.body.error, "internal_error");
+    }
 }
