@@ -826,10 +826,10 @@ mod tests {
     use crate::kernel::encode_kernel_error_status;
     use crate::kernel::kernel_v1::{
         AccountStateRequest, AccountStateResult, AccumulatorTip, AttestRequest, BootstrapManifest,
-        Challenge, CoinProofBlob, CoinProofRequest, EntrustRequest, EntrustResult, GrantRequest,
-        GrantResult, Info, Inscription, Job, JobEvent, JobHandle, JobRequest,
-        ListInscriptionsRequest, Nullifier as ProtoNullifier, NullifierPath, NullifierPathRequest,
-        PublishRequest, PublishResult, PullChallengeRequest, PullRequest,
+        Challenge, CoinProofBlob, CoinProofRequest, EntrustRequest, EntrustResult,
+        GetTokenProvenanceRequest, GrantRequest, GrantResult, Info, Inscription, Job, JobEvent,
+        JobHandle, JobRequest, ListInscriptionsRequest, Nullifier as ProtoNullifier, NullifierPath,
+        NullifierPathRequest, PublishRequest, PublishResult, PullChallengeRequest, PullRequest,
         PullResult as ProtoPullResult, Receipt, RecordBlob, RecordRequest, RevokeRequest,
         RevokeResult, SignRequest, SubscribeReceiptsRequest, TransitionRequest,
     };
@@ -990,6 +990,145 @@ mod tests {
         async fn publish(&self, _req: PublishRequest) -> Result<PublishResult, ApiError> {
             Err(ApiError::internal("test double: publish not configured"))
         }
+    }
+
+    /// Every UnreachableKernel KernelRpc stub returns internal_error so
+    /// llvm-cov does not treat the stubs as misses.
+    #[tokio::test]
+    async fn unreachable_kernel_unused_rpcs_are_internal() {
+        let k = UnreachableKernel;
+
+        let err = k
+            .get_token_provenance(GetTokenProvenanceRequest { asset_id: vec![] })
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .submit_transition(TransitionRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .get_job(JobRequest {
+                job_id: String::new(),
+            })
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let result = k
+            .stream_job(JobRequest {
+                job_id: String::new(),
+            })
+            .await;
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert_eq!(e.body.error, "internal_error");
+        }
+
+        let err = k
+            .sign_transition(SignRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .cancel_job(JobRequest {
+                job_id: String::new(),
+            })
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k.get_info().await.expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k.get_accumulator().await.expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let result = k
+            .list_inscriptions(ListInscriptionsRequest::default())
+            .await;
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert_eq!(e.body.error, "internal_error");
+        }
+
+        let err = k
+            .get_nullifier_path(NullifierPathRequest { pubkey: vec![] })
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .open_pull_challenge(PullChallengeRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .attest_balance(AttestRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .issue_view_grant(GrantRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .pull(PullRequest::default(), SessionAuthority::Ownership)
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .get_record(RecordRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .get_coin_proof(CoinProofRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .get_account_state(AccountStateRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let result = k
+            .subscribe_receipts(SubscribeReceiptsRequest::default())
+            .await;
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert_eq!(e.body.error, "internal_error");
+        }
+
+        let err = k
+            .entrust_operational_bundle(EntrustRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .revoke_operational_bundle(RevokeRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .publish(PublishRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
     }
 
     fn test_app() -> Router {
