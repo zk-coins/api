@@ -2814,6 +2814,90 @@ mod tests {
         );
     }
 
+    #[test]
+    fn job_result_json_rejects_short_new_account_state_hash() {
+        let r = crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![0x11; 16],
+            output_coins_root: vec![],
+            input_nullifiers_root: vec![],
+            output_coin_ids: vec![],
+            publisher_pubkey: vec![],
+            attestation: vec![],
+        };
+        let err = job_result_json(&r).expect_err("short new_account_state_hash");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause()
+                .unwrap_or("")
+                .contains("result.new_account_state_hash"),
+            "cause must name result.new_account_state_hash, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn job_result_json_rejects_short_output_coins_root() {
+        let r = crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![],
+            output_coins_root: vec![0x22; 16],
+            input_nullifiers_root: vec![],
+            output_coin_ids: vec![],
+            publisher_pubkey: vec![],
+            attestation: vec![],
+        };
+        let err = job_result_json(&r).expect_err("short output_coins_root");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause()
+                .unwrap_or("")
+                .contains("result.output_coins_root"),
+            "cause must name result.output_coins_root, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn job_result_json_rejects_short_input_nullifiers_root() {
+        let r = crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![],
+            output_coins_root: vec![],
+            input_nullifiers_root: vec![0x33; 16],
+            output_coin_ids: vec![],
+            publisher_pubkey: vec![],
+            attestation: vec![],
+        };
+        let err = job_result_json(&r).expect_err("short input_nullifiers_root");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause()
+                .unwrap_or("")
+                .contains("result.input_nullifiers_root"),
+            "cause must name result.input_nullifiers_root, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn job_result_json_rejects_short_output_coin_ids() {
+        let r = crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![],
+            output_coins_root: vec![],
+            input_nullifiers_root: vec![],
+            output_coin_ids: vec![vec![0x44; 16]],
+            publisher_pubkey: vec![],
+            attestation: vec![],
+        };
+        let err = job_result_json(&r).expect_err("short output_coin_ids");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause()
+                .unwrap_or("")
+                .contains("result.output_coin_ids[0]"),
+            "cause must name result.output_coin_ids[0], got {:?}",
+            err.cause()
+        );
+    }
+
     // -----------------------------------------------------------------------
     // job_event_to_sse / phase_event_data
     // -----------------------------------------------------------------------

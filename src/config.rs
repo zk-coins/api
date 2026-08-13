@@ -439,6 +439,25 @@ mod tests {
     }
 
     #[test]
+    fn blossom_allowed_ops_skips_empty_tokens() {
+        let mut get = getter(HashMap::from([
+            (ENV_BIND, "127.0.0.1:8080"),
+            (ENV_KERNEL, "http://127.0.0.1:50051"),
+            (ENV_FEATURES, ""),
+            (ENV_PUBLIC_HOST, ""),
+            (ENV_BLOSSOM_STORE, "/var/lib/zkcoins/blossom"),
+            (ENV_BLOSSOM_MAX_BLOB_BYTES, "1048576"),
+            (
+                ENV_BLOSSOM_ALLOWED_OPS,
+                ",aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,",
+            ),
+        ]));
+        let cfg = Config::from_getter(&mut get).expect("valid blossom");
+        let blossom = cfg.blossom.expect("configured");
+        assert_eq!(blossom.allowed_upload_ops.len(), 1);
+    }
+
+    #[test]
     fn blossom_max_blob_zero_is_error() {
         let mut get = getter(HashMap::from([
             (ENV_BIND, "127.0.0.1:8080"),

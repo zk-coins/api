@@ -778,6 +778,37 @@ mod tests {
         assert_eq!(q.limit, 1);
     }
 
+    #[test]
+    fn parse_list_inscriptions_query_ignores_unknown_keys() {
+        let q = parse_list_inscriptions_query(Some("foo=1&limit=5")).expect("unknown keys ok");
+        assert_eq!(q.limit, 5);
+        assert_eq!(q.from_height, 0);
+        assert_eq!(q.from_tx_index, 0);
+        assert_eq!(q.from_vin_index, 0);
+    }
+
+    #[test]
+    fn parse_list_inscriptions_query_skips_empty_pairs() {
+        let q =
+            parse_list_inscriptions_query(Some("limit=5&&from_height=3")).expect("empty pairs ok");
+        assert_eq!(q.limit, 5);
+        assert_eq!(q.from_height, 3);
+        assert_eq!(q.from_tx_index, 0);
+        assert_eq!(q.from_vin_index, 0);
+    }
+
+    #[test]
+    fn parse_list_inscriptions_query_key_without_equals_is_malformed() {
+        let err = parse_list_inscriptions_query(Some("from_height")).expect_err("key without =");
+        assert_eq!(err.body.error, "malformed_request");
+    }
+
+    #[test]
+    fn parse_list_inscriptions_query_empty_value_is_malformed() {
+        let err = parse_list_inscriptions_query(Some("from_height=")).expect_err("empty value");
+        assert_eq!(err.body.error, "malformed_request");
+    }
+
     // -----------------------------------------------------------------------
     // Page-boundary pagination against a catalog double
     // -----------------------------------------------------------------------
