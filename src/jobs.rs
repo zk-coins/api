@@ -1440,9 +1440,9 @@ mod tests {
         assert_eq!(req.output_templates.len(), 1);
         let ot = &req.output_templates[0];
         let cred = ot.delivery.as_ref().expect("delivery present");
-        let inv = match cred.body.as_ref().expect("oneof set") {
-            DeliveryBody::Invoice(i) => i,
-            other => panic!("expected Invoice arm, got {other:?}"),
+        assert!(matches!(cred.body.as_ref(), Some(DeliveryBody::Invoice(_))));
+        let Some(DeliveryBody::Invoice(inv)) = cred.body.as_ref() else {
+            panic!("expected Invoice arm");
         };
         assert_eq!(inv.amount, "100");
         assert_eq!(
@@ -1472,9 +1472,12 @@ mod tests {
             .delivery
             .as_ref()
             .expect("delivery present");
-        let ev = match cred.body.as_ref().expect("oneof set") {
-            DeliveryBody::ProfileEvent(e) => e,
-            other => panic!("expected ProfileEvent arm, got {other:?}"),
+        assert!(matches!(
+            cred.body.as_ref(),
+            Some(DeliveryBody::ProfileEvent(_))
+        ));
+        let Some(DeliveryBody::ProfileEvent(ev)) = cred.body.as_ref() else {
+            panic!("expected ProfileEvent arm");
         };
         assert_eq!(ev.id, vec![0x91; 32]);
         assert_eq!(ev.pubkey, vec![0x92; 32]);
@@ -2207,6 +2210,45 @@ mod tests {
     }
 
     #[test]
+    fn validate_job_accepted_must_not_carry_result() {
+        for status in ["accepted", "proving", "publishing"] {
+            let mut job = sample_job(status);
+            job.result = Some(sample_transition_result());
+            let err = validate_job(&job).expect_err("non-terminal must not carry result");
+            assert_eq!(err.body.error, "internal_error");
+            let cause = err.cause().unwrap_or("");
+            assert!(
+                cause.contains("must not carry") || cause.contains(status),
+                "cause must name exclusivity or status {status}, got {cause:?}"
+            );
+
+            let mut job = sample_job(status);
+            job.awaiting_signature = Some(sample_awaiting_signature());
+            let err =
+                validate_job(&job).expect_err("non-terminal must not carry awaiting_signature");
+            assert_eq!(err.body.error, "internal_error");
+            let cause = err.cause().unwrap_or("");
+            assert!(
+                cause.contains("must not carry") || cause.contains(status),
+                "cause must name exclusivity or status {status}, got {cause:?}"
+            );
+
+            let mut job = sample_job(status);
+            job.error = Some(crate::kernel::kernel_v1::JobError {
+                error: "proving_failed".into(),
+                message: "x".into(),
+            });
+            let err = validate_job(&job).expect_err("non-terminal must not carry error");
+            assert_eq!(err.body.error, "internal_error");
+            let cause = err.cause().unwrap_or("");
+            assert!(
+                cause.contains("must not carry") || cause.contains(status),
+                "cause must name exclusivity or status {status}, got {cause:?}"
+            );
+        }
+    }
+
+    #[test]
     fn validate_job_transition_rejects_short_new_account_state_hash() {
         let mut job = sample_job("completed");
         job.result = Some(crate::kernel::kernel_v1::JobResult {
@@ -2770,6 +2812,22 @@ mod tests {
     }
 
     #[test]
+    fn job_to_json_attest_balance_includes_attestation_hex() {
+        let mut job = sample_job("completed");
+        job.kind = "attest_balance".into();
+        job.result = Some(crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![],
+            output_coins_root: vec![],
+            input_nullifiers_root: vec![],
+            output_coin_ids: vec![],
+            publisher_pubkey: vec![],
+            attestation: vec![0xaa, 0xbb, 0xcc],
+        });
+        let json = job_to_json(&job).expect("attest projection");
+        assert_eq!(json["result"]["attestation"], "aabbcc");
+    }
+
+    #[test]
     fn require_hex32_rejects_wrong_length() {
         let err = require_hex32(&[0u8; 16], "nav_commitment").expect_err("16 bytes");
         assert_eq!(err.body.error, "internal_error");
@@ -2930,5 +2988,54 @@ mod tests {
             "phase data must embed awaiting_signature"
         );
         assert_eq!(data["awaiting_signature"]["send_counter"], 7);
+    }
+
+    // -----------------------------------------------------------------------
+    // Handler empty job_id guards
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_job_empty_job_id_is_malformed_request() {
+        let kernel: crate::KernelHandle =
+            std::sync::Arc::new(crate::connect_lazy("http://127.0.0.1:1").expect("lazy"));
+        let err = get_job(State(kernel), Path(String::new()))
+            .await
+            .expect_err("empty job_id");
+        assert_eq!(err.body.error, "malformed_request");
+    }
+
+    #[tokio::test]
+    async fn stream_job_empty_job_id_is_malformed_request() {
+        let kernel: crate::KernelHandle =
+            std::sync::Arc::new(crate::connect_lazy("http://127.0.0.1:1").expect("lazy"));
+        let result = stream_job(State(kernel), Path(String::new())).await;
+        assert!(result.is_err(), "empty job_id must be Err");
+        if let Err(err) = result {
+            assert_eq!(err.body.error, "malformed_request");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_sign_empty_job_id_is_malformed_request() {
+        let kernel: crate::KernelHandle =
+            std::sync::Arc::new(crate::connect_lazy("http://127.0.0.1:1").expect("lazy"));
+        let body = SignBodyJson {
+            signature: hex64(0x00),
+            s2c_nonce: hex32(0x00),
+        };
+        let err = post_sign(State(kernel), Path(String::new()), JsonBody(body))
+            .await
+            .expect_err("empty job_id");
+        assert_eq!(err.body.error, "malformed_request");
+    }
+
+    #[tokio::test]
+    async fn post_cancel_empty_job_id_is_malformed_request() {
+        let kernel: crate::KernelHandle =
+            std::sync::Arc::new(crate::connect_lazy("http://127.0.0.1:1").expect("lazy"));
+        let err = post_cancel(State(kernel), Path(String::new()))
+            .await
+            .expect_err("empty job_id");
+        assert_eq!(err.body.error, "malformed_request");
     }
 }
