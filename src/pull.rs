@@ -795,10 +795,13 @@ fn receipt_to_json(r: &Receipt) -> Result<Value, ApiError> {
             "kernel Receipt.amount is empty on SubscribeReceipts success",
         ));
     }
-    if r.state.is_empty() {
-        return Err(ApiError::internal(
-            "kernel Receipt.state is empty on SubscribeReceipts success",
-        ));
+    match r.state.as_str() {
+        "completed" | "pending" | "failed" => {}
+        other => {
+            return Err(ApiError::internal(format!(
+                "kernel Receipt.state must be \"completed\", \"pending\", or \"failed\", got {other:?}"
+            )));
+        }
     }
     Ok(json!({
         "coin_id": encode_hex(&r.coin_id),
@@ -1194,6 +1197,18 @@ mod tests {
         let r = sample_receipt(0x11, "100", "", 1_700_000_000);
         let err = receipt_to_json(&r).expect_err("empty state");
         assert_internal(&err);
+    }
+
+    #[test]
+    fn receipt_to_json_rejects_unknown_state() {
+        let r = sample_receipt(0x11, "100", "weird", 1_700_000_000);
+        let err = receipt_to_json(&r).expect_err("unknown state");
+        assert_internal(&err);
+        let cause = err.cause().unwrap_or("");
+        assert!(
+            cause.contains("Receipt.state") && cause.contains("weird"),
+            "operator cause must name the closed state contract, got {cause}"
+        );
     }
 
     #[test]

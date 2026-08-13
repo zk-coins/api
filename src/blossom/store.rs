@@ -212,13 +212,36 @@ impl BlobStore {
     }
 
     /// `true` when a **complete** durable pair (blob + note) exists.
-    pub fn exists(&self, id: &[u8; 32]) -> bool {
-        self.blob_path(id).is_file() && self.uploader_path(id).is_file()
+    ///
+    /// `NotFound` on either path is absence (`Ok(false)`). Any other IO error
+    /// (e.g. permission denied) is `internal_error` — never silent false.
+    pub fn exists(&self, id: &[u8; 32]) -> Result<bool, ApiError> {
+        let blob_ok = match fs::metadata(self.blob_path(id)) {
+            Ok(m) => m.is_file(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => {
+                return Err(ApiError::internal(format!(
+                    "blossom store: stat {}: {e}",
+                    self.blob_path(id).display()
+                )));
+            }
+        };
+        let note_ok = match fs::metadata(self.uploader_path(id)) {
+            Ok(m) => m.is_file(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => {
+                return Err(ApiError::internal(format!(
+                    "blossom store: stat {}: {e}",
+                    self.uploader_path(id).display()
+                )));
+            }
+        };
+        Ok(blob_ok && note_ok)
     }
 
     /// Byte length of a stored blob, or `None` if the complete pair is absent.
     pub fn size(&self, id: &[u8; 32]) -> Result<Option<u64>, ApiError> {
-        if !self.exists(id) {
+        if !self.exists(id)? {
             return Ok(None);
         }
         let path = self.blob_path(id);
@@ -238,7 +261,7 @@ impl BlobStore {
 
     /// Read the full blob body, or `None` if the complete pair is absent.
     pub fn read(&self, id: &[u8; 32]) -> Result<Option<Vec<u8>>, ApiError> {
-        if !self.exists(id) {
+        if !self.exists(id)? {
             return Ok(None);
         }
         let path = self.blob_path(id);
@@ -546,7 +569,7 @@ mod tests {
         let id = blob_id_of(body);
         fs::write(store.blob_path(&id), body).expect("orphan blob");
         assert!(store.read_uploader(&id).expect("read").is_none());
-        assert!(!store.exists(&id));
+        assert!(!store.exists(&id).expect("exists"));
         let uploader = [0x33u8; 32];
         let err = store
             .put(body, &uploader)
@@ -579,7 +602,7 @@ mod tests {
         let id = store.put(body, &uploader).expect("put");
         drop(store);
         let store = BlobStore::open(&root).expect("re-open");
-        assert!(store.exists(&id));
+        assert!(store.exists(&id).expect("exists"));
         assert_eq!(store.read(&id).unwrap().unwrap(), body);
         assert_eq!(store.read_uploader(&id).unwrap().unwrap(), uploader);
         let _ = fs::remove_dir_all(&root);
@@ -734,6 +757,44 @@ mod tests {
             cause.contains("corrupt") || cause.contains("uploader note"),
             "diagnostic must mention corrupt uploader note, got {cause:?}"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Permission errors on the store root must not look like absence (404).
+    #[cfg(unix)]
+    #[test]
+    fn exists_size_read_permission_error_is_internal_not_absence() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let body = b"perm-denied-body";
+        let uploader = [0x77u8; 32];
+        let id = store.put(body, &uploader).expect("put");
+        assert!(store.exists(&id).expect("exists before chmod"));
+
+        let original = fs::metadata(&root).expect("meta").permissions();
+        let _restore = RestorePerm {
+            path: root.clone(),
+            perm: original.clone(),
+        };
+        let mut locked = original.clone();
+        locked.set_mode(0o000);
+        fs::set_permissions(&root, locked).expect("chmod root 000");
+
+        let err = store.exists(&id).expect_err("exists under locked root");
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
+
+        let err = store.size(&id).expect_err("size under locked root");
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+        let err = store.read(&id).expect_err("read under locked root");
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Restore before remove_dir_all (RestorePerm Drop also restores).
+        fs::set_permissions(&root, original).expect("restore root mode");
         let _ = fs::remove_dir_all(&root);
     }
 

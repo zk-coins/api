@@ -86,6 +86,23 @@ fn is_transition_job_kind(kind: &str) -> bool {
     matches!(kind, "mint" | "send" | "receive")
 }
 
+/// Kernel `Job.job_id` must be non-empty and byte-exact equal to the path id
+/// before any job object is forwarded (poll, sign, cancel, SSE).
+fn assert_job_id(job: &Job, path_id: &str) -> Result<(), ApiError> {
+    if job.job_id.is_empty() {
+        return Err(ApiError::internal(
+            "kernel Job.job_id is empty (path job_id contract breach)",
+        ));
+    }
+    if job.job_id.as_bytes() != path_id.as_bytes() {
+        return Err(ApiError::internal(format!(
+            "kernel Job.job_id does not match path job_id (contract breach): path={path_id:?} job={:?}",
+            job.job_id
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a kernel `Job` against the closed status set, status↔payload
 /// exclusivity, kind-dependent result shape, and terminal error-code
 /// vocabulary. Fail-closed as `500 internal_error` on any contract breach
@@ -557,6 +574,7 @@ pub async fn get_job(
             job_id: job_id.clone(),
         })
         .await?;
+    assert_job_id(&job, &job_id)?;
     let (status_header, retry_after) = job_poll_headers(&job)?;
     let mut response = (status_header, Json(job_to_json(&job)?)).into_response();
     if let Some(secs) = retry_after {
@@ -584,9 +602,10 @@ pub async fn stream_job(
     }
     // Await the kernel stream handshake first. On `Err`, axum maps `ApiError`
     // to a normal HTTP response (status + JSON body) and never enters SSE.
+    let path_id = job_id.clone();
     let stream = kernel.stream_job(JobRequest { job_id }).await?;
 
-    let sse_stream = job_event_sse_stream(stream);
+    let sse_stream = job_event_sse_stream(stream, path_id);
     Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
 }
 
@@ -603,6 +622,7 @@ pub async fn post_sign(
         .map_err(|e| ApiError::malformed(format!("signature: {e}")))?;
     let s2c_nonce = decode_hex_exact(&body.s2c_nonce, 32)
         .map_err(|e| ApiError::malformed(format!("s2c_nonce: {e}")))?;
+    let path_id = job_id.clone();
     let job = kernel
         .sign_transition(SignRequest {
             job_id,
@@ -610,6 +630,7 @@ pub async fn post_sign(
             s2c_nonce,
         })
         .await?;
+    assert_job_id(&job, &path_id)?;
     Ok((StatusCode::OK, Json(job_to_json(&job)?)).into_response())
 }
 
@@ -621,7 +642,9 @@ pub async fn post_cancel(
     if job_id.is_empty() {
         return Err(ApiError::malformed("job_id must not be empty"));
     }
+    let path_id = job_id.clone();
     let job = kernel.cancel_job(JobRequest { job_id }).await?;
+    assert_job_id(&job, &path_id)?;
     Ok((StatusCode::OK, Json(job_to_json(&job)?)).into_response())
 }
 
@@ -629,7 +652,10 @@ pub async fn post_cancel(
 // SSE
 // ---------------------------------------------------------------------------
 
-fn job_event_sse_stream<S>(stream: S) -> impl Stream<Item = Result<Event, Infallible>> + Send
+fn job_event_sse_stream<S>(
+    stream: S,
+    path_id: String,
+) -> impl Stream<Item = Result<Event, Infallible>> + Send
 where
     S: Stream<Item = Result<JobEvent, ApiError>> + Send + 'static,
 {
@@ -638,35 +664,41 @@ where
     //
     // `take_while` + stateful scan: after a terminal event (`complete` /
     // `error`) or a stream-break frame we stop polling the kernel stream.
-    async_stream_events(stream)
+    async_stream_events(stream, path_id)
 }
 
-fn async_stream_events<S>(stream: S) -> impl Stream<Item = Result<Event, Infallible>> + Send
+fn async_stream_events<S>(
+    stream: S,
+    path_id: String,
+) -> impl Stream<Item = Result<Event, Infallible>> + Send
 where
     S: Stream<Item = Result<JobEvent, ApiError>> + Send + 'static,
 {
-    futures_util::stream::unfold((Box::pin(stream), false), |(mut stream, done)| async move {
-        if done {
-            return None;
-        }
-        match stream.next().await {
-            None => None,
-            Some(Ok(ev)) => {
-                let terminal = is_terminal_event_name(&ev.event);
-                match job_event_to_sse(&ev) {
-                    Ok(frame) => Some((Ok(frame), (stream, terminal))),
-                    Err(api_err) => {
-                        let frame = stream_break_event(&api_err);
-                        Some((Ok(frame), (stream, true)))
+    futures_util::stream::unfold(
+        (Box::pin(stream), false, path_id),
+        |(mut stream, done, path_id)| async move {
+            if done {
+                return None;
+            }
+            match stream.next().await {
+                None => None,
+                Some(Ok(ev)) => {
+                    let terminal = is_terminal_event_name(&ev.event);
+                    match job_event_to_sse(&ev, &path_id) {
+                        Ok(frame) => Some((Ok(frame), (stream, terminal, path_id))),
+                        Err(api_err) => {
+                            let frame = stream_break_event(&api_err);
+                            Some((Ok(frame), (stream, true, path_id)))
+                        }
                     }
                 }
+                Some(Err(api_err)) => {
+                    let frame = stream_break_event(&api_err);
+                    Some((Ok(frame), (stream, true, path_id)))
+                }
             }
-            Some(Err(api_err)) => {
-                let frame = stream_break_event(&api_err);
-                Some((Ok(frame), (stream, true)))
-            }
-        }
-    })
+        },
+    )
 }
 
 fn is_terminal_event_name(name: &str) -> bool {
@@ -686,7 +718,7 @@ fn stream_break_event(err: &ApiError) -> Event {
     Event::default().event("error").data(data.to_string())
 }
 
-fn job_event_to_sse(ev: &JobEvent) -> Result<Event, ApiError> {
+fn job_event_to_sse(ev: &JobEvent, path_id: &str) -> Result<Event, ApiError> {
     let name = ev.event.as_str();
     let job = match &ev.job {
         Some(j) => j,
@@ -696,6 +728,7 @@ fn job_event_to_sse(ev: &JobEvent) -> Result<Event, ApiError> {
             ));
         }
     };
+    assert_job_id(job, path_id)?;
     // Closed event name + status correlation + payload exclusivity.
     validate_sse_event_status(name, job)?;
     let data = match name {
@@ -2955,8 +2988,31 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // job_event_to_sse / phase_event_data
+    // assert_job_id / job_event_to_sse / phase_event_data
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn assert_job_id_match_mismatch_and_empty() {
+        let job = sample_job("accepted");
+        assert_job_id(&job, "j1").expect("match");
+        let err = assert_job_id(&job, "other").expect_err("mismatch");
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
+        let cause = err.cause().unwrap_or("");
+        assert!(
+            cause.contains("job_id") && cause.contains("path"),
+            "cause must name path/job_id contract, got {cause}"
+        );
+        let mut empty = sample_job("accepted");
+        empty.job_id.clear();
+        let err = assert_job_id(&empty, "j1").expect_err("empty");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("empty"),
+            "cause must name empty job_id, got {:?}",
+            err.cause()
+        );
+    }
 
     #[test]
     fn job_event_to_sse_requires_job_payload() {
@@ -2964,7 +3020,7 @@ mod tests {
             event: "phase".into(),
             job: None,
         };
-        let err = job_event_to_sse(&ev).expect_err("missing job");
+        let err = job_event_to_sse(&ev, "path-id").expect_err("missing job");
         assert_eq!(err.body.error, "internal_error");
         assert!(
             err.cause().unwrap_or("").contains("missing")

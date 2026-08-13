@@ -352,23 +352,24 @@ pub async fn post_grants_revoke(
         state.public_hosts.as_slice(),
     )?;
 
-    // 5. Decode grant + grant→subject binding (DoS protection): a foreign
+    // 5. Expiry — immediately after a valid proof, before grant decode.
+    //    Clean up the expired nonce via `take`, then 410 `challenge_expired`
+    //    (malformed grant must not mask expiry).
+    let now = unix_now()?;
+    if now > entry.expiry {
+        let _ = state.grant_revoke_challenges.take(&nonce_raw);
+        return Err(ApiError::challenge_expired(
+            "grant-revoke challenge has expired",
+        ));
+    }
+
+    // 6. Decode grant + grant→subject binding (DoS protection): a foreign
     //    grant_id must not be revocable merely because someone presents a
     //    valid OwnershipProof for their own subject. On mismatch do not `take`.
     let grant = decode_view_grant(&body.grant)?;
     if grant.subject != entry.subject {
         return Err(ApiError::unauthorized(
             "grant.subject does not match the authenticated revoke subject",
-        ));
-    }
-
-    // 6. Expiry — only after a valid proof and grant→subject bind. Clean up
-    //    the expired nonce via `take`, then 410 `challenge_expired`.
-    let now = unix_now()?;
-    if now > entry.expiry {
-        let _ = state.grant_revoke_challenges.take(&nonce_raw);
-        return Err(ApiError::challenge_expired(
-            "grant-revoke challenge has expired",
         ));
     }
 

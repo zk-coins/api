@@ -263,12 +263,13 @@ impl ServedSurface {
             // `publisher` — hand-off endpoint (§6.1 L2339; rest-surface #23).
             ServedSurface::PublishSpendrecord => features.contains(&Feature::Publisher),
 
-            // §7.4 Blossom: store must be configured, and at least one of
-            // `wallet` / `explorer` must be on (blob fetch under explorer,
-            // upload under both). No DELETE — data permanence.
-            ServedSurface::BlossomGet
-            | ServedSurface::BlossomHead
-            | ServedSurface::BlossomUpload => {
+            // §7.4 Blossom: store must be configured. Blob fetch (GET/HEAD) is
+            // explorer-only; upload is wallet **or** explorer. No DELETE —
+            // data permanence.
+            ServedSurface::BlossomGet | ServedSurface::BlossomHead => {
+                blossom_configured && features.contains(&Feature::Explorer)
+            }
+            ServedSurface::BlossomUpload => {
                 blossom_configured
                     && (features.contains(&Feature::Wallet)
                         || features.contains(&Feature::Explorer))
@@ -8471,6 +8472,152 @@ mod tests {
         assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
     }
 
+    /// Kernel job_id must bind to the path id — foreign id is 500, not 200/404.
+    #[tokio::test]
+    async fn get_job_foreign_job_id_is_500_internal() {
+        let kernel = ScriptedKernel {
+            get: Some(Ok(accepted_job("other"))),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/jobs/path-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_ne!(res.status(), StatusCode::NOT_FOUND);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
+        assert!(
+            json.get("job_id").is_none() || json["job_id"] != "other",
+            "must not forward foreign job object, got {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_sign_foreign_job_id_is_500_internal() {
+        let kernel = ScriptedKernel {
+            sign: Some(Ok(accepted_job("other"))),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
+        let body = serde_json::json!({
+            "signature": crate::hexutil::encode_hex(&[1u8; 64]),
+            "s2c_nonce": hex32(0xcd),
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/path-id/sign")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_ne!(res.status(), StatusCode::NOT_FOUND);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
+        assert!(
+            json.get("job_id").is_none() || json["job_id"] != "other",
+            "must not forward foreign job object, got {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_cancel_foreign_job_id_is_500_internal() {
+        let mut job = accepted_job("other");
+        job.status = "cancelled".to_string();
+        job.error = Some(crate::kernel::kernel_v1::JobError {
+            error: "proving_failed".into(),
+            message: "cancelled".into(),
+        });
+        let kernel = ScriptedKernel {
+            cancel: Some(Ok(job)),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/path-id/cancel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_ne!(res.status(), StatusCode::NOT_FOUND);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
+        assert!(
+            json.get("job_id").is_none() || json["job_id"] != "other",
+            "must not forward foreign job object, got {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_job_foreign_job_id_is_stream_break_internal() {
+        let phase = JobEvent {
+            event: "phase".into(),
+            job: Some({
+                let mut j = accepted_job("other");
+                j.status = "proving".into();
+                j.phase = "witness_build".into();
+                j.progress = 0.25;
+                j
+            }),
+        };
+        let kernel = ScriptedKernel {
+            stream: Some(Ok(vec![Ok(phase)])),
+            ..Default::default()
+        };
+        let app = build_router(test_config(), Arc::new(kernel)).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/jobs/path-id/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Handshake may succeed (200 SSE); body must break on foreign job_id.
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(res).await).expect("utf8");
+        assert!(
+            body.contains("event: error"),
+            "foreign job_id must stream-break as error, body={body}"
+        );
+        assert!(
+            body.contains("internal_error"),
+            "stream-break must carry internal_error, body={body}"
+        );
+        assert!(
+            body.contains(crate::error::PUBLIC_INTERNAL_MESSAGE),
+            "stream-break must carry public internal message, body={body}"
+        );
+        assert!(
+            !body.contains("\"job_id\":\"other\""),
+            "must not forward foreign job_id in phase payload, body={body}"
+        );
+        assert!(
+            !body.contains("event: phase"),
+            "must not emit successful phase for foreign job_id, body={body}"
+        );
+    }
+
     #[tokio::test]
     async fn blossom_upload_rejects_json_content_type_as_malformed_request() {
         let root = blossom_temp_root("jsonct");
@@ -8604,6 +8751,59 @@ mod tests {
         assert!(
             !endpoints.contains_key("blossom_delete"),
             "data permanence: blossom_delete must never be advertised"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Wallet-only + store: upload active/advertised; GET/HEAD inactive stubs.
+    #[tokio::test]
+    async fn blossom_wallet_only_advertises_upload_not_get_head() {
+        let root = blossom_temp_root("wallet-only-blossom");
+        let cfg = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            kernel_addr: "http://127.0.0.1:50051".to_string(),
+            features: BTreeSet::from([Feature::Wallet]),
+            public_hosts: vec!["node.example.com".to_string()],
+            blossom: Some(crate::config::BlossomConfig {
+                store_root: root.clone(),
+                max_blob_bytes: 1024,
+                allowed_upload_ops: BTreeSet::new(),
+            }),
+        };
+        let app = build_router(cfg, Arc::new(UnreachableKernel)).expect("router");
+
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        let endpoints = json["endpoints"].as_object().unwrap();
+        assert_eq!(endpoints["blossom_upload"], "/blossom/upload");
+        assert!(
+            !endpoints.contains_key("blossom_get"),
+            "wallet-only must not advertise blossom_get"
+        );
+        assert!(
+            !endpoints.contains_key("blossom_head"),
+            "wallet-only must not advertise blossom_head"
+        );
+
+        let sha = "a".repeat(64);
+        let get = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/blossom/{sha}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::NOT_FOUND);
+        let body: Value = serde_json::from_slice(&body_bytes(get).await).unwrap();
+        assert_eq!(
+            body["error"], "feature_disabled",
+            "inactive GET stub must be feature_disabled, got {body}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -9193,6 +9393,103 @@ mod tests {
         assert_eq!(res.status(), StatusCode::GONE);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
         assert_eq!(json["error"], "challenge_expired");
+    }
+
+    /// Expiry runs before grant decode: malformed grant must not mask 410.
+    #[tokio::test]
+    async fn grants_revoke_expired_challenge_is_410_even_with_malformed_grant() {
+        use crate::ownership::{
+            pull_challenge_message, GrantRevokeChallengeStore, RevokedGrantSet, SubjectOpDirectory,
+            REVOKE_GRANT_CHALLENGE_DOMAIN,
+        };
+
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let (grant_bech, _, _, _) = test_signed_zkgrant(&subject_raw, 0x55, 0x66, 0x77);
+
+        let challenges = Arc::new(GrantRevokeChallengeStore::new());
+        let past_expiry = 1u64;
+        let nonce_raw = challenges.issue(subject_raw, past_expiry);
+        let nonce_hex = encode_hex(&nonce_raw);
+
+        let kernel = Arc::new(ScriptedKernel::default());
+        let config = test_config();
+        let state = AppState {
+            kernel: kernel.clone(),
+            features: config.features.clone(),
+            public_hosts: Arc::new(config.public_hosts.clone()),
+            blossom: None,
+            subject_ops: Arc::new(SubjectOpDirectory::new()),
+            revoked_grants: Arc::new(RevokedGrantSet::new()),
+            grant_revoke_challenges: challenges.clone(),
+        };
+        let app = {
+            let mut router = Router::new().route("/", get(root));
+            for surface in ServedSurface::active(&config.features, false) {
+                router = surface.register(router, None);
+            }
+            router.with_state(state)
+        };
+
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            REVOKE_GRANT_CHALLENGE_DOMAIN,
+            &nonce_raw,
+            &cb,
+            &subject_raw,
+            past_expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        // Malformed grant would be 400 if decode ran before expiry.
+        let body = grant_revoke_ownership_body(
+            &nonce_hex,
+            &subject_bech,
+            &pk0,
+            &nkc,
+            &sig,
+            "not-a-zkgrant",
+        );
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::GONE);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(
+            json["error"], "challenge_expired",
+            "expired challenge must be 410 even with malformed grant, got {json}"
+        );
+
+        // Expired nonce was taken — second redeem is unauthorized, not 410 again.
+        let body2 =
+            grant_revoke_ownership_body(&nonce_hex, &subject_bech, &pk0, &nkc, &sig, &grant_bech);
+        let res2 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body2.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res2.status(), StatusCode::UNAUTHORIZED);
+        let json2: Value = serde_json::from_slice(&body_bytes(res2).await).unwrap();
+        assert_eq!(json2["error"], "unauthorized");
+        assert!(
+            challenges.get(&nonce_raw).is_none(),
+            "expired nonce must have been taken"
+        );
     }
 
     #[tokio::test]

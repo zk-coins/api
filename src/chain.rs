@@ -331,6 +331,15 @@ async fn fetch_inscriptions_page(
                 ));
             }
         };
+        // End of the u64 triple space: no exclusive successor exists; do not
+        // call exclusive_successor (that is 500 for the max triple) and do not
+        // issue a peek RPC — the page is final.
+        if last.height == u64::MAX && last.tx_index == u64::MAX && last.vin_index == u64::MAX {
+            return Ok(InscriptionsPage {
+                inscriptions: collected,
+                next: None,
+            });
+        }
         let peek_from = TripleCursor::from_inscription(last).exclusive_successor()?;
         let peek = collect_stream(
             kernel,
@@ -1298,6 +1307,39 @@ mod tests {
         assert!(
             page.next.is_none(),
             "peek must find nothing past the last item"
+        );
+    }
+
+    /// Full page whose last triple is the u64 max — end of cursor space, not 500.
+    #[tokio::test]
+    async fn max_limit_page_ending_at_max_triple_has_no_next() {
+        let mut catalog: Vec<_> = (0..999u64)
+            .map(|h| sample_inscription(h, 0, 0, "completed", vec![sample_nullifier("completed")]))
+            .collect();
+        catalog.push(sample_inscription(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            "completed",
+            vec![sample_nullifier("completed")],
+        ));
+        assert_eq!(catalog.len(), MAX_LIMIT as usize);
+        let kernel: KernelHandle = Arc::new(CatalogKernel { catalog });
+        let page = fetch_inscriptions_page(
+            &kernel,
+            ListInscriptionsQuery {
+                from_height: 0,
+                from_tx_index: 0,
+                from_vin_index: 0,
+                limit: MAX_LIMIT,
+            },
+        )
+        .await
+        .expect("max triple end-of-space must not 500");
+        assert_eq!(page.inscriptions.len(), 1000);
+        assert!(
+            page.next.is_none(),
+            "no exclusive successor past (u64::MAX, u64::MAX, u64::MAX)"
         );
     }
 
