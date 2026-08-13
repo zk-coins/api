@@ -2571,4 +2571,115 @@ mod tests {
         .expect_err("wrong chan_bind");
         assert_eq!(err.body.error, "unauthorized");
     }
+
+    #[test]
+    fn validate_resolved_scope_rejects_all_assets_with_non_empty_ids() {
+        let s = ResolvedScope {
+            all_assets: true,
+            asset_ids: vec![[0u8; 32]],
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        let err = validate_resolved_scope(&s).expect_err("all_assets with non-empty asset_ids");
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn validate_resolved_scope_rejects_explicit_empty_asset_ids() {
+        let s = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![],
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        let err = validate_resolved_scope(&s).expect_err("empty asset_ids when not all_assets");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("non-empty"));
+    }
+
+    #[test]
+    fn encode_grant_asset_ids_rejects_all_assets_with_ids() {
+        let err = encode_grant_asset_ids(true, &[[0u8; 32]]).expect_err("all_assets with ids");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("empty"));
+    }
+
+    #[test]
+    fn encode_grant_asset_ids_rejects_explicit_empty_list() {
+        let err = encode_grant_asset_ids(false, &[]).expect_err("empty explicit list");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("non-empty"));
+    }
+
+    #[test]
+    fn encode_grant_asset_ids_rejects_non_ascending() {
+        let err = encode_grant_asset_ids(false, &[[0x02u8; 32], [0x01u8; 32]])
+            .expect_err("non-ascending");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("ascending"));
+    }
+
+    #[test]
+    fn parse_u64_decimal_rejects_empty_leading_non_digit_and_overflow() {
+        let err = parse_u64_decimal("").expect_err("empty");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("empty"));
+
+        let err = parse_u64_decimal("01").expect_err("leading zero");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("leading"));
+
+        let err = parse_u64_decimal("1a").expect_err("non-digit");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("digit"));
+
+        let err = parse_u64_decimal("18446744073709551616").expect_err("overflow");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("u64"));
+    }
+
+    #[test]
+    fn parse_u64_decimal_accepts_zero_and_positive() {
+        assert_eq!(parse_u64_decimal("0").expect("zero"), 0);
+        assert_eq!(parse_u64_decimal("42").expect("forty-two"), 42);
+    }
+
+    #[test]
+    fn decode_zk_address_rejects_invalid_bech32() {
+        let err = decode_zk_address("not-a-bech32").expect_err("invalid bech32");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("Bech32m") || err.body.message.contains("invalid"),
+            "message: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn decode_zk_address_rejects_wrong_hrp() {
+        let hrp = bech32::Hrp::parse("bc").expect("test HRP");
+        let encoded =
+            bech32::encode::<bech32::Bech32m>(hrp, &[0u8; 32]).expect("32-byte payload encodes");
+        let err = decode_zk_address(&encoded).expect_err("wrong HRP");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("HRP") || err.body.message.contains("zk"),
+            "message: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn decode_zk_address_rejects_wrong_payload_length() {
+        let hrp = bech32::Hrp::parse(ADDRESS_HRP).expect("constant HRP");
+        let encoded =
+            bech32::encode::<bech32::Bech32m>(hrp, &[0u8; 20]).expect("20-byte payload encodes");
+        let err = decode_zk_address(&encoded).expect_err("wrong payload length");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("32"),
+            "message: {}",
+            err.body.message
+        );
+    }
 }
