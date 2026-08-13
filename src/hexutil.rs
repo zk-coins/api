@@ -84,16 +84,13 @@ mod tests {
     #[test]
     fn rejects_wrong_length() {
         let err = decode_hex_exact("ab", 32).unwrap_err();
-        match err {
+        assert!(matches!(
+            err,
             HexError::Length {
-                expected_chars,
-                got_chars,
-            } => {
-                assert_eq!(expected_chars, 64);
-                assert_eq!(got_chars, 2);
+                expected_chars: 64,
+                got_chars: 2
             }
-            HexError::InvalidChar(b) => panic!("expected Length, got InvalidChar({b})"),
-        }
+        ));
     }
 
     #[test]

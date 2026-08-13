@@ -401,6 +401,12 @@ mod tests {
     }
 
     #[test]
+    fn readiness_ready_with_empty_reason_string_is_200() {
+        let res = readiness_from_info(&sample_info(true, Some("")));
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[test]
     fn info_json_rejects_unknown_network() {
         let mut info = sample_info(true, None);
         info.network = "signet".into();

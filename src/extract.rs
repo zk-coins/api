@@ -180,12 +180,12 @@ mod tests {
             .uri("/")
             .body(broken_body())
             .unwrap();
-        let err = match LimitedBytes::from_request(req, &()).await {
-            Err(err) => err,
-            Ok(_) => panic!("broken body must be rejected"),
-        };
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert_eq!(err.body.error, "malformed_request");
+        let result = LimitedBytes::from_request(req, &()).await;
+        assert!(result.is_err(), "broken body must be rejected");
+        if let Err(err) = result {
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            assert_eq!(err.body.error, "malformed_request");
+        }
     }
 
     #[tokio::test]

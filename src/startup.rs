@@ -21,6 +21,15 @@ pub async fn run() -> ExitCode {
         }
     };
 
+    run_with_config(config).await
+}
+
+/// Start the HTTP server from an already-validated [`Config`].
+///
+/// Shared by [`run`] (env entry) and unit tests that construct `Config`
+/// directly. Tracing is **not** initialised here — callers that need it
+/// (production `run`) install it before loading config.
+pub async fn run_with_config(config: Config) -> ExitCode {
     let kernel: KernelHandle = match connect_lazy(&config.kernel_addr) {
         Ok(c) => Arc::new(c),
         Err(e) => {
@@ -78,11 +87,76 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::BlossomConfig;
+    use std::collections::BTreeSet;
     use std::process::ExitCode;
+
+    fn test_config(bind: &str, kernel: &str, blossom: Option<BlossomConfig>) -> Config {
+        Config {
+            bind_addr: bind.parse().expect("bind"),
+            kernel_addr: kernel.to_string(),
+            features: BTreeSet::new(),
+            public_hosts: Vec::new(),
+            blossom,
+        }
+    }
 
     #[tokio::test]
     async fn run_without_env_is_exit_code_1() {
         let code = run().await;
         assert_eq!(code, ExitCode::from(1));
+    }
+
+    #[tokio::test]
+    async fn run_with_config_invalid_kernel_uri_is_exit_1() {
+        let config = test_config("127.0.0.1:0", "not a uri", None);
+        let code = run_with_config(config).await;
+        assert_eq!(code, ExitCode::from(1));
+    }
+
+    #[tokio::test]
+    async fn run_with_config_blossom_open_failure_is_exit_1() {
+        let path = std::env::temp_dir().join(format!(
+            "zkcoins-startup-not-a-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"not-a-directory").expect("temp file");
+        let config = test_config(
+            "127.0.0.1:0",
+            "http://127.0.0.1:50051",
+            Some(BlossomConfig {
+                store_root: path.clone(),
+                max_blob_bytes: 1024,
+                allowed_upload_ops: BTreeSet::new(),
+            }),
+        );
+        let code = run_with_config(config).await;
+        assert_eq!(code, ExitCode::from(1));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn run_with_config_bind_failure_is_exit_1() {
+        let mut config = test_config("127.0.0.1:1", "http://127.0.0.1:50051", None);
+        // Prefer privileged-port failure; if :1 is unexpectedly free, hold a
+        // listener on an ephemeral port so the second bind is EADDRINUSE.
+        if let Ok(holder) = tokio::net::TcpListener::bind("127.0.0.1:1").await {
+            drop(holder);
+            let holder = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("ephemeral bind");
+            config.bind_addr = holder.local_addr().expect("local addr");
+            let code = run_with_config(config).await;
+            assert_eq!(code, ExitCode::from(1));
+            // keep holder alive until after run_with_config returns
+            drop(holder);
+        } else {
+            let code = run_with_config(config).await;
+            assert_eq!(code, ExitCode::from(1));
+        }
     }
 }

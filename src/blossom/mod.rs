@@ -260,15 +260,54 @@ mod tests {
 
     #[tokio::test]
     async fn require_blossom_without_configuration_is_internal() {
-        let err = match require_blossom(&dummy_state()) {
+        let state = dummy_state();
+        let result = require_blossom(&state);
+        assert!(result.is_err(), "unconfigured blossom must err");
+        let err = match result {
             Err(e) => e,
-            Ok(_) => panic!("unconfigured blossom must err"),
+            Ok(_) => return,
         };
         assert_eq!(err.body.error, "internal_error");
         assert_eq!(
             err.cause(),
             Some("blossom surface reached without configuration")
         );
+    }
+
+    #[tokio::test]
+    async fn upload_blob_oversize_before_auth_is_payload_too_large() {
+        let root = std::env::temp_dir().join(format!(
+            "zkcoins-blossom-oversize-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Arc::new(BlobStore::open(&root).expect("temp blossom store"));
+        let mut state = dummy_state();
+        state.blossom = Some(BlossomState {
+            store,
+            max_blob_bytes: 1,
+            allowed_upload_ops: Arc::new(BTreeSet::new()),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        let body = axum::body::Bytes::from_static(b"ab");
+        let result = upload_blob(State(state), headers, LimitedBytes(body)).await;
+        assert!(
+            result.is_err(),
+            "oversize body must be rejected before auth"
+        );
+        if let Err(err) = result {
+            assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(err.body.error, "payload_too_large");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

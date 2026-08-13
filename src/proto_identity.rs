@@ -71,16 +71,50 @@ mod tests {
         out
     }
 
+    #[derive(Debug)]
+    enum SiblingCheck {
+        SkippedAbsent,
+        Matched,
+    }
+
+    /// Pure sibling compare: absence, match against pin, or named mismatch.
+    fn check_sibling(local: &Path, sibling: &Path) -> Result<SiblingCheck, String> {
+        if !sibling.is_file() {
+            return Ok(SiblingCheck::SkippedAbsent);
+        }
+        let local_bytes = std::fs::read(local).map_err(|e| {
+            format!(
+                "failed to read local kernel proto at {}: {e}",
+                local.display()
+            )
+        })?;
+        let sibling_bytes = std::fs::read(sibling).map_err(|e| {
+            format!(
+                "failed to read sibling node proto at {}: {e}",
+                sibling.display()
+            )
+        })?;
+        if local_bytes != sibling_bytes {
+            return Err(format!(
+                "carried api proto must be byte-identical to sibling node proto at {}",
+                sibling.display()
+            ));
+        }
+        let got = sha256_hex(&sibling_bytes);
+        if got != KERNEL_PROTO_SHA256_HEX {
+            return Err(format!(
+                "sibling node proto SHA-256 must equal the pin (node moved without api update); \
+                 got {got}, pin {KERNEL_PROTO_SHA256_HEX}"
+            ));
+        }
+        Ok(SiblingCheck::Matched)
+    }
+
     /// **CI-relevant gate:** carried file bytes must equal the pin.
     #[test]
     fn carried_proto_matches_pinned_sha256() {
         let path = local_proto_path();
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| {
-            panic!(
-                "failed to read carried kernel proto at {}: {e}",
-                path.display()
-            )
-        });
+        let bytes = std::fs::read(&path).expect("failed to read carried kernel proto");
         let got = sha256_hex(&bytes);
         assert_eq!(
             got, KERNEL_PROTO_SHA256_HEX,
@@ -113,33 +147,79 @@ mod tests {
     #[test]
     fn carried_proto_matches_sibling_node_when_present_local_only() {
         let sibling = sibling_node_proto_path();
-        if !Path::new(&sibling).is_file() {
-            // Named skip: absence is expected in CI and standalone api clones.
-            // Do not treat this as proof that the node contract matches.
-            eprintln!(
-                "proto_identity: sibling node proto absent at {} — \
-                 skipping local multi-repo byte compare (CI gate is pin==file)",
-                sibling.display()
-            );
-            return;
+        let local = local_proto_path();
+        match check_sibling(&local, &sibling) {
+            Ok(SiblingCheck::SkippedAbsent) => {
+                // Named skip: absence is expected in CI and standalone api clones.
+                // Do not treat this as proof that the node contract matches.
+                eprintln!(
+                    "proto_identity: sibling node proto absent at {} — \
+                     skipping local multi-repo byte compare (CI gate is pin==file)",
+                    sibling.display()
+                );
+            }
+            Ok(SiblingCheck::Matched) => {}
+            Err(msg) => panic!("{msg}"),
         }
-        let local = std::fs::read(local_proto_path()).expect("local proto");
-        let node = std::fs::read(&sibling).unwrap_or_else(|e| {
-            panic!(
-                "failed to read sibling node proto at {}: {e}",
-                sibling.display()
-            )
-        });
-        assert_eq!(
-            local,
-            node,
-            "carried api proto must be byte-identical to sibling node proto at {}",
-            sibling.display()
-        );
-        assert_eq!(
-            sha256_hex(&node),
-            KERNEL_PROTO_SHA256_HEX,
-            "sibling node proto SHA-256 must equal the pin (node moved without api update)"
-        );
+    }
+
+    #[test]
+    fn check_sibling_absent_is_skipped() {
+        let root = std::env::temp_dir().join(format!(
+            "zkcoins-proto-absent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let local = root.join("local.proto");
+        let sibling = root.join("missing.proto");
+        std::fs::write(&local, b"placeholder").expect("local");
+        let result = check_sibling(&local, &sibling);
+        assert!(matches!(result, Ok(SiblingCheck::SkippedAbsent)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn check_sibling_identical_pinned_files_match() {
+        let root = std::env::temp_dir().join(format!(
+            "zkcoins-proto-match-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let bytes = std::fs::read(local_proto_path()).expect("read carried proto");
+        let local = root.join("local.proto");
+        let sibling = root.join("sibling.proto");
+        std::fs::write(&local, &bytes).expect("local");
+        std::fs::write(&sibling, &bytes).expect("sibling");
+        let result = check_sibling(&local, &sibling);
+        assert!(matches!(result, Ok(SiblingCheck::Matched)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn check_sibling_different_files_is_err() {
+        let root = std::env::temp_dir().join(format!(
+            "zkcoins-proto-diff-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let local = root.join("local.proto");
+        let sibling = root.join("sibling.proto");
+        std::fs::write(&local, b"aaa").expect("local");
+        std::fs::write(&sibling, b"bbb").expect("sibling");
+        let result = check_sibling(&local, &sibling);
+        assert!(result.is_err(), "different bytes must err: {result:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -469,12 +469,10 @@ mod tests {
             (ENV_BLOSSOM_ALLOWED_OPS, ""),
         ]));
         let err = Config::from_getter(&mut get).expect_err("zero max");
-        match err {
-            ConfigError::InvalidBlossomMaxBlobBytes { value, .. } => {
-                assert_eq!(value, "0");
-            }
-            other => panic!("expected InvalidBlossomMaxBlobBytes, got {other:?}"),
-        }
+        assert!(matches!(
+            &err,
+            ConfigError::InvalidBlossomMaxBlobBytes { value, .. } if value == "0"
+        ));
     }
 
     #[test]
@@ -520,10 +518,10 @@ mod tests {
             (ENV_PUBLIC_HOST, ""),
         ]));
         let err = Config::from_getter(&mut get).expect_err("unknown feature");
-        match &err {
-            ConfigError::UnknownFeature(name) => assert_eq!(name, "not_a_feature"),
-            other => panic!("expected UnknownFeature, got {other:?}"),
-        }
+        assert!(matches!(
+            &err,
+            ConfigError::UnknownFeature(name) if name == "not_a_feature"
+        ));
         // Display names the bad token and the closed set.
         let msg = err.to_string();
         assert!(
@@ -620,13 +618,11 @@ mod tests {
             (ENV_PUBLIC_HOST, ""),
         ]));
         let err = Config::from_getter(&mut get).expect_err("bad bind");
-        match &err {
-            ConfigError::InvalidBindAddr { value, reason } => {
-                assert_eq!(value, "not-a-socket");
-                assert!(!reason.is_empty(), "parse reason must be non-empty");
-            }
-            other => panic!("expected InvalidBindAddr, got {other:?}"),
-        }
+        assert!(matches!(
+            &err,
+            ConfigError::InvalidBindAddr { value, reason }
+                if value == "not-a-socket" && !reason.is_empty()
+        ));
     }
 
     #[test]
@@ -709,12 +705,10 @@ mod tests {
             (ENV_BLOSSOM_ALLOWED_OPS, ""),
         ]));
         let err = Config::from_getter(&mut get).expect_err("leading zero max");
-        match err {
-            ConfigError::InvalidBlossomMaxBlobBytes { value, .. } => {
-                assert_eq!(value, "01");
-            }
-            other => panic!("expected InvalidBlossomMaxBlobBytes, got {other:?}"),
-        }
+        assert!(matches!(
+            &err,
+            ConfigError::InvalidBlossomMaxBlobBytes { value, .. } if value == "01"
+        ));
     }
 
     #[test]
@@ -729,12 +723,10 @@ mod tests {
             (ENV_BLOSSOM_ALLOWED_OPS, ""),
         ]));
         let err = Config::from_getter(&mut get).expect_err("non-digit max");
-        match err {
-            ConfigError::InvalidBlossomMaxBlobBytes { value, .. } => {
-                assert_eq!(value, "12a");
-            }
-            other => panic!("expected InvalidBlossomMaxBlobBytes, got {other:?}"),
-        }
+        assert!(matches!(
+            &err,
+            ConfigError::InvalidBlossomMaxBlobBytes { value, .. } if value == "12a"
+        ));
     }
 
     #[test]
@@ -749,12 +741,11 @@ mod tests {
             (ENV_BLOSSOM_ALLOWED_OPS, ""),
         ]));
         let err = Config::from_getter(&mut get).expect_err("out of u64 max");
-        match err {
-            ConfigError::InvalidBlossomMaxBlobBytes { value, .. } => {
-                assert_eq!(value, "18446744073709551616");
-            }
-            other => panic!("expected InvalidBlossomMaxBlobBytes, got {other:?}"),
-        }
+        assert!(matches!(
+            &err,
+            ConfigError::InvalidBlossomMaxBlobBytes { value, .. }
+                if value == "18446744073709551616"
+        ));
     }
 
     #[test]
@@ -787,15 +778,12 @@ mod tests {
             ),
         ]));
         let err = Config::from_getter(&mut get).expect_err("uppercase op");
-        match err {
-            ConfigError::InvalidBlossomAllowedOp { value, .. } => {
-                assert_eq!(
-                    value,
-                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-                );
-            }
-            other => panic!("expected InvalidBlossomAllowedOp, got {other:?}"),
-        }
+        assert!(matches!(
+            &err,
+            ConfigError::InvalidBlossomAllowedOp { value, .. }
+                if value
+                    == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ));
     }
 
     #[test]
@@ -810,12 +798,11 @@ mod tests {
             (ENV_BLOSSOM_ALLOWED_OPS, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
         ]));
         let err = Config::from_getter(&mut get).expect_err("short op hex");
-        match err {
-            ConfigError::InvalidBlossomAllowedOp { value, .. } => {
-                assert_eq!(value, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-            }
-            other => panic!("expected InvalidBlossomAllowedOp, got {other:?}"),
-        }
+        assert!(matches!(
+            &err,
+            ConfigError::InvalidBlossomAllowedOp { value, .. }
+                if value == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
     }
 
     /// Reads the real process env only (no set_var/remove_var — races other tests).

@@ -213,17 +213,20 @@ pub fn check_time_window(created_at: u64, expiration: u64, now_unix: u64) -> Res
 
 fn parse_nostr_authorization(header: &str) -> Result<&str, ApiError> {
     let header = header.trim();
-    const PREFIX: &str = "Nostr ";
-    if let Some(rest) = header.strip_prefix(PREFIX) {
+    if header == "Nostr" {
+        return Err(ApiError::unauthorized(
+            "Authorization Nostr payload is empty",
+        ));
+    }
+    if let Some(rest) = header.strip_prefix("Nostr ") {
+        let rest = rest.trim();
         if rest.is_empty() {
             return Err(ApiError::unauthorized(
                 "Authorization Nostr payload is empty",
             ));
         }
-        return Ok(rest.trim());
+        return Ok(rest);
     }
-    // Also accept case-sensitive "Nostr" only per BUD-01 convention; anything
-    // else is a missing/invalid capability.
     Err(ApiError::unauthorized(
         "Authorization must be \"Nostr <base64(event JSON)>\"",
     ))
@@ -597,6 +600,32 @@ mod tests {
     }
 
     #[test]
+    fn event_id_mismatch_is_401() {
+        let (sk, pk) = sample_sk_pk();
+        let x = [0x88u8; 32];
+        let now = 1_700_000_000u64;
+        let b64 = sign_auth_event_base64(&sk, &pk, AuthAction::Upload, &x, now, now + 60);
+        let raw = base64::decode(&b64).unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        // Flip one hex nibble of the claimed id so it no longer matches canonical.
+        let id = v["id"].as_str().unwrap().to_string();
+        let mut chars: Vec<char> = id.chars().collect();
+        let last = chars.len() - 1;
+        chars[last] = if chars[last] == '0' { '1' } else { '0' };
+        v["id"] = serde_json::Value::String(chars.into_iter().collect());
+        let bad = base64::encode(v.to_string().as_bytes());
+        let err = verify_blossom_auth(&format!("Nostr {bad}"), RequiredAction::Upload, &x, now)
+            .expect_err("id mismatch");
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("does not match canonical"),
+            "cause must name canonical id mismatch: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
     fn time_window_is_pure_over_injected_now() {
         // Direct unit of the pure helper — no system clock.
         // `now` must be large enough that `now − REPLAY_WINDOW_SECS − 1` is a
@@ -668,6 +697,21 @@ mod tests {
             "cause must name Nostr: {}",
             err.body.message
         );
+    }
+
+    #[test]
+    fn header_nostr_without_payload_is_empty() {
+        let x = [0u8; 32];
+        for header in ["Nostr", "Nostr   "] {
+            let err = verify_blossom_auth(header, RequiredAction::Upload, &x, 0).expect_err(header);
+            assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+            assert_eq!(err.body.error, "unauthorized");
+            assert!(
+                err.body.message.contains("payload is empty"),
+                "header {header:?} must name empty payload: {}",
+                err.body.message
+            );
+        }
     }
 
     #[test]
@@ -872,6 +916,11 @@ mod tests {
     fn parse_decimal_u64_empty() {
         let err = parse_decimal_u64("").expect_err("empty");
         assert!(err.contains("empty"), "cause: {err}");
+    }
+
+    #[test]
+    fn parse_decimal_u64_zero_is_ok() {
+        assert_eq!(parse_decimal_u64("0"), Ok(0));
     }
 
     #[test]

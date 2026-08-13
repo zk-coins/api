@@ -969,20 +969,20 @@ mod tests {
     #[test]
     fn invalid_uri_is_named() {
         let err = KernelClient::connect_lazy("not a uri").expect_err("bad uri");
-        match err {
-            ClientBuildError::InvalidUri { value, reason } => {
-                assert_eq!(value, "not a uri");
-                assert!(!reason.is_empty());
-                let display = ClientBuildError::InvalidUri {
-                    value: value.clone(),
-                    reason: reason.clone(),
-                }
-                .to_string();
-                assert!(display.contains("ZKCOINS_KERNEL_ADDR"));
-                assert!(display.contains("not a uri"));
-                assert!(display.contains(&reason));
+        assert!(matches!(
+            &err,
+            ClientBuildError::InvalidUri { value, reason }
+                if value == "not a uri" && !reason.is_empty()
+        ));
+        if let ClientBuildError::InvalidUri { value, reason } = &err {
+            let display = ClientBuildError::InvalidUri {
+                value: value.clone(),
+                reason: reason.clone(),
             }
-            other => panic!("expected InvalidUri, got {other:?}"),
+            .to_string();
+            assert!(display.contains("ZKCOINS_KERNEL_ADDR"));
+            assert!(display.contains("not a uri"));
+            assert!(display.contains(reason));
         }
     }
 
@@ -1196,20 +1196,20 @@ mod tests {
                 .unwrap_err(),
         );
         assert_internal(client.get_job(job_request()).await.unwrap_err());
-        assert_internal(match client.stream_job(job_request()).await {
-            Ok(_) => panic!("stream_job must fail"),
-            Err(err) => err,
-        });
+        let result = client.stream_job(job_request()).await;
+        assert!(result.is_err(), "stream_job must fail");
+        if let Err(err) = result {
+            assert_internal(err);
+        }
         assert_internal(client.sign_transition(sign_request()).await.unwrap_err());
         assert_internal(client.cancel_job(job_request()).await.unwrap_err());
         assert_internal(client.get_info().await.unwrap_err());
         assert_internal(client.get_accumulator().await.unwrap_err());
-        assert_internal(
-            match client.list_inscriptions(inscriptions_request()).await {
-                Ok(_) => panic!("list_inscriptions must fail"),
-                Err(err) => err,
-            },
-        );
+        let result = client.list_inscriptions(inscriptions_request()).await;
+        assert!(result.is_err(), "list_inscriptions must fail");
+        if let Err(err) = result {
+            assert_internal(err);
+        }
         assert_internal(
             client
                 .get_nullifier_path(nullifier_request())
@@ -1241,10 +1241,11 @@ mod tests {
                 .await
                 .unwrap_err(),
         );
-        assert_internal(match client.subscribe_receipts(receipts_request()).await {
-            Ok(_) => panic!("subscribe_receipts must fail"),
-            Err(err) => err,
-        });
+        let result = client.subscribe_receipts(receipts_request()).await;
+        assert!(result.is_err(), "subscribe_receipts must fail");
+        if let Err(err) = result {
+            assert_internal(err);
+        }
         assert_internal(
             client
                 .entrust_operational_bundle(entrust_request())
