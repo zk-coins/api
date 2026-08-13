@@ -654,4 +654,241 @@ mod tests {
             err.body.message
         );
     }
+
+    // --- Header framing -------------------------------------------------------
+
+    #[test]
+    fn header_nostr_prefix_only_is_rejected() {
+        let x = [0u8; 32];
+        let err =
+            verify_blossom_auth("Nostr ", RequiredAction::Upload, &x, 0).expect_err("prefix only");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("Nostr"),
+            "cause must name Nostr: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn header_bearer_scheme_is_rejected() {
+        let x = [0u8; 32];
+        let err = verify_blossom_auth("Bearer abc", RequiredAction::Upload, &x, 0)
+            .expect_err("Bearer scheme");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("Nostr"),
+            "cause must name Nostr: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn header_invalid_base64_is_rejected() {
+        let x = [0u8; 32];
+        let err = verify_blossom_auth("Nostr !!!", RequiredAction::Upload, &x, 0)
+            .expect_err("invalid base64");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("base64"),
+            "cause must name base64: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn header_non_json_payload_is_rejected() {
+        let x = [0u8; 32];
+        let b64 = crate::blossom::base64::encode(b"not-json");
+        let err = verify_blossom_auth(&format!("Nostr {b64}"), RequiredAction::Upload, &x, 0)
+            .expect_err("non-JSON payload");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("JSON"),
+            "cause must name JSON: {}",
+            err.body.message
+        );
+    }
+
+    // --- Event field checks before signature ----------------------------------
+
+    fn dummy_event_json(kind: u64, content: &str) -> String {
+        // Dummy hex only: kind/content are checked before sig verification.
+        format!(
+            r#"{{"id":"{}","pubkey":"{}","created_at":1,"kind":{},"tags":[],"content":"{}","sig":"{}"}}"#,
+            "11".repeat(32),
+            "22".repeat(32),
+            kind,
+            content,
+            "33".repeat(64),
+        )
+    }
+
+    #[test]
+    fn wrong_kind_is_401_before_signature() {
+        let x = [0u8; 32];
+        let b64 = crate::blossom::base64::encode(dummy_event_json(1, "").as_bytes());
+        let err = verify_blossom_auth(&format!("Nostr {b64}"), RequiredAction::Upload, &x, 0)
+            .expect_err("wrong kind");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("kind"),
+            "cause must name kind: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn non_empty_content_is_401_before_signature() {
+        let x = [0u8; 32];
+        let b64 = crate::blossom::base64::encode(dummy_event_json(24242, "nope").as_bytes());
+        let err = verify_blossom_auth(&format!("Nostr {b64}"), RequiredAction::Upload, &x, 0)
+            .expect_err("non-empty content");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("content"),
+            "cause must name content: {}",
+            err.body.message
+        );
+    }
+
+    // --- Tag helpers ----------------------------------------------------------
+
+    #[test]
+    fn require_t_tag_missing() {
+        let err = require_t_tag(&[]).expect_err("missing t");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("missing the t tag"),
+            "cause: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn require_t_tag_missing_value() {
+        let err = require_t_tag(&[vec!["t".into()]]).expect_err("missing t value");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("missing its value"),
+            "cause: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn require_t_tag_download_rejected() {
+        let err = require_t_tag(&[vec!["t".into(), "download".into()]]).expect_err("download");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("upload"),
+            "cause must name upload: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn require_t_tag_multiple() {
+        let err = require_t_tag(&[
+            vec!["t".into(), "upload".into()],
+            vec!["t".into(), "upload".into()],
+        ])
+        .expect_err("multiple t");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("multiple t"),
+            "cause: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn require_x_tag_missing_value() {
+        let err = require_x_tag(&[vec!["x".into()]]).expect_err("missing x value");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("missing its value"),
+            "cause: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn require_x_tag_uppercase_hex_rejected() {
+        let err = require_x_tag(&[vec!["x".into(), "AA".repeat(32)]]).expect_err("uppercase");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("lowercase"),
+            "cause must name lowercase: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn require_x_tag_multiple() {
+        let err = require_x_tag(&[
+            vec!["x".into(), "aa".repeat(32)],
+            vec!["x".into(), "bb".repeat(32)],
+        ])
+        .expect_err("multiple x");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("multiple x"),
+            "cause: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn require_expiration_tag_missing_value() {
+        let err = require_expiration_tag(&[vec!["expiration".into()]])
+            .expect_err("missing expiration value");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("missing its value"),
+            "cause: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn require_expiration_tag_multiple() {
+        let err = require_expiration_tag(&[
+            vec!["expiration".into(), "1".into()],
+            vec!["expiration".into(), "2".into()],
+        ])
+        .expect_err("multiple expiration");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("multiple expiration"),
+            "cause: {}",
+            err.body.message
+        );
+    }
+
+    // --- parse_decimal_u64 ----------------------------------------------------
+
+    #[test]
+    fn parse_decimal_u64_empty() {
+        let err = parse_decimal_u64("").expect_err("empty");
+        assert!(err.contains("empty"), "cause: {err}");
+    }
+
+    #[test]
+    fn parse_decimal_u64_leading_zero() {
+        let err = parse_decimal_u64("01").expect_err("leading zero");
+        assert!(err.contains("leading"), "cause: {err}");
+    }
+
+    #[test]
+    fn parse_decimal_u64_non_digit() {
+        let err = parse_decimal_u64("1a").expect_err("non-digit");
+        assert!(err.contains("digit"), "cause: {err}");
+    }
+
+    #[test]
+    fn parse_decimal_u64_overflow() {
+        let err = parse_decimal_u64("18446744073709551616").expect_err("overflow");
+        assert!(err.contains("u64"), "cause: {err}");
+    }
 }
