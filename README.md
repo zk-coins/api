@@ -30,14 +30,20 @@ The API layer sits **outward** of the node. It consumes the node's internal **ke
 - It never touches Bitcoin and holds no SPEND key. Capability-gating, rate-limiting, and the LNURL receive flow live here; proving, broadcasting, and chain scanning stay in the node.
 - Running it is **optional**: a sovereign personal node serves its own wallet directly; the API layer is the "public service node" role that hosts other accounts.
 
-> **Status: scaffold.** The API surface is currently served by [`zk-coins/node`](https://github.com/zk-coins/node) directly; this repo will hold the standalone API layer once the kernel RPC contract stabilises. The full design is specified in [§6.1 (kernel and API)](https://docs.zkcoins.com/specification), [§7.5 (REST)](https://docs.zkcoins.com/specification), and [§7.8 (kernel RPC)](https://docs.zkcoins.com/specification).
+This repository **is** the standalone API process: `src/startup.rs` loads
+config, connects the kernel client (`connect_lazy` / `ZKCOINS_KERNEL_ADDR`),
+and serves REST. The [node](https://github.com/zk-coins/node) is the trustless
+kernel, not the public API. The full design is specified in
+[§6.1 (kernel and API)](https://docs.zkcoins.com/specification),
+[§7.5 (REST)](https://docs.zkcoins.com/specification), and
+[§7.8 (kernel RPC)](https://docs.zkcoins.com/specification).
 
 ### Current surface
 
 - Full §7.5 endpoint inventory (method, capability, feature, kernel RPC): [`docs/rest-surface.md`](docs/rest-surface.md).
-- Rust process (`axum` + `tonic 0.13.1` client): **`GET /`**, **`GET /health`**, info/chain reads, the job surface, **attest/grants**, pull/records/account, **`GET /v1/receipts/stream`** (SSE over `SubscribeReceipts`), bootstrap/publish, and optional Blossom. No placeholder routes for unbuilt keys.
+- Rust process (`axum` + `tonic 0.13.1` client): **`GET /`**, **`GET /health`**, info/chain reads, the job surface, **attest/grants** (including grant revoke), pull/records/account, **`GET /v1/receipts/stream`** (SSE over `SubscribeReceipts`), bootstrap/publish, token provenance, and optional Blossom. No placeholder routes for unbuilt keys.
 - **OwnershipProof** for attest/grants is verified at the API edge (BIP-340, action-bound domain, `chan_bind`, `request_hash`) **before** any kernel call that would consume a challenge nonce.
-- **`GET /` discovery follows registration** via `ServedSurface` — only served keys are advertised. Known-but-disabled inventory paths answer `404 feature_disabled`. The 28-key catalogue stays as inventory (no `blossom_delete`; append-only Blossom).
+- **`GET /` discovery follows registration** via `ServedSurface` — only served keys are advertised. Known-but-disabled inventory paths answer `404 feature_disabled`. The 31-key catalogue is the inventory (`grants_revoke_challenge`, `grants_revoke`, `token_provenance` included; no `blossom_delete`; append-only Blossom).
 - Kernel contract: carried `proto/kernel/v1/kernel.proto` with SHA-256 identity pin (`src/proto_identity.rs`); REST errors from `ErrorInfo.metadata["http_status"]` only (API-local auth failures use §7.5 `401 unauthorized` directly).
 - Codegen lives in the workspace member **`kernel-proto`** (tonic client stubs only). Workspace `default-members = ["."]` keeps default `cargo clippy` / `cargo test` on the **api** package so generated code is not linted.
 - Fail-closed env: `ZKCOINS_BIND_ADDR`, `ZKCOINS_KERNEL_ADDR`, `ZKCOINS_FEATURES`, `ZKCOINS_PUBLIC_HOST` (see the inventory doc). Optional Blossom store: `ZKCOINS_BLOSSOM_STORE` (+ max bytes / allowed ops companions).

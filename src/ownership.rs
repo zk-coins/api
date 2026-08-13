@@ -136,6 +136,7 @@ impl ChallengeDomain {
 
 /// §7.5 / §5.1(a) `OwnershipProofJson` on the wire.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OwnershipProofJson {
     #[serde(rename = "type")]
     pub proof_type: String,
@@ -150,7 +151,7 @@ pub struct OwnershipProofJson {
 /// so clients receive `401 unauthorized` (capability gate) rather than
 /// `400 malformed_request` from missing Ownership fields.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum OwnerOnlyProofJson {
     #[serde(rename = "ownership")]
     Ownership {
@@ -230,6 +231,7 @@ pub fn validate_resolved_scope(scope: &ResolvedScope) -> Result<(), ApiError> {
 /// MUST resubmit the issued `expiry` so BIP-340 verification can run
 /// **before** any kernel call that would consume the nonce.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChallengeEcho {
     pub nonce: String,
     /// §7.1 decimal-string u64 (same wire form as the challenge response).
@@ -467,6 +469,8 @@ pub fn encode_zk_address(raw: &[u8; 32]) -> String {
     bech32::encode::<Bech32m>(hrp, raw).expect("32-byte payload encodes")
 }
 
+/// Parse a fixed-width hex field that is **not** a proof credential (e.g.
+/// `challenge.nonce`). Bad hex → `400 malformed_request`.
 fn parse_hex32_field(s: &str, field: &str) -> Result<[u8; 32], ApiError> {
     let v = decode_hex_exact(s, 32).map_err(|e| ApiError::malformed(format!("{field}: {e}")))?;
     let mut out = [0u8; 32];
@@ -474,8 +478,17 @@ fn parse_hex32_field(s: &str, field: &str) -> Result<[u8; 32], ApiError> {
     Ok(out)
 }
 
-fn parse_hex64_field(s: &str, field: &str) -> Result<[u8; 64], ApiError> {
-    let v = decode_hex_exact(s, 64).map_err(|e| ApiError::malformed(format!("{field}: {e}")))?;
+/// Parse an OwnershipProof / GrantProof hex field. Bad hex (wrong width,
+/// non-hex, odd length) → `401 unauthorized` (§7.5 proof-field rule).
+fn parse_proof_hex32(s: &str, field: &str) -> Result<[u8; 32], ApiError> {
+    let v = decode_hex_exact(s, 32).map_err(|e| ApiError::unauthorized(format!("{field}: {e}")))?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&v);
+    Ok(out)
+}
+
+fn parse_proof_hex64(s: &str, field: &str) -> Result<[u8; 64], ApiError> {
+    let v = decode_hex_exact(s, 64).map_err(|e| ApiError::unauthorized(format!("{field}: {e}")))?;
     let mut out = [0u8; 64];
     out.copy_from_slice(&v);
     Ok(out)
@@ -619,11 +632,11 @@ pub fn verify_ownership_proof(
         ));
     }
 
-    // 3. Parse fixed-width proof fields.
-    let pk0 = parse_hex32_field(&proof.public_key, "ownership_proof.public_key")?;
-    let nk_commit = parse_hex32_field(&proof.nk_commit, "ownership_proof.nk_commit")?;
+    // 3. Parse fixed-width proof fields (401) and challenge.nonce (400).
+    let pk0 = parse_proof_hex32(&proof.public_key, "ownership_proof.public_key")?;
+    let nk_commit = parse_proof_hex32(&proof.nk_commit, "ownership_proof.nk_commit")?;
     validate_nk_commit_limbs(&nk_commit)?;
-    let signature = parse_hex64_field(&proof.signature, "ownership_proof.signature")?;
+    let signature = parse_proof_hex64(&proof.signature, "ownership_proof.signature")?;
     let nonce = parse_hex32_field(&challenge.nonce, "challenge.nonce")?;
     let challenge_expiry = parse_u64_decimal(&challenge.expiry)
         .map_err(|e| ApiError::malformed(format!("challenge.expiry: {}", e.body.message)))?;
@@ -683,6 +696,7 @@ pub fn verify_ownership_proof(
 
 /// §7.5 `GrantProofJson` on the wire (pull path only).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantProofJson {
     #[serde(rename = "type")]
     pub proof_type: String,
@@ -948,10 +962,10 @@ pub fn verify_simple_ownership_proof(
         ));
     }
 
-    let pk0 = parse_hex32_field(&proof.public_key, "ownership_proof.public_key")?;
-    let nk_commit = parse_hex32_field(&proof.nk_commit, "ownership_proof.nk_commit")?;
+    let pk0 = parse_proof_hex32(&proof.public_key, "ownership_proof.public_key")?;
+    let nk_commit = parse_proof_hex32(&proof.nk_commit, "ownership_proof.nk_commit")?;
     validate_nk_commit_limbs(&nk_commit)?;
-    let signature = parse_hex64_field(&proof.signature, "ownership_proof.signature")?;
+    let signature = parse_proof_hex64(&proof.signature, "ownership_proof.signature")?;
     let nonce = parse_hex32_field(&challenge.nonce, "challenge.nonce")?;
     let challenge_expiry = parse_u64_decimal(&challenge.expiry)
         .map_err(|e| ApiError::malformed(format!("challenge.expiry: {}", e.body.message)))?;
@@ -1379,7 +1393,7 @@ pub fn verify_grant_proof(
     )?;
 
     // ---- (2) grantee identity + chal signature ----
-    let grantee_pk = parse_hex32_field(&proof.grantee_pk, "grant_proof.grantee_pk")?;
+    let grantee_pk = parse_proof_hex32(&proof.grantee_pk, "grant_proof.grantee_pk")?;
     if grantee_pk != grant.grantee {
         return Err(ApiError::unauthorized(
             "grant_proof.grantee_pk does not equal grant.grantee",
@@ -1400,7 +1414,7 @@ pub fn verify_grant_proof(
         .iter()
         .map(|h| chan_bind_for_host(h))
         .collect();
-    let grantee_sig = parse_hex64_field(&proof.signature, "grant_proof.signature")?;
+    let grantee_sig = parse_proof_hex64(&proof.signature, "grant_proof.signature")?;
 
     let domain_str = ChallengeDomain::Pull.as_str();
     let mut accepted_bind: Option<[u8; 32]> = None;
@@ -1910,6 +1924,79 @@ mod tests {
             err.body.message.contains("GrantProof"),
             "message must name GrantProof: {}",
             err.body.message
+        );
+    }
+
+    #[test]
+    fn ownership_proof_garbage_public_key_is_unauthorized() {
+        let subject = encode_zk_address(&[0u8; 32]);
+        let err = verify_ownership_proof(
+            ChallengeDomain::AttestBalance,
+            &subject,
+            &ChallengeEcho {
+                nonce: encode_hex(&[1u8; 32]),
+                expiry: "1".into(),
+            },
+            &OwnershipProofJson {
+                proof_type: "ownership".into(),
+                subject: subject.clone(),
+                public_key: "zz".into(),
+                nk_commit: encode_hex(&[0u8; 32]),
+                signature: encode_hex(&[0u8; 64]),
+            },
+            &[0u8; 32],
+            &["h.example".into()],
+        )
+        .expect_err("garbage public_key");
+        assert_eq!(err.body.error, "unauthorized");
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+        assert!(
+            err.body.message.contains("ownership_proof.public_key"),
+            "message must name the field: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn challenge_nonce_garbage_hex_is_malformed() {
+        let subject = encode_zk_address(&[0u8; 32]);
+        let err = verify_ownership_proof(
+            ChallengeDomain::AttestBalance,
+            &subject,
+            &ChallengeEcho {
+                nonce: "zz".into(),
+                expiry: "1".into(),
+            },
+            &OwnershipProofJson {
+                proof_type: "ownership".into(),
+                subject: subject.clone(),
+                // Valid width so parse reaches challenge.nonce after proof fields.
+                public_key: encode_hex(&[0u8; 32]),
+                nk_commit: encode_hex(&[0u8; 32]),
+                signature: encode_hex(&[0u8; 64]),
+            },
+            &[0u8; 32],
+            &["h.example".into()],
+        )
+        .expect_err("garbage challenge.nonce");
+        assert_eq!(err.body.error, "malformed_request");
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn ownership_proof_json_rejects_unknown_field() {
+        let v = serde_json::json!({
+            "type": "ownership",
+            "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqun6mw",
+            "public_key": "00".repeat(32),
+            "nk_commit": "00".repeat(32),
+            "signature": "00".repeat(64),
+            "ghost": true,
+        });
+        let err = serde_json::from_value::<OwnershipProofJson>(v).expect_err("deny");
+        assert!(
+            err.to_string().contains("ghost") || err.to_string().contains("unknown field"),
+            "serde must reject unknown field, got {err}"
         );
     }
 

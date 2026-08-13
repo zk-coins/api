@@ -52,6 +52,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PullChallengeBody {
     pub subject: String,
     #[serde(default)]
@@ -59,6 +60,7 @@ pub struct PullChallengeBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PullScopeJson {
     /// Either the string `"*"` or an array of hex32 asset ids.
     pub asset_ids: Value,
@@ -75,6 +77,7 @@ pub struct PullScopeJson {
 /// compute `requested ∩ capability` without a challenge store (§5.1). Omitted
 /// scope normalises to the unbounded sentinel pair before intersection.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PullBody {
     pub nonce: String,
     /// Challenge expiry echoed from issuance (bound into signed `chal`; not
@@ -88,7 +91,7 @@ pub struct PullBody {
 
 /// Closed proof discriminator for `POST /v1/pull`.
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum PullProofJson {
     #[serde(rename = "ownership")]
     Ownership {
@@ -1224,5 +1227,38 @@ mod tests {
         });
         let expected = Event::default().event("error").data(data.to_string());
         assert_eq!(format!("{ev:?}"), format!("{expected:?}"));
+    }
+
+    // -----------------------------------------------------------------------
+    // deny_unknown_fields (closed REST request DTOs)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pull_challenge_body_rejects_unknown_top_level_field() {
+        let v = json!({
+            "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqun6mw",
+            "not_in_spec": true,
+        });
+        let err = serde_json::from_value::<PullChallengeBody>(v).expect_err("deny");
+        assert!(
+            err.to_string().contains("not_in_spec") || err.to_string().contains("unknown field"),
+            "serde must reject unknown field, got {err}"
+        );
+    }
+
+    #[test]
+    fn pull_challenge_body_rejects_unknown_nested_scope_field() {
+        let v = json!({
+            "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqun6mw",
+            "scope": {
+                "asset_ids": "*",
+                "ghost": 1,
+            },
+        });
+        let err = serde_json::from_value::<PullChallengeBody>(v).expect_err("deny nested");
+        assert!(
+            err.to_string().contains("ghost") || err.to_string().contains("unknown field"),
+            "nested deny_unknown_fields must fire, got {err}"
+        );
     }
 }

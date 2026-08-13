@@ -57,7 +57,7 @@ impl std::error::Error for StartupError {}
 
 /// Closed `endpoints` key set from specification §7.5 (`GET /` row).
 ///
-/// Full inventory of the 30 logical names a conforming producer may emit
+/// Full inventory of the 31 logical names a conforming producer may emit
 /// (data permanence: no `blossom_delete`). Order matches the closed §7.5
 /// listing. This constant is the reference for surfaces not yet built; it is
 /// **not** what `GET /` returns.
@@ -4178,6 +4178,49 @@ mod tests {
         );
         assert_eq!(kernel.attest_calls.load(Ordering::SeqCst), 0);
         assert_eq!(kernel.issue_grant_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ownership_proof_garbage_public_key_is_unauthorized_without_kernel() {
+        let (_sk, _pk0, _nkc, _subject_raw, subject_bech) = ownership_fixtures::identity();
+        let kernel = Arc::new(ScriptedKernel {
+            attest: Some(Ok(JobHandle {
+                job_id: "x".into(),
+                status: "accepted".into(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone()).expect("router");
+        let body = serde_json::json!({
+            "subject": subject_bech,
+            "asset_id": encode_hex(&[0u8; 32]),
+            "challenge": {
+                "nonce": encode_hex(&[1u8; 32]),
+                "expiry": "100",
+            },
+            "ownership_proof": {
+                "type": "ownership",
+                "subject": subject_bech,
+                "public_key": "zz",
+                "nk_commit": encode_hex(&[0u8; 32]),
+                "signature": encode_hex(&[0u8; 64]),
+            },
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/attest/balance")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+        assert_eq!(kernel.attest_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

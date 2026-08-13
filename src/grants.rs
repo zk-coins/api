@@ -34,11 +34,13 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantsChallengeBody {
     pub subject: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantScopeJson {
     /// Either the string `"*"` or an array of hex32 asset ids.
     pub asset_ids: Value,
@@ -49,6 +51,7 @@ pub struct GrantScopeJson {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IssueGrantBody {
     pub subject: String,
     pub grantee_pk: String,
@@ -60,16 +63,19 @@ pub struct IssueGrantBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantsRevokeChallengeBody {
     pub subject: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantRevokeNonce {
     pub nonce: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantsRevokeBody {
     pub challenge: GrantRevokeNonce,
     pub ownership_proof: OwnerOnlyProofJson,
@@ -460,6 +466,48 @@ mod tests {
         assert_malformed(
             normalise_scope(&scope(json!([id, encode_hex(&[0x33; 32])]), None, None)),
             "strictly ascending and unique",
+        );
+    }
+
+    #[test]
+    fn grants_challenge_body_rejects_unknown_top_level_field() {
+        let v = json!({
+            "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqun6mw",
+            "not_in_spec": true,
+        });
+        let err = serde_json::from_value::<GrantsChallengeBody>(v).expect_err("deny");
+        assert!(
+            err.to_string().contains("not_in_spec") || err.to_string().contains("unknown field"),
+            "serde must reject unknown field, got {err}"
+        );
+    }
+
+    #[test]
+    fn issue_grant_body_rejects_unknown_nested_scope_field() {
+        let v = json!({
+            "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqun6mw",
+            "grantee_pk": "00".repeat(32),
+            "scope": {
+                "asset_ids": "*",
+                "ghost": 1,
+            },
+            "expiry": "1",
+            "challenge": {
+                "nonce": "00".repeat(32),
+                "expiry": "1",
+            },
+            "ownership_proof": {
+                "type": "ownership",
+                "subject": "unused",
+                "public_key": "00".repeat(32),
+                "nk_commit": "00".repeat(32),
+                "signature": "00".repeat(64),
+            },
+        });
+        let err = serde_json::from_value::<IssueGrantBody>(v).expect_err("deny nested");
+        assert!(
+            err.to_string().contains("ghost") || err.to_string().contains("unknown field"),
+            "nested deny_unknown_fields must fire, got {err}"
         );
     }
 }

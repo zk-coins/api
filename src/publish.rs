@@ -61,6 +61,7 @@ fn is_closed_reason(reason: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockAnchorJson {
     pub block_hash: String,
     /// §7.1 decimal-string u32 (same wire form as other request integers).
@@ -68,6 +69,7 @@ pub struct BlockAnchorJson {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublishSpendRecordBody {
     pub public_key: String,
     pub r: String,
@@ -304,5 +306,45 @@ mod tests {
     fn parse_u32_decimal_rejects_value_above_u32_max() {
         let err = parse_u32_decimal("4294967296", "height").unwrap_err();
         assert_eq!(err.body.error, "malformed_request");
+    }
+
+    #[test]
+    fn publish_spend_record_body_rejects_unknown_top_level_field() {
+        let v = serde_json::json!({
+            "public_key": "00".repeat(32),
+            "r": "00".repeat(32),
+            "s": "00".repeat(32),
+            "r_prime": "00".repeat(32),
+            "block_anchor": {
+                "block_hash": "00".repeat(32),
+                "height": "1",
+            },
+            "not_in_spec": true,
+        });
+        let err = serde_json::from_value::<PublishSpendRecordBody>(v).expect_err("deny");
+        assert!(
+            err.to_string().contains("not_in_spec") || err.to_string().contains("unknown field"),
+            "serde must reject unknown field, got {err}"
+        );
+    }
+
+    #[test]
+    fn publish_spend_record_body_rejects_unknown_nested_block_anchor_field() {
+        let v = serde_json::json!({
+            "public_key": "00".repeat(32),
+            "r": "00".repeat(32),
+            "s": "00".repeat(32),
+            "r_prime": "00".repeat(32),
+            "block_anchor": {
+                "block_hash": "00".repeat(32),
+                "height": "1",
+                "ghost": 1,
+            },
+        });
+        let err = serde_json::from_value::<PublishSpendRecordBody>(v).expect_err("deny nested");
+        assert!(
+            err.to_string().contains("ghost") || err.to_string().contains("unknown field"),
+            "nested deny_unknown_fields must fire, got {err}"
+        );
     }
 }

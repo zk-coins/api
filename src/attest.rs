@@ -30,11 +30,13 @@ use serde_json::json;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttestChallengeBody {
     pub subject: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttestBalanceBody {
     pub subject: String,
     pub asset_id: String,
@@ -243,6 +245,44 @@ mod tests {
             err.body.message.contains("nav_ceiling") && err.body.message.contains("size_ceiling"),
             "mixed-presence message, got {:?}",
             err.body.message
+        );
+    }
+
+    #[test]
+    fn attest_challenge_body_rejects_unknown_top_level_field() {
+        let v = serde_json::json!({
+            "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqun6mw",
+            "not_in_spec": true,
+        });
+        let err = serde_json::from_value::<AttestChallengeBody>(v).expect_err("deny");
+        assert!(
+            err.to_string().contains("not_in_spec") || err.to_string().contains("unknown field"),
+            "serde must reject unknown field, got {err}"
+        );
+    }
+
+    #[test]
+    fn attest_balance_body_rejects_unknown_nested_challenge_field() {
+        let v = serde_json::json!({
+            "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqun6mw",
+            "asset_id": "00".repeat(32),
+            "challenge": {
+                "nonce": "00".repeat(32),
+                "expiry": "1",
+                "ghost": true,
+            },
+            "ownership_proof": {
+                "type": "ownership",
+                "subject": "unused",
+                "public_key": "00".repeat(32),
+                "nk_commit": "00".repeat(32),
+                "signature": "00".repeat(64),
+            },
+        });
+        let err = serde_json::from_value::<AttestBalanceBody>(v).expect_err("deny nested");
+        assert!(
+            err.to_string().contains("ghost") || err.to_string().contains("unknown field"),
+            "nested deny_unknown_fields must fire, got {err}"
         );
     }
 }

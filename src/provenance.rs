@@ -112,6 +112,7 @@ fn require_hex32(field: &str, bytes: &[u8]) -> Result<String, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::PUBLIC_INTERNAL_MESSAGE;
 
     fn valid_v1() -> TokenProvenance {
         TokenProvenance {
@@ -124,18 +125,26 @@ mod tests {
         }
     }
 
+    fn assert_public_internal(err: ApiError) {
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, PUBLIC_INTERNAL_MESSAGE);
+    }
+
     #[test]
     fn token_provenance_rejects_unknown_issuance_version() {
         let mut provenance = valid_v1();
         provenance.issuance_version = 3;
-        assert!(token_provenance_to_json(&[0xaa; 32], &provenance).is_err());
+        let err = token_provenance_to_json(&[0xaa; 32], &provenance).expect_err("unknown version");
+        assert_public_internal(err);
     }
 
     #[test]
     fn token_provenance_rejects_decimals_exceeding_u8() {
         let mut provenance = valid_v1();
         provenance.decimals = 256; // §7.5 decimals is u8; a wider kernel value must fail closed
-        assert!(token_provenance_to_json(&[0xaa; 32], &provenance).is_err());
+        let err = token_provenance_to_json(&[0xaa; 32], &provenance).expect_err("decimals");
+        assert_public_internal(err);
     }
 
     #[test]
@@ -144,14 +153,16 @@ mod tests {
         provenance.issuance_version = 2;
         provenance.cap_total = "not-a-number".to_owned();
         provenance.terms_salt = vec![0x22; 32];
-        assert!(token_provenance_to_json(&[0xaa; 32], &provenance).is_err());
+        let err = token_provenance_to_json(&[0xaa; 32], &provenance).expect_err("non-u128");
+        assert_public_internal(err);
     }
 
     #[test]
     fn token_provenance_rejects_v1_with_v2_fields() {
         let mut provenance = valid_v1();
         provenance.cap_total = "1".to_owned();
-        assert!(token_provenance_to_json(&[0xaa; 32], &provenance).is_err());
+        let err = token_provenance_to_json(&[0xaa; 32], &provenance).expect_err("v1+v2");
+        assert_public_internal(err);
     }
 
     #[test]
@@ -159,14 +170,16 @@ mod tests {
         let mut provenance = valid_v1();
         provenance.issuance_version = 2;
         provenance.cap_total = "1".to_owned();
-        assert!(token_provenance_to_json(&[0xaa; 32], &provenance).is_err());
+        let err = token_provenance_to_json(&[0xaa; 32], &provenance).expect_err("incomplete v2");
+        assert_public_internal(err);
     }
 
     #[test]
     fn token_provenance_rejects_invalid_creator_pubkey_width() {
         let mut provenance = valid_v1();
         provenance.creator_pubkey = vec![0x11; 31];
-        assert!(token_provenance_to_json(&[0xaa; 32], &provenance).is_err());
+        let err = token_provenance_to_json(&[0xaa; 32], &provenance).expect_err("pubkey width");
+        assert_public_internal(err);
     }
 
     #[test]
@@ -175,6 +188,19 @@ mod tests {
         provenance.issuance_version = 2;
         provenance.cap_total = "1".to_owned();
         provenance.terms_salt = vec![0x22; 31];
-        assert!(token_provenance_to_json(&[0xaa; 32], &provenance).is_err());
+        let err = token_provenance_to_json(&[0xaa; 32], &provenance).expect_err("terms_salt width");
+        assert_public_internal(err);
+    }
+
+    #[test]
+    fn token_provenance_rejects_cap_total_overflow_u128() {
+        let mut provenance = valid_v1();
+        provenance.issuance_version = 2;
+        // One digit past u128::MAX (340282366920938463463374607431768211455).
+        provenance.cap_total = format!("{}1", u128::MAX);
+        provenance.terms_salt = vec![0x22; 32];
+        let err =
+            token_provenance_to_json(&[0xaa; 32], &provenance).expect_err("cap_total overflow");
+        assert_public_internal(err);
     }
 }

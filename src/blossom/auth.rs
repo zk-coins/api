@@ -238,10 +238,19 @@ fn require_t_tag(tags: &[Vec<String>]) -> Result<AuthAction, ApiError> {
         if tag.first().map(String::as_str) != Some("t") {
             continue;
         }
-        let value = tag
-            .get(1)
-            .map(String::as_str)
-            .ok_or_else(|| ApiError::unauthorized("auth event t tag is missing its value"))?;
+        // Named tag must be exactly `["t", value]` — len 1 is missing value;
+        // len > 2 is a structural rejection (both 401).
+        if tag.len() < 2 {
+            return Err(ApiError::unauthorized(
+                "auth event t tag is missing its value",
+            ));
+        }
+        if tag.len() != 2 {
+            return Err(ApiError::unauthorized(
+                "auth event t tag must have exactly two elements",
+            ));
+        }
+        let value = tag[1].as_str();
         let action = match value {
             TAG_T_UPLOAD => AuthAction::Upload,
             other => {
@@ -266,10 +275,17 @@ fn require_x_tag(tags: &[Vec<String>]) -> Result<[u8; 32], ApiError> {
         if tag.first().map(String::as_str) != Some("x") {
             continue;
         }
-        let value = tag
-            .get(1)
-            .map(String::as_str)
-            .ok_or_else(|| ApiError::unauthorized("auth event x tag is missing its value"))?;
+        if tag.len() < 2 {
+            return Err(ApiError::unauthorized(
+                "auth event x tag is missing its value",
+            ));
+        }
+        if tag.len() != 2 {
+            return Err(ApiError::unauthorized(
+                "auth event x tag must have exactly two elements",
+            ));
+        }
+        let value = tag[1].as_str();
         // x is lowercase-hex SHA-256 of body / blob_id.
         if value.len() != 64
             || !value
@@ -300,9 +316,17 @@ fn require_expiration_tag(tags: &[Vec<String>]) -> Result<u64, ApiError> {
         if tag.first().map(String::as_str) != Some("expiration") {
             continue;
         }
-        let value = tag.get(1).map(String::as_str).ok_or_else(|| {
-            ApiError::unauthorized("auth event expiration tag is missing its value")
-        })?;
+        if tag.len() < 2 {
+            return Err(ApiError::unauthorized(
+                "auth event expiration tag is missing its value",
+            ));
+        }
+        if tag.len() != 2 {
+            return Err(ApiError::unauthorized(
+                "auth event expiration tag must have exactly two elements",
+            ));
+        }
+        let value = tag[1].as_str();
         let exp = parse_decimal_u64(value)
             .map_err(|m| ApiError::unauthorized(format!("auth event expiration: {m}")))?;
         if found.is_some() {
@@ -821,6 +845,18 @@ mod tests {
     }
 
     #[test]
+    fn require_t_tag_extra_element_is_unauthorized() {
+        let err = require_t_tag(&[vec!["t".into(), "upload".into(), "junk".into()]])
+            .expect_err("extra t element");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("exactly two elements"),
+            "cause: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
     fn require_t_tag_download_rejected() {
         let err = require_t_tag(&[vec!["t".into(), "download".into()]]).expect_err("download");
         assert_eq!(err.body.error, "unauthorized");
@@ -852,6 +888,18 @@ mod tests {
         assert_eq!(err.body.error, "unauthorized");
         assert!(
             err.body.message.contains("missing its value"),
+            "cause: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn require_x_tag_extra_element_is_unauthorized() {
+        let err = require_x_tag(&[vec!["x".into(), "aa".repeat(32), "junk".into()]])
+            .expect_err("extra x element");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("exactly two elements"),
             "cause: {}",
             err.body.message
         );
@@ -890,6 +938,18 @@ mod tests {
         assert_eq!(err.body.error, "unauthorized");
         assert!(
             err.body.message.contains("missing its value"),
+            "cause: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn require_expiration_tag_extra_element_is_unauthorized() {
+        let err = require_expiration_tag(&[vec!["expiration".into(), "123".into(), "junk".into()]])
+            .expect_err("extra expiration element");
+        assert_eq!(err.body.error, "unauthorized");
+        assert!(
+            err.body.message.contains("exactly two elements"),
             "cause: {}",
             err.body.message
         );

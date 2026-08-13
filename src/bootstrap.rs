@@ -52,6 +52,7 @@ pub const OPERATIONAL_BUNDLE_HEX_CHARS: usize = OPERATIONAL_BUNDLE_LEN * 2;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BootstrapChallengeBody {
     pub subject: String,
     /// `"entrust"` or `"revoke"` — maps to kernel `OpenPullChallenge.action`.
@@ -61,6 +62,7 @@ pub struct BootstrapChallengeBody {
 /// Entrust redeem body. **`Debug` redacts `bundle`** so a logger that prints
 /// the extractor cannot spill five operational secrets.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BootstrapEntrustBody {
     /// Redeem-body `expiry` (§7.5 normative): `{ nonce, expiry }` from issuance.
     pub challenge: ChallengeEcho,
@@ -82,6 +84,7 @@ impl std::fmt::Debug for BootstrapEntrustBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BootstrapRevokeBody {
     /// Redeem-body `expiry` (§7.5 normative): `{ nonce, expiry }` from issuance.
     pub challenge: ChallengeEcho,
@@ -329,11 +332,104 @@ pub async fn post_bootstrap_revoke(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::connect_lazy;
+    use crate::ownership::{
+        encode_zk_address, GrantRevokeChallengeStore, RevokedGrantSet, SubjectOpDirectory,
+    };
+    use crate::state::AppState;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    fn dummy_state() -> AppState {
+        let kernel = Arc::new(connect_lazy("http://127.0.0.1:1").expect("lazy kernel uri"));
+        AppState {
+            kernel,
+            features: BTreeSet::new(),
+            public_hosts: Arc::new(vec!["node.example.com".into()]),
+            blossom: None,
+            subject_ops: Arc::new(SubjectOpDirectory::new()),
+            revoked_grants: Arc::new(RevokedGrantSet::new()),
+            grant_revoke_challenges: Arc::new(GrantRevokeChallengeStore::new()),
+        }
+    }
+
+    /// Distinctive secret hex; Debug must never emit this substring.
+    fn distinctive_bundle_marker() -> String {
+        "B00B1E5C0FFEE_OPERATIONAL_BUNDLE_MARKER".to_string()
+    }
 
     #[test]
     fn bundle_len_constants_match_spec() {
         assert_eq!(OPERATIONAL_BUNDLE_LEN, 161);
         assert_eq!(OPERATIONAL_BUNDLE_HEX_CHARS, 322);
+    }
+
+    #[test]
+    fn entrust_body_debug_redacts_bundle() {
+        let marker = distinctive_bundle_marker();
+        let body = BootstrapEntrustBody {
+            challenge: ChallengeEcho {
+                nonce: "00".repeat(32),
+                expiry: "1".into(),
+            },
+            ownership_proof: OwnerOnlyProofJson::Ownership {
+                subject: "unused".into(),
+                public_key: "00".repeat(32),
+                nk_commit: "00".repeat(32),
+                signature: "00".repeat(64),
+            },
+            bundle: marker.clone(),
+        };
+        let rendered = format!("{body:?}");
+        assert!(
+            rendered.contains("redacted"),
+            "Debug must use the redaction marker, got {rendered}"
+        );
+        assert!(
+            !rendered.contains(&marker),
+            "Debug must not leak the operational bundle hex: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn challenge_unknown_action_is_malformed_before_kernel() {
+        let subject = encode_zk_address(&[0u8; 32]);
+        let err = post_bootstrap_challenge(
+            State(dummy_state()),
+            JsonBody(BootstrapChallengeBody {
+                subject,
+                action: "transfer".into(),
+            }),
+        )
+        .await
+        .expect_err("unknown action");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("entrust")
+                && err.body.message.contains("revoke")
+                && err.body.message.contains("transfer"),
+            "message must name the closed set and the bad token, got {:?}",
+            err.body.message
+        );
+    }
+
+    #[tokio::test]
+    async fn challenge_empty_subject_is_malformed_before_kernel() {
+        let err = post_bootstrap_challenge(
+            State(dummy_state()),
+            JsonBody(BootstrapChallengeBody {
+                subject: String::new(),
+                action: "entrust".into(),
+            }),
+        )
+        .await
+        .expect_err("empty subject");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("subject is required"),
+            "got {:?}",
+            err.body.message
+        );
     }
 
     #[test]
@@ -423,6 +519,44 @@ mod tests {
         assert!(
             !dbg.contains(&secret),
             "Debug must not contain the real bundle hex"
+        );
+    }
+
+    #[test]
+    fn bootstrap_challenge_body_rejects_unknown_top_level_field() {
+        let v = serde_json::json!({
+            "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqun6mw",
+            "action": "entrust",
+            "not_in_spec": true,
+        });
+        let err = serde_json::from_value::<BootstrapChallengeBody>(v).expect_err("deny");
+        assert!(
+            err.to_string().contains("not_in_spec") || err.to_string().contains("unknown field"),
+            "serde must reject unknown field, got {err}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_entrust_body_rejects_unknown_nested_challenge_field() {
+        let v = serde_json::json!({
+            "challenge": {
+                "nonce": "00".repeat(32),
+                "expiry": "1",
+                "ghost": true,
+            },
+            "ownership_proof": {
+                "type": "ownership",
+                "subject": "unused",
+                "public_key": "00".repeat(32),
+                "nk_commit": "00".repeat(32),
+                "signature": "00".repeat(64),
+            },
+            "bundle": "00".repeat(OPERATIONAL_BUNDLE_HEX_CHARS / 2),
+        });
+        let err = serde_json::from_value::<BootstrapEntrustBody>(v).expect_err("deny nested");
+        assert!(
+            err.to_string().contains("ghost") || err.to_string().contains("unknown field"),
+            "nested deny_unknown_fields must fire, got {err}"
         );
     }
 }

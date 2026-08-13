@@ -9,9 +9,10 @@ If you discover a security vulnerability in zkCoins, please report it responsibl
 3. Include: description, reproduction steps, impact assessment
 4. We will acknowledge within 48 hours and provide a fix timeline
 
-> **Note:** this repo is currently a scaffold — the public API surface is served
-> by [zk-coins/node](https://github.com/zk-coins/node). Vulnerabilities in the
-> live API surface go to the same address.
+This repository **is** the standalone API process. Vulnerabilities in the live
+REST / LNURL surface are reported here (same email). Issues in the trustless
+node kernel still go to [zk-coins/node](https://github.com/zk-coins/node)
+(see Scope table).
 
 ## Scope
 

@@ -13,7 +13,7 @@ Bestandsaufnahme (Worktree `zk-coins/docs-vectors`).
 | Menge | Werte | Fundstelle |
 |---|---|---|
 | API-`features` | `{wallet, explorer, publisher, lightning_bridge, mail_bridge}` | §6.1 L2322, L2333–L2341; §7.5 `/v1/info` L2877 |
-| `GET /` · `endpoints`-Schlüssel | siehe Tabelle unten (29 geschlossene Keys) | §7.5; Data Permanence (kein `blossom_delete`) |
+| `GET /` · `endpoints`-Schlüssel | siehe Tabelle unten (31 geschlossene Keys) | §7.5; Data Permanence (kein `blossom_delete`) |
 | Kernel-Prozeduren | siehe §7.8-Tabelle | §7.8 L3138–L3159 |
 
 **Feature-Semantik (§6.1):** Jedes Feature ist **off**, bis der Operator es einschaltet.
@@ -54,21 +54,23 @@ eigenes `Kernel`-RPC-Verb in der Procedure-Tabelle).
 | 14 | `POST` | `/v1/attest/balance` | **Ja** — action-bound OwnershipProof | `wallet` | `AttestBalance` | §7.5 L2894; §7.8 L3158; Feature §6.1 L2337 |
 | 15 | `POST` | `/v1/grants/challenge` | Nein (stellt Challenge aus) | `wallet` | `OpenPullChallenge` (`action = issue_grant`) | §7.5 L2895; §7.8 L3149, L3341–L3345; Feature §6.1 L2337 |
 | 16 | `POST` | `/v1/grants` | **Ja** — action-bound OwnershipProof (kein GrantProof) | `wallet` | `IssueViewGrant` | §7.5 L2896; §7.8 L3159; Feature §6.1 L2337 |
-| 17 | `POST` | `/v1/pull/challenge` | Nein (stellt Challenge aus) | `wallet` | `OpenPullChallenge` | §7.5 L3039; §7.8 L3149; Feature §6.1 L2337 |
-| 18 | `POST` | `/v1/pull` | **Ja** — OwnershipProof oder GrantProof | `wallet` | `Pull` | §7.5 L3040; §7.8 L3150; Feature §6.1 L2337 |
-| 19 | `GET` | `/v1/record/<record_id>` | **Ja** — Pull-Session Bearer | `wallet` | `GetRecord` | §7.5 L3041; §7.8 L3151; Feature §6.1 L2337 |
-| 20 | `GET` | `/v1/proof/<coin_id>` | **Ja** — Pull-Session Bearer | `wallet` | `GetCoinProof` | §7.5 L3042; §7.8 L3152; Feature §6.1 L2337 |
-| 21 | `GET` | `/v1/account/state` | **Ja** — Ownership-Pull-Session (kein Grant) | `wallet` | `GetAccountState` | §7.5 L3043; §7.8 L3153; Feature §6.1 L2337 |
-| 22 | `GET` | `/v1/receipts/stream` | **Ja** — Pull-Session Bearer (Ownership oder Grant) | `wallet` | `SubscribeReceipts` | §7.5 L3044, L2953–L2955; §7.8 L3154; Feature §6.1 L2337 |
-| 23 | `POST` | `/v1/publish/spendrecord` | Nein (permissionless) | `publisher` | `Publish` | §7.6 L3050–L3054; §7.8 L3155; Feature §6.1 L2339 |
-| 24 | `POST` | `/v1/bootstrap/challenge` | Nein (stellt Challenge aus) | `wallet` | `OpenPullChallenge` (`action` entrust/revoke) | §7.7 L3118; §7.8 L3149, L3341–L3344; Feature §6.1 L2337 |
-| 25 | `POST` | `/v1/bootstrap/entrust` | **Ja** — OwnershipProof (Entrust-Domain) | `wallet` | `EntrustOperationalBundle` | §7.7 L3119; §7.8 L3156; Feature §6.1 L2337 |
-| 26 | `POST` | `/v1/bootstrap/revoke` | **Ja** — OwnershipProof (Revoke-Domain) | `wallet` | `RevokeOperationalBundle` | §7.7 L3120; §7.8 L3157; Feature §6.1 L2337 |
-| 27 | `GET` | `/blossom/<sha256>` | Nein (Ciphertext) | `explorer` (blob fetch) | Blossom-Ebene / Kernel-Store — **kein** eigenes Kernel-RPC-Verb (§7.8 L3490) | §7.4 L2804; Feature §6.1 L2338; `endpoints`-Key §7.5 L2874 |
-| 28 | `HEAD` | `/blossom/<sha256>` | Nein | `explorer` (blob fetch) | Blossom-Ebene / Kernel-Store | §7.4 L2805; Feature §6.1 L2338; Key §7.5 L2874 |
-| 29 | `PUT` | `/blossom/upload` | **Ja** — Nostr kind-`24242` Auth-Event | `explorer` / `wallet` | Blossom-Ebene / Kernel-Store | §7.4; Keys §7.5; Data Permanence (append-only, Antwort `{ blob_id }`) |
-| 30 | `POST` | `/blossom/upload` | **Ja** — Nostr kind-`24242` Auth-Event | `explorer` / `wallet` | Blossom-Ebene / Kernel-Store (äquivalent zu PUT) | §7.4; Keys §7.5 |
-| 31 | `GET` | `/v1/token/<asset_id>/provenance` | Nein (offen, unauthentifiziert) | **immer** — nicht feature-gated | `GetTokenProvenance` — offene Class-B-Provenienz; self-verifying; `404 not_found` wenn der Node keine Terms für `asset_id` hält | §7.5; §7.8; §4.6 Class B |
+| 17 | `POST` | `/v1/grants/revoke/challenge` | Nein (stellt Challenge aus) | `wallet` | **API-lokal** (kein Kernel-Dial, §5.2) | §7.5 |
+| 18 | `POST` | `/v1/grants/revoke` | **Ja** — action-bound OwnershipProof (RevokeGrant-Domain) | `wallet` | **API-lokal** (kein Kernel-Dial, §5.2) | §7.5 |
+| 19 | `POST` | `/v1/pull/challenge` | Nein (stellt Challenge aus) | `wallet` | `OpenPullChallenge` | §7.5 L3039; §7.8 L3149; Feature §6.1 L2337 |
+| 20 | `POST` | `/v1/pull` | **Ja** — OwnershipProof oder GrantProof | `wallet` | `Pull` | §7.5 L3040; §7.8 L3150; Feature §6.1 L2337 |
+| 21 | `GET` | `/v1/record/<record_id>` | **Ja** — Pull-Session Bearer | `wallet` | `GetRecord` | §7.5 L3041; §7.8 L3151; Feature §6.1 L2337 |
+| 22 | `GET` | `/v1/proof/<coin_id>` | **Ja** — Pull-Session Bearer | `wallet` | `GetCoinProof` | §7.5 L3042; §7.8 L3152; Feature §6.1 L2337 |
+| 23 | `GET` | `/v1/account/state` | **Ja** — Ownership-Pull-Session (kein Grant) | `wallet` | `GetAccountState` | §7.5 L3043; §7.8 L3153; Feature §6.1 L2337 |
+| 24 | `GET` | `/v1/receipts/stream` | **Ja** — Pull-Session Bearer (Ownership oder Grant) | `wallet` | `SubscribeReceipts` | §7.5 L3044, L2953–L2955; §7.8 L3154; Feature §6.1 L2337 |
+| 25 | `POST` | `/v1/publish/spendrecord` | Nein (permissionless) | `publisher` | `Publish` | §7.6 L3050–L3054; §7.8 L3155; Feature §6.1 L2339 |
+| 26 | `POST` | `/v1/bootstrap/challenge` | Nein (stellt Challenge aus) | `wallet` | `OpenPullChallenge` (`action` entrust/revoke) | §7.7 L3118; §7.8 L3149, L3341–L3344; Feature §6.1 L2337 |
+| 27 | `POST` | `/v1/bootstrap/entrust` | **Ja** — OwnershipProof (Entrust-Domain) | `wallet` | `EntrustOperationalBundle` | §7.7 L3119; §7.8 L3156; Feature §6.1 L2337 |
+| 28 | `POST` | `/v1/bootstrap/revoke` | **Ja** — OwnershipProof (Revoke-Domain) | `wallet` | `RevokeOperationalBundle` | §7.7 L3120; §7.8 L3157; Feature §6.1 L2337 |
+| 29 | `GET` | `/blossom/<sha256>` | Nein (Ciphertext) | `explorer` (blob fetch) | Blossom-Ebene / Kernel-Store — **kein** eigenes Kernel-RPC-Verb (§7.8 L3490) | §7.4 L2804; Feature §6.1 L2338; `endpoints`-Key §7.5 L2874 |
+| 30 | `HEAD` | `/blossom/<sha256>` | Nein | `explorer` (blob fetch) | Blossom-Ebene / Kernel-Store | §7.4 L2805; Feature §6.1 L2338; Key §7.5 L2874 |
+| 31 | `PUT` | `/blossom/upload` | **Ja** — Nostr kind-`24242` Auth-Event | `explorer` / `wallet` | Blossom-Ebene / Kernel-Store | §7.4; Keys §7.5; Data Permanence (append-only, Antwort `{ blob_id }`) |
+| 32 | `POST` | `/blossom/upload` | **Ja** — Nostr kind-`24242` Auth-Event | `explorer` / `wallet` | Blossom-Ebene / Kernel-Store (äquivalent zu PUT) | §7.4; Keys §7.5 |
+| 33 | `GET` | `/v1/token/<asset_id>/provenance` | Nein (offen, unauthentifiziert) | **immer** — nicht feature-gated | `GetTokenProvenance` — offene Class-B-Provenienz; self-verifying; `404 not_found` wenn der Node keine Terms für `asset_id` hält | §7.5; §7.8; §4.6 Class B |
 
 **Kein** `DELETE /blossom/<sha256>` — Data Permanence (Requirement 12): der Blob-Store
 ist append-only; empfangene Daten werden nie gelöscht. `ReplicaReceiptV1` / §4.6
@@ -76,7 +78,8 @@ Dual-Commit und `retention_hold` entfallen mit der Spec.
 
 ### Geschlossene `endpoints`-Schlüssel von `GET /` (§7.5)
 
-Genau diese 29 Keys — wörtlich, vollständig:
+Genau diese 31 Keys — wörtlich, vollständig (Inventur-Reihenfolge von
+`CLOSED_ENDPOINT_KEYS`):
 
 | Key | Typischer Pfad |
 |---|---|
@@ -108,6 +111,8 @@ Genau diese 29 Keys — wörtlich, vollständig:
 | `blossom_get` | `/blossom/<sha256>` |
 | `blossom_head` | `/blossom/<sha256>` |
 | `blossom_upload` | `/blossom/upload` |
+| `grants_revoke_challenge` | `/v1/grants/revoke/challenge` |
+| `grants_revoke` | `/v1/grants/revoke` |
 | `token_provenance` | `/v1/token/<asset_id>/provenance` |
 
 Spec-Regel (§7.5): Ein Producer emittiert **genau** die geschlossene Schlüsselmenge
@@ -120,28 +125,28 @@ beworbene optionale Rollen weglassen. Unbekannte Keys beim Lesen ignorieren.
 
 | Kategorie | Anzahl |
 |---|---|
-| HTTP-Endpunkte (Method+Path) in der Tabelle oben | **31** |
-| davon in §7.5-Haupttext (ohne §7.4/§7.6/§7.7) | **22** |
+| HTTP-Endpunkte (Method+Path) in der Tabelle oben | **33** |
+| davon in §7.5-Haupttext (ohne §7.4/§7.6/§7.7) | **24** |
 | + Publisher §7.6 | **1** |
 | + Bootstrap §7.7 | **3** |
 | + Blossom §7.4 (GET/HEAD/PUT/POST; kein DELETE) | **4** |
-| Geschlossene `endpoints`-Keys | **29** |
-| Capability-gebunden (Ownership / Grant / Session / Nostr-Auth) | **12** (#14, #16, #18–22, #25–26, #29–30) |
-| Challenge-Aussteller ohne Capability | **4** (#13, #15, #17, #24) |
+| Geschlossene `endpoints`-Keys | **31** |
+| Capability-gebunden (Ownership / Grant / Session / Nostr-Auth) | **12** (#14, #16, #18, #20–24, #27–28, #31–32) |
+| Challenge-Aussteller ohne Capability | **5** (#13, #15, #17, #19, #26) |
 | API-lokal | **2** (`GET /`, `GET /health`) |
 
 ### Pro Feature (Method+Path, ohne „immer“)
 
 | Feature | Endpunkte | Nummern |
 |---|---|---|
-| immer (API-Prozess) | 5 | #1–#4, #31 |
-| `wallet` | 19 | #8–#22, #24–#26 (+ Blossom-Upload geteilt) |
-| `explorer` | 3 Chain + Blossom-Fetch (+ Upload geteilt) | #5–#7, #27–#28 (+ #29–#30 geteilt) |
-| `publisher` | 1 | #23 |
+| immer (API-Prozess) | 5 | #1–#4, #33 |
+| `wallet` | 20 | #8–#24, #26–#28 (+ Blossom-Upload geteilt) |
+| `explorer` | 3 Chain + Blossom-Fetch (+ Upload geteilt) | #5–#7, #29–#30 (+ #31–#32 geteilt) |
+| `publisher` | 1 | #25 |
 | `lightning_bridge` | 0 in §7.5 | Erweiterung `/lightning-bridge` |
 | `mail_bridge` | 0 in §7.5 | Erweiterung `/mail-bridge` |
 
-Blossom-Upload (#29–#30) sind weder rein `wallet` noch rein `explorer` in der
+Blossom-Upload (#31–#32) sind weder rein `wallet` noch rein `explorer` in der
 Feature-Tabelle §6.1; sie gehören zur öffentlichen Blossom-Ebene (§7.4) und werden von
 Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Blob-Pfad).
 
@@ -153,7 +158,7 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Blob-Pfad).
 |---|---|
 | `GET /health` | **implementiert** — `200` mit Body `"ok"` |
 | `GET /health/ready` | **implementiert** — Readiness aus Kernel-`GetInfo` (`ready` / `ready_reason`); Body-Form `{ ready, reason? }`, nie die generische Fehlerform. Bei fehlgeschlagenem `GetInfo` (z. B. fehlende `ChainIdentity` im node): **503** `{ ready: false, reason: "dependency_unavailable" }` — nie grünes `ready: true`. |
-| `GET /` | **implementiert** — `{ name, version, endpoints }` mit **genau** den Flächen, die dieser Prozess registriert (`ServedSurface`). Inventur der 28 Keys in `CLOSED_ENDPOINT_KEYS`; unregistrierte Keys werden weggelassen. |
+| `GET /` | **implementiert** — `{ name, version, endpoints }` mit **genau** den Flächen, die dieser Prozess registriert (`ServedSurface`). Inventur der 31 Keys in `CLOSED_ENDPOINT_KEYS`; unregistrierte Keys werden weggelassen. |
 | `GET /v1/info` | **implementiert** — Kernel-`GetInfo` + API-eigene `features` aus `ZKCOINS_FEATURES` (`kernel_parts` bleibt intern). |
 | `GET /v1/chain/accumulator` | **implementiert** — `GetAccumulator`; `root` ist pass-through der Kernel-`nav_root`, keine Nachrechnung. |
 | `GET /v1/chain/inscriptions` | **implementiert** — `ListInscriptions` (Server-Stream → eine Seite); Triple-Cursor ganz-oder-gar-nicht; leerer Katalog → leere Liste (kein 404). |
@@ -167,6 +172,8 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Blob-Pfad).
 | `POST /v1/attest/balance` | **implementiert** — OwnershipProof-Verifikation am API-Rand, dann `AttestBalance` |
 | `POST /v1/grants/challenge` | **implementiert** — `OpenPullChallenge` (`action = issue_grant`) |
 | `POST /v1/grants` | **implementiert** — OwnershipProof-Verifikation am API-Rand, dann `IssueViewGrant` |
+| `POST /v1/grants/revoke/challenge` | **implementiert** — API-lokal, stellt Single-Use-Nonce für Grant-Revoke aus; kein Kernel-Dial (§5.2) |
+| `POST /v1/grants/revoke` | **implementiert** — OwnershipProof-Verifikation am API-Rand (RevokeGrant-Domain, grant→subject binding), dann `revoked_grants`; kein Kernel-Dial (§5.2) |
 | `POST /v1/pull/challenge` | **implementiert** — `OpenPullChallenge` (`action = pull`) |
 | `POST /v1/pull` | **implementiert** — OwnershipProof am API-Rand, dann `Pull` (GrantProof fail-closed) |
 | `GET /v1/record/<record_id>` | **implementiert** — `GetRecord` (Bearer-Session) |
@@ -214,7 +221,7 @@ ausschließlich über `google.rpc.ErrorInfo` (`domain`, `reason`,
 | Variable | Bedeutung |
 |---|---|
 | `ZKCOINS_BIND_ADDR` | Socket-Adresse für den HTTP-Listener (z. B. `127.0.0.1:8080`). **Kein Default.** |
-| `ZKCOINS_KERNEL_ADDR` | Adresse des Kernel-gRPC (z. B. `http://127.0.0.1:50051`). **Kein Default.** Pflicht, auch wenn dieser Scaffold den Kanal noch nicht öffnet — Start ohne konfigurierte Kernel-Adresse ist unzulässig. |
+| `ZKCOINS_KERNEL_ADDR` | Adresse des Kernel-gRPC (z. B. `http://127.0.0.1:50051`). **Kein Default.** Pflicht — dieser API-Prozess dialt den Kernel vor dem Serve; Start ohne konfigurierte Kernel-Adresse ist unzulässig. |
 | `ZKCOINS_FEATURES` | Komma-separierte Teilmenge von `{wallet,explorer,publisher,lightning_bridge,mail_bridge}`. Darf leer sein (alle Features off). Unbekannter Token → **Startfehler**. Variable selbst ist Pflicht (explizit leer = absichtlich nichts freigeschaltet). |
 | `ZKCOINS_PUBLIC_HOST` | Komma-separierte autoritative Hostnamen für §5.1 `chan_bind` (lowercase, trailing-dot gestrichen). **Nie** aus `Host`-Header. Darf leer sein (dann schlägt OwnershipProof-Auth laut fehl). Variable selbst ist Pflicht. |
 

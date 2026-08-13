@@ -686,6 +686,25 @@ mod tests {
         let _ = fs::remove_dir_all(&file_path);
     }
 
+    /// Poisoned map lock must recover via `into_inner` so put still works.
+    #[test]
+    fn put_recovers_from_poisoned_blob_locks_map() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.blob_locks.lock().expect("map lock");
+            panic!("intentional poison for recover path");
+        }));
+        let body = b"poison-map-recover-body";
+        let uploader = [0x55u8; 32];
+        let id = store
+            .put(body, &uploader)
+            .expect("put after map poison recover");
+        assert_eq!(id, blob_id_of(body));
+        assert_eq!(store.read(&id).unwrap().unwrap(), body);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn list_root_names_after_root_deleted_is_internal_error() {
         let root = temp_root();

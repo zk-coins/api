@@ -217,8 +217,8 @@ fn require_octet_stream(headers: &HeaderMap) -> Result<(), ApiError> {
     let ct = ct
         .to_str()
         .map_err(|_| ApiError::malformed("Content-Type is not valid UTF-8"))?;
-    // Exact media type; parameters (e.g. charset) are not a conforming form.
-    let media = ct.split(';').next().unwrap_or(ct).trim();
+    // Full trimmed header must equal `application/octet-stream`; parameters are rejected.
+    let media = ct.trim();
     if media != "application/octet-stream" {
         return Err(ApiError::malformed(format!(
             "Content-Type must be application/octet-stream, got {media:?} \
@@ -349,5 +349,17 @@ mod tests {
             HeaderValue::from_static("application/octet-stream"),
         );
         require_octet_stream(&headers).expect("exact media type");
+    }
+
+    #[test]
+    fn require_octet_stream_charset_parameter_is_malformed() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream; charset=utf-8"),
+        );
+        let err = require_octet_stream(&headers).expect_err("charset parameter");
+        assert_eq!(err.body.error, "malformed_request");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 }
