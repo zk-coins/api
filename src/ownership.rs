@@ -3027,6 +3027,129 @@ mod tests {
         );
     }
 
+    fn encode_grant_payload(payload: &[u8]) -> String {
+        let hrp = bech32::Hrp::parse(GRANT_HRP).expect("hrp");
+        bech32::encode::<Bech32m>(hrp, payload).expect("encode")
+    }
+
+    #[test]
+    fn decode_view_grant_explicit_zero_asset_count_is_malformed() {
+        // version(1)+subject(32)+grantee(32)+disc(1)+count(4)+tail(104) = 174
+        let mut payload = Vec::with_capacity(174);
+        payload.push(GRANT_VERSION);
+        payload.extend_from_slice(&[0u8; 32]); // subject
+        payload.extend_from_slice(&[0u8; 32]); // grantee
+        payload.push(0x01); // explicit asset list
+        payload.extend_from_slice(&0u32.to_be_bytes()); // count = 0
+        payload.extend_from_slice(&[0u8; 104]); // tail
+        let encoded = encode_grant_payload(&payload);
+        let err = decode_view_grant(&encoded).expect_err("zero asset count");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("non-empty") || err.body.message.contains("asset_ids"),
+            "message: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn decode_view_grant_truncated_asset_ids_list_is_malformed() {
+        // count must exceed remaining/32 so list truncates despite the 170-byte floor.
+        // count=4 → need=128; after header (70) remaining at len=170 is 100 < 128.
+        let mut payload = Vec::with_capacity(170);
+        payload.push(GRANT_VERSION);
+        payload.extend_from_slice(&[0u8; 32]); // subject
+        payload.extend_from_slice(&[0u8; 32]); // grantee
+        payload.push(0x01); // explicit asset list
+        payload.extend_from_slice(&4u32.to_be_bytes()); // count = 4
+        payload.extend_from_slice(&[0u8; 8]); // only 8 of 128 required id bytes
+        payload.resize(170, 0);
+        let encoded = encode_grant_payload(&payload);
+        let err = decode_view_grant(&encoded).expect_err("truncated asset_ids list");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("truncated asset_ids list"),
+            "message: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn decode_view_grant_asset_ids_not_strictly_ascending_is_malformed() {
+        // version(1)+subject(32)+grantee(32)+disc(1)+count(4)+2*32 ids+tail(104) = 238
+        let mut payload = Vec::with_capacity(238);
+        payload.push(GRANT_VERSION);
+        payload.extend_from_slice(&[0u8; 32]); // subject
+        payload.extend_from_slice(&[0u8; 32]); // grantee
+        payload.push(0x01); // explicit asset list
+        payload.extend_from_slice(&2u32.to_be_bytes()); // count = 2
+        payload.extend_from_slice(&[0x02u8; 32]); // id0
+        payload.extend_from_slice(&[0x01u8; 32]); // id1 (descending)
+        payload.extend_from_slice(&[0u8; 104]); // tail
+        let encoded = encode_grant_payload(&payload);
+        let err = decode_view_grant(&encoded).expect_err("non-ascending asset_ids");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("ascending"),
+            "message: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn decode_view_grant_unknown_asset_discriminator_is_malformed() {
+        let mut payload = vec![0u8; 170];
+        payload[0] = GRANT_VERSION;
+        payload[65] = 0x02; // unknown discriminator at offset 1+32+32
+        let encoded = encode_grant_payload(&payload);
+        let err = decode_view_grant(&encoded).expect_err("unknown asset discriminator");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("discriminator") || err.body.message.contains("0x02"),
+            "message: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn decode_view_grant_truncated_tail_is_malformed() {
+        // disc 0x01, count=1, full 32-byte id → cur=102; at len=170 remaining=68 < 104.
+        let mut payload = Vec::with_capacity(170);
+        payload.push(GRANT_VERSION);
+        payload.extend_from_slice(&[0u8; 32]); // subject
+        payload.extend_from_slice(&[0u8; 32]); // grantee
+        payload.push(0x01); // explicit asset list
+        payload.extend_from_slice(&1u32.to_be_bytes()); // count = 1
+        payload.extend_from_slice(&[0u8; 32]); // full asset id
+        payload.resize(170, 0); // short tail (68 bytes)
+        let encoded = encode_grant_payload(&payload);
+        let err = decode_view_grant(&encoded).expect_err("truncated tail");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("truncated time")
+                || err.body.message.contains("nonce")
+                || err.body.message.contains("signature"),
+            "message: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn decode_view_grant_trailing_bytes_is_malformed() {
+        // Valid 170-byte wildcard (disc 0x00 + full 104-byte tail) plus one extra byte.
+        let mut payload = vec![0u8; 171];
+        payload[0] = GRANT_VERSION;
+        // disc at offset 65 remains 0x00 (wildcard); bytes 66..170 are the tail; 170 is trailing.
+        let encoded = encode_grant_payload(&payload);
+        let err = decode_view_grant(&encoded).expect_err("trailing bytes");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("trailing"),
+            "message: {}",
+            err.body.message
+        );
+    }
+
     #[test]
     fn intersect_scopes_empty_time_window_is_403() {
         let requested = ResolvedScope {
