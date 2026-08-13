@@ -12,8 +12,14 @@ use tracing::info;
 
 pub async fn run() -> ExitCode {
     init_tracing();
+    run_from_config_result(Config::from_env()).await
+}
 
-    let config = match Config::from_env() {
+/// Map a config load result to either fail-closed exit 1 or [`run_with_config`].
+///
+/// Extracted so the `Ok` arm is unit-testable without mutating process env.
+async fn run_from_config_result(config: Result<Config, crate::config::ConfigError>) -> ExitCode {
+    let config = match config {
         Ok(c) => c,
         Err(e) => {
             eprintln!("api: configuration error: {e}");
@@ -108,6 +114,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_from_config_result_err_is_exit_1() {
+        let code = run_from_config_result(Err(crate::config::ConfigError::MissingEnv(
+            "ZKCOINS_BIND_ADDR",
+        )))
+        .await;
+        assert_eq!(code, ExitCode::from(1));
+    }
+
+    #[tokio::test]
     async fn run_with_config_invalid_kernel_uri_is_exit_1() {
         let config = test_config("127.0.0.1:0", "not a uri", None);
         let code = run_with_config(config).await;
@@ -139,6 +154,21 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Deterministic EADDRINUSE: hold a listener and bind the same address.
+    #[tokio::test]
+    async fn run_with_config_eaddrinuse_is_exit_1() {
+        let holder = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral bind");
+        let mut config = test_config("127.0.0.1:0", "http://127.0.0.1:50051", None);
+        config.bind_addr = holder.local_addr().expect("local addr");
+        let code = run_with_config(config).await;
+        assert_eq!(code, ExitCode::from(1));
+        // keep holder alive until after run_with_config returns
+        drop(holder);
+    }
+
+    /// Legacy bind-failure path (privileged :1, with EADDRINUSE fallback).
     #[tokio::test]
     async fn run_with_config_bind_failure_is_exit_1() {
         let mut config = test_config("127.0.0.1:1", "http://127.0.0.1:50051", None);

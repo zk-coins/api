@@ -955,4 +955,446 @@ mod tests {
         assert!(!tmp.exists(), "tmp must be removed on install error");
         let _ = fs::remove_dir_all(&root);
     }
+
+    // --- lock recovery / release branches ---
+
+    /// Poisoned per-blob mutex recovers via `into_inner` for a fresh complete put.
+    #[test]
+    fn put_recovers_from_poisoned_per_blob_mutex() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let body = b"poison-per-blob-mutex-unique-body";
+        let id = blob_id_of(body);
+        // Leave a poisoned Arc in the map; put → with_blob_lock recovers via into_inner.
+        let arc = store.acquire_blob_lock(&id);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = arc.lock().expect("blob lock");
+            panic!("intentional per-blob mutex poison for put path");
+        }));
+        drop(arc);
+        let uploader = [0x91u8; 32];
+        let got = store
+            .put(body, &uploader)
+            .expect("put must recover from poisoned per-blob mutex");
+        assert_eq!(got, id);
+        assert_eq!(store.read(&id).unwrap().unwrap(), body);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn blob_lock_entry_count_recovers_from_poisoned_map() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.blob_locks.lock().expect("map lock");
+            panic!("intentional map poison for entry_count");
+        }));
+        let n = store.blob_lock_entry_count();
+        assert_eq!(n, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn put_recovers_from_poisoned_root_lock() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.root_lock.write().expect("root write");
+            panic!("intentional root_lock poison");
+        }));
+        let body = b"poison-root-lock-unique-body";
+        let uploader = [0x92u8; 32];
+        let id = store
+            .put(body, &uploader)
+            .expect("put must recover from poisoned root_lock");
+        assert_eq!(id, blob_id_of(body));
+        assert_eq!(store.read(&id).unwrap().unwrap(), body);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_blob_lock_keeps_entry_while_extra_holder_lives() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let id = blob_id_of(b"extra-holder-body");
+        let held = store.acquire_blob_lock(&id);
+        let extra = Arc::clone(&held);
+        store.release_blob_lock(&id, held);
+        assert_eq!(
+            store.blob_lock_entry_count(),
+            1,
+            "extra Arc must prevent map removal"
+        );
+        drop(extra);
+        let drain = store.acquire_blob_lock(&id);
+        store.release_blob_lock(&id, drain);
+        assert_eq!(store.blob_lock_entry_count(), 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_blob_lock_does_not_remove_replaced_entry() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let id = blob_id_of(b"replace-entry-body");
+        let held = store.acquire_blob_lock(&id);
+        // Keep strong_count == 2 on `held` after map replace so the
+        // `ptr_eq` false arm (not remove) is reached.
+        let extra = Arc::clone(&held);
+        let replacement = Arc::new(Mutex::new(()));
+        {
+            let mut map = store.blob_locks.lock().unwrap_or_else(|e| e.into_inner());
+            map.insert(id, Arc::clone(&replacement));
+        }
+        store.release_blob_lock(&id, held);
+        drop(extra);
+        {
+            let map = store.blob_locks.lock().unwrap_or_else(|e| e.into_inner());
+            let current = map.get(&id).expect("replacement must remain");
+            assert!(
+                Arc::ptr_eq(current, &replacement),
+                "release must not remove a non-ptr_eq map entry"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_blob_lock_missing_entry_is_noop() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let id = blob_id_of(b"missing-entry-body");
+        let held = store.acquire_blob_lock(&id);
+        // Keep strong_count == 2 while the map entry is gone so the
+        // `if let Some(current) = map.get(id)` None path is exercised.
+        let extra = Arc::clone(&held);
+        {
+            let mut map = store.blob_locks.lock().unwrap_or_else(|e| e.into_inner());
+            map.remove(&id);
+        }
+        store.release_blob_lock(&id, held);
+        drop(extra);
+        assert_eq!(store.blob_lock_entry_count(), 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // --- exists / size / read branches ---
+
+    #[test]
+    fn exists_unknown_id_is_false() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let id = blob_id_of(b"never-stored");
+        assert!(!store.exists(&id).expect("exists"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Note path metadata fails (EACCES via symlink into mode-0 dir) while blob is a file.
+    #[cfg(unix)]
+    #[test]
+    fn exists_note_stat_error_is_internal_error() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let body = b"exists-note-stat-error-body";
+        let uploader = [0x93u8; 32];
+        let id = store.put(body, &uploader).expect("put");
+        let note = store.uploader_path(&id);
+        assert!(note.is_file());
+
+        let locked = root.join("locked-note-dir");
+        fs::create_dir(&locked).expect("locked dir");
+        let target = locked.join("note-target");
+        fs::rename(&note, &target).expect("move note into locked dir");
+        std::os::unix::fs::symlink(&target, &note).expect("symlink note path");
+
+        let original = fs::metadata(&locked).expect("meta").permissions();
+        let _restore = RestorePerm {
+            path: locked.clone(),
+            perm: original.clone(),
+        };
+        let mut mode = original.clone();
+        mode.set_mode(0o000);
+        fs::set_permissions(&locked, mode).expect("chmod locked 000");
+
+        let err = store
+            .exists(&id)
+            .expect_err("note stat EACCES must be internal_error");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("stat"),
+            "cause must mention stat, got {:?}",
+            err.cause()
+        );
+
+        fs::set_permissions(&locked, original).expect("restore locked mode");
+        drop(_restore);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn size_and_read_unknown_id_are_none() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let id = blob_id_of(b"size-read-absent");
+        assert_eq!(store.size(&id).expect("size"), None);
+        assert_eq!(store.read(&id).expect("read"), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // TOCTOU size/read arms (250, 254-255, 270) need a race after internal
+    // `exists()`; omitted here — not reliably deterministic without changing
+    // production size/read logic.
+
+    // --- put_locked install / temp-write errors ---
+
+    fn list_names_with_prefix(root: &Path, prefix: &str) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(rd) = fs::read_dir(root) {
+            for entry in rd.flatten() {
+                let name = entry.file_name();
+                if let Some(s) = name.to_str() {
+                    if s.starts_with(prefix) {
+                        out.push(entry.path());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn put_write_note_temp_fails_when_precreated() {
+        let root = temp_root();
+        let store = Arc::new(BlobStore::open(&root).expect("open"));
+        let body = b"write-note-temp-fail-body";
+        let id = blob_id_of(body);
+        let hex = BlobStore::blob_id_hex(&id);
+        let blob_prefix = format!(".{hex}.blob.tmp.");
+        let root_t = root.clone();
+        // Spin for the whole put window so the note temp is occupied as soon as
+        // the tag is known from the blob temp name.
+        let watcher = thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(2) {
+                for blob_tmp in list_names_with_prefix(&root_t, &blob_prefix) {
+                    let name = blob_tmp.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if let Some(tag) = name.rsplit(".blob.tmp.").next() {
+                        let note_tmp = root_t.join(format!(".{hex}.note.tmp.{tag}"));
+                        let _ = fs::write(&note_tmp, b"occupied");
+                    }
+                }
+                thread::yield_now();
+            }
+        });
+        let op = [0xa1u8; 32];
+        let err = store
+            .put(body, &op)
+            .expect_err("precreated note temp must fail write_exclusive");
+        let _ = watcher.join();
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("write note temp"),
+            "cause must mention write note temp, got {:?}",
+            err.cause()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn put_install_blob_already_exists_incomplete_is_internal_error() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let body = b"install-blob-dir-occupied-body";
+        let id = blob_id_of(body);
+        // Directory at blob path: is_file() is false → incomplete guard does not fire.
+        fs::create_dir(store.blob_path(&id)).expect("dir at blob path");
+        let op = [0xa2u8; 32];
+        let err = store
+            .put(body, &op)
+            .expect_err("directory at blob path must refuse put");
+        assert_eq!(err.body.error, "internal_error");
+        let cause = err.cause().unwrap_or("");
+        assert!(
+            cause.contains("occupied")
+                || cause.contains("incomplete")
+                || cause.contains("refuse put"),
+            "cause must mention occupied/incomplete/refuse put, got {cause:?}"
+        );
+        let _ = fs::remove_dir(store.blob_path(&id));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// After both temps exist, delete the blob temp so hard_link fails ≠ AlreadyExists.
+    #[test]
+    fn put_install_blob_other_error_when_temp_deleted() {
+        let root = temp_root();
+        let store = Arc::new(BlobStore::open(&root).expect("open"));
+        let body = b"install-blob-other-error-body";
+        let id = blob_id_of(body);
+        let hex = BlobStore::blob_id_hex(&id);
+        let blob_prefix = format!(".{hex}.blob.tmp.");
+        let note_prefix = format!(".{hex}.note.tmp.");
+        let root_t = root.clone();
+        let watcher = thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let mut armed = false;
+            while start.elapsed() < std::time::Duration::from_secs(2) {
+                let blobs = list_names_with_prefix(&root_t, &blob_prefix);
+                let notes = list_names_with_prefix(&root_t, &note_prefix);
+                if !blobs.is_empty() && !notes.is_empty() {
+                    armed = true;
+                }
+                if armed {
+                    for p in list_names_with_prefix(&root_t, &blob_prefix) {
+                        let _ = fs::remove_file(&p);
+                    }
+                }
+                thread::yield_now();
+            }
+        });
+        let op = [0xa4u8; 32];
+        let result = store.put(body, &op);
+        let _ = watcher.join();
+        match result {
+            Err(err) => {
+                assert_eq!(err.body.error, "internal_error");
+                let cause = err.cause().unwrap_or("");
+                assert!(
+                    cause.contains("install blob"),
+                    "cause must mention install blob, got {cause:?}"
+                );
+            }
+            Ok(_) => panic!("expected install blob failure when blob temp deleted"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn put_install_note_already_exists_file_is_ok() {
+        let root = temp_root();
+        let store = Arc::new(BlobStore::open(&root).expect("open"));
+        let body = b"install-note-exists-file-body";
+        let id = blob_id_of(body);
+        let final_blob = store.blob_path(&id);
+        let final_note = store.uploader_path(&id);
+        let watcher = thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(2) {
+                if final_blob.is_file() {
+                    let _ = fs::write(&final_note, encode_hex(&[0xa5u8; 32]).as_bytes());
+                }
+                thread::yield_now();
+            }
+        });
+        let op = [0xa5u8; 32];
+        let got = store
+            .put(body, &op)
+            .expect("note AlreadyExists as file must be Ok");
+        let _ = watcher.join();
+        assert_eq!(got, id);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn put_install_note_already_exists_not_file_is_internal_error() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let body = b"install-note-dir-occupied-body";
+        let id = blob_id_of(body);
+        // Directory at note path; blob absent → incomplete guard: note_path.is_file() is false,
+        // blob_path.is_file() is false → guard does not fire. put installs blob then note hard_link EEXIST.
+        fs::create_dir(store.uploader_path(&id)).expect("dir at note path");
+        let op = [0xa6u8; 32];
+        let err = store
+            .put(body, &op)
+            .expect_err("directory at note path must fail install note");
+        assert_eq!(err.body.error, "internal_error");
+        let cause = err.cause().unwrap_or("");
+        assert!(
+            cause.contains("install note race") && cause.contains("blob retained"),
+            "cause must mention install note race and blob retained, got {cause:?}"
+        );
+        assert!(
+            store.blob_path(&id).is_file(),
+            "data permanence: installed blob must remain"
+        );
+        let _ = fs::remove_dir(store.uploader_path(&id));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn put_install_note_other_error_retains_blob() {
+        let root = temp_root();
+        let store = Arc::new(BlobStore::open(&root).expect("open"));
+        let body = b"install-note-other-error-body";
+        let id = blob_id_of(body);
+        let hex = BlobStore::blob_id_hex(&id);
+        let note_prefix = format!(".{hex}.note.tmp.");
+        let final_blob = store.blob_path(&id);
+        let root_t = root.clone();
+        let watcher = thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(2) {
+                // Wait until final blob is installed, then delete note temp so
+                // hard_link fails with NotFound (not AlreadyExists).
+                if final_blob.is_file() {
+                    for p in list_names_with_prefix(&root_t, &note_prefix) {
+                        let _ = fs::remove_file(&p);
+                    }
+                }
+                thread::yield_now();
+            }
+        });
+        let op = [0xa7u8; 32];
+        let result = store.put(body, &op);
+        let _ = watcher.join();
+        match result {
+            Err(err) => {
+                assert_eq!(err.body.error, "internal_error");
+                let cause = err.cause().unwrap_or("");
+                assert!(
+                    cause.contains("install note") && cause.contains("blob retained"),
+                    "cause must mention install note and blob retained, got {cause:?}"
+                );
+                assert!(
+                    store.blob_path(&id).is_file(),
+                    "data permanence: blob must remain after note install failure"
+                );
+            }
+            Ok(_) => panic!("expected install note failure when note temp deleted"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // --- list_root_names / non-UTF8 ---
+
+    #[cfg(unix)]
+    #[test]
+    fn list_root_names_skips_non_utf8_and_lists_utf8() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        fs::write(root.join("visible-utf8"), b"ok").expect("utf8 file");
+        // APFS/macOS rejects some non-UTF8 names (Illegal byte sequence); skip that arm then.
+        let non_utf8 = OsString::from_vec(vec![0xff, 0xfe]);
+        let non_utf8_path = root.join(&non_utf8);
+        let created_non_utf8 = fs::write(&non_utf8_path, b"bin").is_ok();
+        let names = store.list_root_names().expect("list");
+        assert!(
+            names.iter().any(|n| n == "visible-utf8"),
+            "utf8 name must be listed, got {names:?}"
+        );
+        if created_non_utf8 {
+            // Non-UTF8 name must not appear (to_str() skip arm).
+            assert_eq!(
+                names.len(),
+                1,
+                "only the utf8 name must be listed, got {names:?}"
+            );
+            let _ = fs::remove_file(&non_utf8_path);
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
 }
