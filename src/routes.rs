@@ -8796,11 +8796,17 @@ mod tests {
 
     #[tokio::test]
     async fn grants_revoke_bad_ownership_signature_is_unauthorized() {
-        let (_, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        use crate::ownership::{pull_challenge_message, REVOKE_GRANT_CHALLENGE_DOMAIN};
+
+        let host = "node.example.com"; // matches test_config public host
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
         let (grant_bech, _, _, _) = test_signed_zkgrant(&subject_raw, 0x55, 0x66, 0x77);
         let app = build_router(test_config(), Arc::new(ScriptedKernel::default())).expect("router");
-        let (nonce_hex, _, _) = issue_grant_revoke_challenge(&app, &subject_bech).await;
-        let body = grant_revoke_ownership_body(
+        let (nonce_hex, expiry, nonce_raw) =
+            issue_grant_revoke_challenge(&app, &subject_bech).await;
+
+        // Failed proof must not burn the single-use nonce.
+        let bad_body = grant_revoke_ownership_body(
             &nonce_hex,
             &subject_bech,
             &pk0,
@@ -8809,12 +8815,13 @@ mod tests {
             &grant_bech,
         );
         let res = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/v1/grants/revoke")
                     .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
+                    .body(Body::from(bad_body.to_string()))
                     .unwrap(),
             )
             .await
@@ -8822,10 +8829,35 @@ mod tests {
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
         assert_eq!(json["error"], "unauthorized");
+
+        // Same nonce still redeemable with a valid proof.
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            REVOKE_GRANT_CHALLENGE_DOMAIN,
+            &nonce_raw,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        let good_body =
+            grant_revoke_ownership_body(&nonce_hex, &subject_bech, &pk0, &nkc, &sig, &grant_bech);
+        let res2 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(good_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res2.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn grants_revoke_expired_challenge_is_unauthorized() {
+    async fn grants_revoke_expired_challenge_is_gone() {
         use crate::ownership::{
             pull_challenge_message, GrantRevokeChallengeStore, RevokedGrantSet, SubjectOpDirectory,
             REVOKE_GRANT_CHALLENGE_DOMAIN,
@@ -8859,6 +8891,7 @@ mod tests {
             router.with_state(state)
         };
 
+        // Valid BIP-340 proof over the expired store entry → 410 after cleanup.
         let cb = chan_bind_for_host(host);
         let chal = pull_challenge_message(
             REVOKE_GRANT_CHALLENGE_DOMAIN,
@@ -8882,18 +8915,18 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(res.status(), StatusCode::GONE);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
-        assert_eq!(json["error"], "unauthorized");
+        assert_eq!(json["error"], "challenge_expired");
     }
 
     #[tokio::test]
     async fn grants_revoke_unknown_nonce_is_unauthorized() {
         let (_sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
         let (grant_bech, _, _, _) = test_signed_zkgrant(&subject_raw, 0x55, 0x66, 0x77);
-        // Never issued via /challenge — take fails before any other check.
+        // Never issued via /challenge — peek returns None before verify.
         let nonce = [0u8; 32];
-        // Dummy signature (never verified — take fails first).
+        // Dummy signature (never verified — peek fails first).
         let sig = [0u8; 64];
         let body = grant_revoke_ownership_body(
             &encode_hex(&nonce),

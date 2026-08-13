@@ -73,6 +73,12 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, "not_found", message)
     }
 
+    /// §7.5 `challenge_expired` / 410 — issued challenge past its expiry
+    /// after a cryptographically valid proof.
+    pub fn challenge_expired(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::GONE, "challenge_expired", message)
+    }
+
     /// §7.5 intro / §6.1: known route whose role feature is off for this
     /// deployment → `404 feature_disabled`. Distinct from a bare axum 404 for
     /// a path that was never registered (including unconfigured Blossom).

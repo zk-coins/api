@@ -288,9 +288,10 @@ fn validate_sse_event_status(event_name: &str, job: &Job) -> Result<(), ApiError
 /// §7.5 `TransitionRequest` JSON body for `POST /v1/tx` (L2898–L2930).
 ///
 /// §7.5: "the body is exactly this JSON object" — unknown fields are
-/// `400 malformed_request`. `deny_unknown_fields` is set on **every** nested
-/// object type below so a foreign key inside `output_templates[]` or
-/// `issuance` is rejected the same way as one at the top level.
+/// `400 malformed_request`. `deny_unknown_fields` is set on nested object
+/// types below (except NIP-01 `Kind0EventJson`, which accepts extra fields)
+/// so a foreign key inside `output_templates[]` or `issuance` is rejected
+/// the same way as one at the top level.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransitionRequestJson {
@@ -441,12 +442,12 @@ impl fmt::Debug for InvoiceJson {
 ///
 /// Binary fields are lowercase-or-uppercase hex of exact width. `tags` is the
 /// JSON array of tag arrays; the API serialises it to `Kind0Event.tags_json`
-/// without reformatting the `content` string.
+/// without reformatting the `content` string. Extra NIP-01 fields beyond the
+/// core set are accepted (no `deny_unknown_fields`).
 ///
 /// **Debug** redacts id / pubkey / content / sig (content holds the `zkcoins`
 /// object including `pk0`).
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Kind0EventJson {
     pub id: String,
     pub pubkey: String,
@@ -1833,14 +1834,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_field_inside_profile_event_is_malformed() {
+    fn unknown_field_inside_profile_event_is_accepted() {
         let mut v = mint_with_profile_delivery();
         v["output_templates"][0]["delivery"]["event"]["extra"] = serde_json::json!(1);
-        let err = serde_json::from_value::<TransitionRequestJson>(v).expect_err("deny");
-        assert!(
-            err.to_string().contains("extra") || err.to_string().contains("unknown field"),
-            "got {err}"
-        );
+        serde_json::from_value::<TransitionRequestJson>(v)
+            .expect("NIP-01 kind-0 extra fields must be accepted");
     }
 
     #[test]

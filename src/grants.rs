@@ -316,34 +316,29 @@ pub async fn post_grants_revoke(
     State(state): State<AppState>,
     JsonBody(body): JsonBody<GrantsRevokeBody>,
 ) -> Result<Response, ApiError> {
-    // 1. Capability gate — GrantProof-Arm wird mit 401 abgewiesen, bevor der
-    //    Nonce-Store überhaupt angefasst wird (no-escalation, wie überall sonst).
+    // 1. Capability gate — GrantProof arm is rejected with 401 before the
+    //    nonce store is touched (no-escalation, same as elsewhere).
     let ownership_proof = body.ownership_proof.require_ownership()?;
 
-    // 2. Single-use take — DAS ist der Single-Use-Check. Unbekannt ODER
-    //    bereits verbraucht sehen von aussen identisch aus (401), keine
-    //    Unterscheidung, die Existenz/Timing leakt.
+    // 2. Parse nonce hex. Malformed → 400 before any store lookup.
     let nonce_bytes = decode_hex_exact(&body.challenge.nonce, 32)
         .map_err(|e| ApiError::malformed(format!("challenge.nonce: {e}")))?;
     let mut nonce_raw = [0u8; 32];
     nonce_raw.copy_from_slice(&nonce_bytes);
+
+    // 3. Peek — never-issued and already-consumed look identical on the wire
+    //    (401). Do not consume yet: a failed proof must not burn the nonce.
     let entry = state
         .grant_revoke_challenges
-        .take(&nonce_raw)
+        .get(&nonce_raw)
         .ok_or_else(|| {
             ApiError::unauthorized("unknown or already-consumed grant-revoke challenge nonce")
         })?;
 
-    // 3. Expiry — der Store ist hier der einzige Prüfer (kein Kernel dahinter).
-    let now = unix_now()?;
-    if now > entry.expiry {
-        return Err(ApiError::unauthorized("grant-revoke challenge has expired"));
-    }
-
-    // 4. OwnershipProof unter RevokeGrant-Domain verifizieren. subject UND
-    //    expiry kommen aus `entry` (dem Store), NICHT aus dem Client-Body —
-    //    der Body trägt für `challenge` nur `nonce`, keine `expiry`. chan_bind
-    //    bleibt server-autoritativ (state.public_hosts), wie überall sonst.
+    // 4. OwnershipProof under RevokeGrant. subject and expiry come from
+    //    `entry` (the store), not the client body — the body only carries
+    //    `challenge.nonce`. chan_bind stays server-authoritative
+    //    (`state.public_hosts`). On verify failure do not `take`.
     let subject_bech32 = encode_zk_address_public(&entry.subject)?;
     let echo = ChallengeEcho {
         nonce: body.challenge.nonce.clone(),
@@ -357,9 +352,9 @@ pub async fn post_grants_revoke(
         state.public_hosts.as_slice(),
     )?;
 
-    // 5. Grant decodieren + grant→subject-Bindung (DoS-Schutz): eine fremde
-    //    grant_id darf nicht revozierbar sein, nur weil jemand ein gültiges
-    //    OwnershipProof für SEIN EIGENES subject vorlegt.
+    // 5. Decode grant + grant→subject binding (DoS protection): a foreign
+    //    grant_id must not be revocable merely because someone presents a
+    //    valid OwnershipProof for their own subject. On mismatch do not `take`.
     let grant = decode_view_grant(&body.grant)?;
     if grant.subject != entry.subject {
         return Err(ApiError::unauthorized(
@@ -367,8 +362,26 @@ pub async fn post_grants_revoke(
         ));
     }
 
-    // 6. Population — der einzige Schreibzugriff auf revoked_grants in dieser
-    //    Datei. KEIN Kernel-Dial an irgendeiner Stelle in diesem Handler.
+    // 6. Expiry — only after a valid proof and grant→subject bind. Clean up
+    //    the expired nonce via `take`, then 410 `challenge_expired`.
+    let now = unix_now()?;
+    if now > entry.expiry {
+        let _ = state.grant_revoke_challenges.take(&nonce_raw);
+        return Err(ApiError::challenge_expired(
+            "grant-revoke challenge has expired",
+        ));
+    }
+
+    // 7. Single-use consume. `None` means lost the race with another redeem.
+    let _entry = state
+        .grant_revoke_challenges
+        .take(&nonce_raw)
+        .ok_or_else(|| {
+            ApiError::unauthorized("unknown or already-consumed grant-revoke challenge nonce")
+        })?;
+
+    // 8. Population — only write to revoked_grants in this handler. No kernel
+    //    dial at any point here.
     state.revoked_grants.revoke(grant.grant_id);
 
     let body = json!({ "revoked": true });

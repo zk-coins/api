@@ -917,6 +917,19 @@ impl GrantRevokeChallengeStore {
         nonce
     }
 
+    /// Peek at the entry for `nonce` without consuming it.
+    ///
+    /// `None` covers both "never issued" and "already consumed"; callers must
+    /// not distinguish the two on the wire. Use [`Self::take`] only after the
+    /// proof (and grant→subject binding) has been validated.
+    pub fn get(&self, nonce: &[u8; 32]) -> Option<ChallengeEntry> {
+        let guard = self
+            .inner
+            .read()
+            .expect("grant_revoke_challenges lock poisoned");
+        guard.get(nonce).copied()
+    }
+
     /// Atomically remove and return the entry for `nonce` — this IS the
     /// single-use check. `None` covers both "never issued" and "already
     /// consumed"; callers must not distinguish the two in the response.
