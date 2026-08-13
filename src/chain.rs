@@ -1107,6 +1107,59 @@ mod tests {
         assert!(json.get("next_height").is_none());
     }
 
+    /// At `limit == MAX_LIMIT` the handler peeks the exclusive successor instead
+    /// of requesting `MAX_LIMIT + 1`; a successor sets `next` to that item.
+    #[tokio::test]
+    async fn max_limit_page_peek_sets_next_when_successor_exists() {
+        let catalog: Vec<_> = (0..1001)
+            .map(|h| sample_inscription(h, 0, 0, "completed", vec![sample_nullifier("completed")]))
+            .collect();
+        let kernel: KernelHandle = Arc::new(CatalogKernel { catalog });
+        let page = fetch_inscriptions_page(
+            &kernel,
+            ListInscriptionsQuery {
+                from_height: 0,
+                from_tx_index: 0,
+                from_vin_index: 0,
+                limit: MAX_LIMIT,
+            },
+        )
+        .await
+        .expect("max-limit page with successor");
+        assert_eq!(page.inscriptions.len(), 1000);
+        let next = page.next.expect("peek must find the 1001st item");
+        assert_eq!(
+            (next.height, next.tx_index, next.vin_index),
+            (1000, 0, 0),
+            "next must be the exclusive successor's triple"
+        );
+    }
+
+    /// Full page of exactly `MAX_LIMIT` with no catalog successor → no `next`.
+    #[tokio::test]
+    async fn max_limit_page_without_successor_has_no_next() {
+        let catalog: Vec<_> = (0..MAX_LIMIT as u64)
+            .map(|h| sample_inscription(h, 0, 0, "completed", vec![sample_nullifier("completed")]))
+            .collect();
+        let kernel: KernelHandle = Arc::new(CatalogKernel { catalog });
+        let page = fetch_inscriptions_page(
+            &kernel,
+            ListInscriptionsQuery {
+                from_height: 0,
+                from_tx_index: 0,
+                from_vin_index: 0,
+                limit: MAX_LIMIT,
+            },
+        )
+        .await
+        .expect("max-limit page without successor");
+        assert_eq!(page.inscriptions.len(), 1000);
+        assert!(
+            page.next.is_none(),
+            "peek must find nothing past the last item"
+        );
+    }
+
     /// §7.8 promises stable triple order; an out-of-order stream is
     /// `internal_error`, not a silently re-sorted page.
     #[tokio::test]
@@ -1258,6 +1311,44 @@ mod tests {
         assert_eq!(err.body.error, "internal_error");
         assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn nullifier_state_unknown_is_internal() {
+        let ins = sample_inscription(1, 0, 0, "completed", vec![sample_nullifier("bogus")]);
+        let err = inscription_to_json(&ins).expect_err("unknown nullifier state");
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        let cause = err.cause().unwrap_or("");
+        assert!(
+            cause.contains("Nullifier.state") || cause.contains("completed"),
+            "operator cause must name Nullifier.state or completed, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn present_true_audit_path_over_64_is_internal() {
+        let path = NullifierPath {
+            root: vec![0x01; 32],
+            tip_height: 10,
+            present: true,
+            leaf: vec![0x02; 32],
+            position: 3,
+            audit_path: vec![vec![0x03; 32]; 65],
+            tree_size: 4,
+            tip_block_hash: vec![0x04; 32],
+        };
+        let err = nullifier_path_to_json(&path).expect_err("audit_path over 64");
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            err.cause().unwrap_or("").contains("audit_path"),
+            "operator cause must name audit_path, got {:?}",
+            err.cause()
+        );
     }
 
     #[test]

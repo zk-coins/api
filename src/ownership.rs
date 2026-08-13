@@ -2929,4 +2929,144 @@ mod tests {
             err.body.message
         );
     }
+
+    #[test]
+    fn decode_view_grant_wrong_hrp_is_malformed() {
+        let scope = ResolvedScope {
+            all_assets: true,
+            asset_ids: vec![],
+            not_before: 0,
+            not_after: u64::MAX,
+        };
+        let subject = [0u8; 32];
+        let grantee = [0u8; 32];
+        let nonce = [0u8; 16];
+        let sig = [0u8; 64];
+        let good = encode_view_grant(&subject, &grantee, &scope, 0, &nonce, &sig)
+            .expect("encode dummy grant");
+        let checked = CheckedHrpstring::new::<Bech32m>(&good).expect("valid Bech32m grant");
+        let data: Vec<u8> = checked.byte_iter().collect();
+        let bad_hrp = bech32::Hrp::parse("zkxxxx").expect("test HRP");
+        let bad = bech32::encode::<Bech32m>(bad_hrp, &data).expect("re-encode with wrong HRP");
+        let err = decode_view_grant(&bad).expect_err("wrong HRP");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("HRP") || err.body.message.contains("zkgrant"),
+            "message: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn decode_view_grant_truncated_payload_is_malformed() {
+        let hrp = bech32::Hrp::parse(GRANT_HRP).expect("constant HRP");
+        let encoded =
+            bech32::encode::<Bech32m>(hrp, &[GRANT_VERSION]).expect("1-byte payload encodes");
+        let err = decode_view_grant(&encoded).expect_err("truncated payload");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("too short") || err.body.message.contains("invalid"),
+            "message: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn decode_view_grant_unknown_version_is_malformed() {
+        let mut payload = vec![0u8; 170];
+        payload[0] = 0xFF;
+        let hrp = bech32::Hrp::parse(GRANT_HRP).expect("constant HRP");
+        let encoded = bech32::encode::<Bech32m>(hrp, &payload).expect("170-byte payload encodes");
+        let err = decode_view_grant(&encoded).expect_err("unknown version");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("version"),
+            "message: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn intersect_scopes_empty_time_window_is_403() {
+        let requested = ResolvedScope {
+            all_assets: true,
+            asset_ids: vec![],
+            not_before: 10,
+            not_after: 20,
+        };
+        let grant = ResolvedScope {
+            all_assets: true,
+            asset_ids: vec![],
+            not_before: 30,
+            not_after: 40,
+        };
+        let err = intersect_scopes(&requested, &grant).expect_err("empty time window");
+        assert_eq!(err.body.error, "scope_exceeded");
+    }
+
+    #[test]
+    fn intersect_scopes_star_against_empty_grant_assets_is_403() {
+        let requested = ResolvedScope {
+            all_assets: true,
+            asset_ids: vec![],
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        let grant = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![],
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        let err = intersect_scopes(&requested, &grant).expect_err("star vs empty grant assets");
+        assert_eq!(err.body.error, "scope_exceeded");
+    }
+
+    #[test]
+    fn intersect_scopes_explicit_id_outside_grant_is_403() {
+        let requested = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![[0x01; 32]],
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        let grant = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![[0x02; 32]],
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        let err = intersect_scopes(&requested, &grant).expect_err("explicit id outside grant");
+        assert_eq!(err.body.error, "scope_exceeded");
+        assert!(
+            err.body.message.contains("outside") || err.body.message.contains("asset"),
+            "message: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn verify_grant_proof_empty_public_hosts_is_internal() {
+        let f = grant_fixture();
+        let nonce = [0xAAu8; 32];
+        let chal_expiry = 1_700_000_060u64;
+        let now = 1_700_000_000u64;
+        let revoked = RevokedGrantSet::new();
+        let dummy_sig = [0u8; 64];
+        let err = verify_grant_proof(
+            &encode_hex(&nonce),
+            &chal_expiry.to_string(),
+            &GrantProofJson {
+                proof_type: "grant".into(),
+                grant: f.bech.clone(),
+                grantee_pk: encode_hex(&f.grantee_pk),
+                signature: encode_hex(&dummy_sig),
+            },
+            &f.op_pk,
+            &ResolvedScope::unbounded(),
+            &grant_ctx(&[], now, &revoked),
+        )
+        .expect_err("empty public hosts");
+        assert_eq!(err.body.error, "internal_error");
+    }
 }
