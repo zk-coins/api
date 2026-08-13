@@ -963,6 +963,147 @@ mod tests {
         }
     }
 
+    /// Every CatalogKernel KernelRpc stub except list_inscriptions returns
+    /// internal_error so llvm-cov does not treat the stubs as misses.
+    #[tokio::test]
+    async fn catalog_kernel_unused_rpcs_are_internal() {
+        use crate::kernel::kernel_v1::{
+            AccountStateRequest, AttestRequest, CoinProofRequest, EntrustRequest,
+            GetTokenProvenanceRequest, GrantRequest, JobRequest, PublishRequest,
+            PullChallengeRequest, PullRequest, RecordRequest, RevokeRequest, SignRequest,
+            SubscribeReceiptsRequest, TransitionRequest,
+        };
+
+        let k = CatalogKernel { catalog: vec![] };
+
+        let err = k
+            .get_token_provenance(GetTokenProvenanceRequest { asset_id: vec![] })
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .submit_transition(TransitionRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .get_job(JobRequest {
+                job_id: String::new(),
+            })
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let result = k
+            .stream_job(JobRequest {
+                job_id: String::new(),
+            })
+            .await;
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert_eq!(e.body.error, "internal_error");
+        }
+
+        let err = k
+            .sign_transition(SignRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .cancel_job(JobRequest {
+                job_id: String::new(),
+            })
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k.get_info().await.expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k.get_accumulator().await.expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .get_nullifier_path(NullifierPathRequest { pubkey: vec![] })
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .open_pull_challenge(PullChallengeRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .attest_balance(AttestRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .issue_view_grant(GrantRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .pull(
+                PullRequest::default(),
+                crate::ownership::SessionAuthority::Ownership,
+            )
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .get_record(RecordRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .get_coin_proof(CoinProofRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .get_account_state(AccountStateRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let result = k
+            .subscribe_receipts(SubscribeReceiptsRequest::default())
+            .await;
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert_eq!(e.body.error, "internal_error");
+        }
+
+        let err = k
+            .entrust_operational_bundle(EntrustRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .revoke_operational_bundle(RevokeRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .publish(PublishRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+    }
+
     /// Three pages with limit=1; page boundary sits mid-reveal-tx (vin 0/1/2
     /// of the same (height, tx_index)). Exclusive next of page n is inclusive
     /// from of page n+1 — no duplicates, no gaps.
