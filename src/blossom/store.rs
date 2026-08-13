@@ -651,4 +651,53 @@ mod tests {
         }
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn open_on_file_cannot_create_root_is_internal_error() {
+        let file_path = temp_root();
+        fs::write(&file_path, b"not-a-dir").expect("write file at root path");
+        let err = BlobStore::open(&file_path).expect_err("file is not a store root");
+        assert_eq!(err.body.error, "internal_error");
+        let cause = err.cause().unwrap_or("");
+        assert!(
+            cause.contains("cannot create root")
+                || cause.contains("not a directory")
+                || cause.contains("File exists"),
+            "diagnostic must mention cannot create root / not a directory / File exists, got {cause:?}"
+        );
+        let _ = fs::remove_file(&file_path);
+        let _ = fs::remove_dir_all(&file_path);
+    }
+
+    #[test]
+    fn list_root_names_after_root_deleted_is_internal_error() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let gone = store.root().with_extension("gone");
+        fs::rename(store.root(), &gone).expect("rename store root away");
+        let _ = fs::remove_dir_all(&gone);
+        let err = store.list_root_names().expect_err("root gone");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("read_dir"),
+            "diagnostic must mention read_dir, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn read_uploader_corrupt_note_is_internal_error() {
+        let root = temp_root();
+        let store = BlobStore::open(&root).expect("open");
+        let id = blob_id_of(b"x");
+        fs::write(store.uploader_path(&id), b"not-a-hex-note").expect("corrupt note");
+        let err = store.read_uploader(&id).expect_err("corrupt note");
+        assert_eq!(err.body.error, "internal_error");
+        let cause = err.cause().unwrap_or("");
+        assert!(
+            cause.contains("corrupt") || cause.contains("uploader note"),
+            "diagnostic must mention corrupt uploader note, got {cause:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 }

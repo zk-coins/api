@@ -817,4 +817,14 @@ mod tests {
             other => panic!("expected InvalidBlossomAllowedOp, got {other:?}"),
         }
     }
+
+    /// Reads the real process env only (no set_var/remove_var — races other tests).
+    #[test]
+    fn from_env_without_zkcoins_vars_is_missing_env() {
+        let err = Config::from_env().expect_err("missing ZKCOINS_* in typical test process");
+        assert!(
+            matches!(err, ConfigError::MissingEnv(_)),
+            "expected MissingEnv, got {err:?}"
+        );
+    }
 }
