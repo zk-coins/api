@@ -4646,6 +4646,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pull_challenge_empty_subject_is_400() {
+        let kernel = Arc::new(ScriptedKernel::default());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull/challenge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({ "subject": "" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+        assert!(json["message"].as_str().unwrap().contains("subject"));
+        assert_eq!(kernel.open_challenge_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pull_challenge_kernel_nonce_wrong_len_is_500() {
+        let (_, _, _, _, subject_bech) = ownership_fixtures::identity();
+        let kernel = Arc::new(ScriptedKernel {
+            open_challenge: Some(Ok(Challenge {
+                nonce: vec![0xABu8; 16],
+                expiry: 1,
+                domain: PULL_CHALLENGE_DOMAIN.to_string(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull/challenge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "subject": subject_bech }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(
+            json["message"],
+            crate::error::PUBLIC_INTERNAL_MESSAGE,
+            "public internal_error message must be neutral"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_challenge_kernel_wrong_domain_is_500() {
+        let (_, _, _, _, subject_bech) = ownership_fixtures::identity();
+        let kernel = Arc::new(ScriptedKernel {
+            open_challenge: Some(Ok(Challenge {
+                nonce: vec![0xABu8; 32],
+                expiry: 1,
+                domain: "not-the-pull-domain".into(),
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull/challenge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "subject": subject_bech }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(
+            json["message"],
+            crate::error::PUBLIC_INTERNAL_MESSAGE,
+            "public internal_error message must be neutral"
+        );
+    }
+
+    #[tokio::test]
     async fn pull_valid_ownership_opens_session_with_ownership_authority() {
         let host = "node.example.com";
         let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
@@ -6161,6 +6253,96 @@ mod tests {
         assert_eq!(json["error"], "malformed_request");
         assert!(json["message"].as_str().unwrap().contains("subject"));
         assert_eq!(kernel.entrust_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_revoke_empty_subject_in_proof_is_400() {
+        let pk0 = [0u8; 32];
+        let nkc = [0u8; 32];
+        let nonce = [0u8; 32];
+        let sig = [0u8; 64];
+        let expiry = 1_700_000_060u64;
+        let kernel = Arc::new(ScriptedKernel::default());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bootstrap/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        bootstrap_ownership_body("", &pk0, &nkc, &nonce, expiry, &sig, None)
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+        assert!(json["message"].as_str().unwrap().contains("subject"));
+        assert_eq!(kernel.revoke_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_entrust_invalid_op_secret_is_500() {
+        let host = "node.example.com";
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let nonce = [0x11u8; 32];
+        let expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            ChallengeDomain::Entrust.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+
+        let mut bytes = [0u8; OPERATIONAL_BUNDLE_LEN];
+        bytes[0] = 0x01;
+        bytes[65..97].copy_from_slice(&[0xFFu8; 32]);
+        let bundle_hex = encode_hex(&bytes);
+        assert_eq!(bundle_hex.len(), OPERATIONAL_BUNDLE_HEX_CHARS);
+
+        let kernel = Arc::new(ScriptedKernel {
+            entrust: Some(Ok(EntrustResult { accepted: true })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone()).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bootstrap/entrust")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        bootstrap_ownership_body(
+                            &subject_bech,
+                            &pk0,
+                            &nkc,
+                            &nonce,
+                            expiry,
+                            &sig,
+                            Some(&bundle_hex),
+                        )
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(
+            json["message"],
+            crate::error::PUBLIC_INTERNAL_MESSAGE,
+            "public internal_error message must be neutral"
+        );
+        assert_eq!(kernel.entrust_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

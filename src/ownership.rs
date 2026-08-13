@@ -1742,6 +1742,166 @@ mod tests {
     }
 
     #[test]
+    fn simple_verify_refuses_attest_balance_domain() {
+        let subject = encode_zk_address(&[0u8; 32]);
+        let err = verify_simple_ownership_proof(
+            ChallengeDomain::AttestBalance,
+            &subject,
+            &ChallengeEcho {
+                nonce: encode_hex(&[1u8; 32]),
+                expiry: "1".into(),
+            },
+            &OwnershipProofJson {
+                proof_type: "ownership".into(),
+                subject: subject.clone(),
+                public_key: encode_hex(&[0u8; 32]),
+                nk_commit: encode_hex(&[0u8; 32]),
+                signature: encode_hex(&[0u8; 64]),
+            },
+            &["h.example".into()],
+        )
+        .expect_err("attest-balance domain is not simple");
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn simple_verify_rejects_subject_mismatch() {
+        let (_sk, _pk0, _nkc, _subject_raw, subject_bech) = fixture_identity();
+        let other_subject = encode_zk_address(&[0x11u8; 32]);
+        let err = verify_simple_ownership_proof(
+            ChallengeDomain::Pull,
+            &subject_bech,
+            &ChallengeEcho {
+                nonce: encode_hex(&[1u8; 32]),
+                expiry: "1".into(),
+            },
+            &OwnershipProofJson {
+                proof_type: "ownership".into(),
+                subject: other_subject,
+                public_key: encode_hex(&[0u8; 32]),
+                nk_commit: encode_hex(&[0u8; 32]),
+                signature: encode_hex(&[0u8; 64]),
+            },
+            &["h.example".into()],
+        )
+        .expect_err("subject mismatch");
+        assert_eq!(err.body.error, "unauthorized");
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+        assert!(
+            err.body.message.contains("does not match request subject"),
+            "message must name subject mismatch: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn simple_verify_rejects_pk0_nk_not_equal_address() {
+        let (_sk, pk0, _nkc, _subject_raw, subject_bech) = fixture_identity();
+        // Canonical limbs (each 0x02… < GOLDILOCKS_ORDER), not the fixture nk_commit.
+        let wrong_nk = [0x02u8; 32];
+        let err = verify_simple_ownership_proof(
+            ChallengeDomain::Pull,
+            &subject_bech,
+            &ChallengeEcho {
+                nonce: encode_hex(&[1u8; 32]),
+                expiry: "1".into(),
+            },
+            &OwnershipProofJson {
+                proof_type: "ownership".into(),
+                subject: subject_bech.clone(),
+                public_key: encode_hex(&pk0),
+                nk_commit: encode_hex(&wrong_nk),
+                signature: encode_hex(&[0u8; 64]),
+            },
+            &["h.example".into()],
+        )
+        .expect_err("pk0||nk_commit must equal subject");
+        assert_eq!(err.body.error, "unauthorized");
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+        assert!(
+            err.body.message.contains("does not equal subject address"),
+            "message must name address equality: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn simple_verify_rejects_empty_public_hosts() {
+        let (sk, pk0, nkc, subject_raw, subject_bech) = fixture_identity();
+        let host = "node.example.com";
+        let nonce = [0xAAu8; 32];
+        let expiry = 1_700_000_060u64;
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            ChallengeDomain::Pull.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = sign_chal(&sk, &chal);
+        let err = verify_simple_ownership_proof(
+            ChallengeDomain::Pull,
+            &subject_bech,
+            &ChallengeEcho {
+                nonce: encode_hex(&nonce),
+                expiry: expiry.to_string(),
+            },
+            &OwnershipProofJson {
+                proof_type: "ownership".into(),
+                subject: subject_bech.clone(),
+                public_key: encode_hex(&pk0),
+                nk_commit: encode_hex(&nkc),
+                signature: encode_hex(&sig),
+            },
+            &[],
+        )
+        .expect_err("empty public_hosts must be internal_error");
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn nk_commit_non_canonical_goldilocks_limb_is_malformed() {
+        let mut non_canonical = [0u8; 32];
+        non_canonical[..8].copy_from_slice(&GOLDILOCKS_ORDER.to_be_bytes());
+
+        let err = validate_nk_commit_limbs(&non_canonical)
+            .expect_err("limb 0 == GOLDILOCKS_ORDER is non-canonical");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("non-canonical Goldilocks"),
+            "message must name non-canonical Goldilocks: {}",
+            err.body.message
+        );
+
+        let (_sk, pk0, _nkc, _subject_raw, subject_bech) = fixture_identity();
+        let err = verify_simple_ownership_proof(
+            ChallengeDomain::Pull,
+            &subject_bech,
+            &ChallengeEcho {
+                nonce: encode_hex(&[1u8; 32]),
+                expiry: "1".into(),
+            },
+            &OwnershipProofJson {
+                proof_type: "ownership".into(),
+                subject: subject_bech.clone(),
+                public_key: encode_hex(&pk0),
+                nk_commit: encode_hex(&non_canonical),
+                signature: encode_hex(&[0u8; 64]),
+            },
+            &["h.example".into()],
+        )
+        .expect_err("non-canonical nk_commit must fail before signature check");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("non-canonical Goldilocks"),
+            "message must name non-canonical Goldilocks: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
     fn session_authority_wire_tokens_match_node_metadata() {
         // node `parse_session_authority`: "ownership" | "grant" only.
         assert_eq!(SessionAuthority::Ownership.as_str(), "ownership");
