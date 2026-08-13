@@ -1618,6 +1618,34 @@ mod tests {
     }
 
     #[test]
+    fn grant_revoke_challenge_store_get_peeks_without_consuming() {
+        let store = GrantRevokeChallengeStore::new();
+        let subject = [0xABu8; 32];
+        let expiry = 1_700_000_060u64;
+        let nonce = store.issue(subject, expiry);
+
+        let first = store
+            .get(&nonce)
+            .expect("first get must return issued entry");
+        assert_eq!(first.subject, subject);
+        assert_eq!(first.expiry, expiry);
+
+        let second = store
+            .get(&nonce)
+            .expect("second get must still return entry");
+        assert_eq!(second.subject, subject);
+        assert_eq!(second.expiry, expiry);
+
+        let taken = store.take(&nonce).expect("take must return issued entry");
+        assert_eq!(taken.subject, subject);
+        assert_eq!(taken.expiry, expiry);
+
+        assert!(store.get(&nonce).is_none());
+        assert!(store.take(&nonce).is_none());
+        assert!(store.get(&[0u8; 32]).is_none());
+    }
+
+    #[test]
     fn entrust_domain_rejects_revoke_signed_proof() {
         let (sk, pk0, nkc, subject_raw, subject_bech) = fixture_identity();
         let host = "node.example.com";

@@ -165,4 +165,12 @@ mod tests {
         assert_eq!(err.body.error, "not_found");
         assert_eq!(err.body.message, "unknown blob_id");
     }
+
+    #[test]
+    fn challenge_expired_is_410_with_code_and_passthrough_message() {
+        let err = ApiError::challenge_expired("grant-revoke challenge has expired");
+        assert_eq!(err.status, StatusCode::GONE);
+        assert_eq!(err.body.error, "challenge_expired");
+        assert_eq!(err.body.message, "grant-revoke challenge has expired");
+    }
 }
