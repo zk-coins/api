@@ -1272,7 +1272,13 @@ fn job_poll_headers(job: &Job) -> Result<(StatusCode, Option<u64>), ApiError> {
 mod tests {
     use super::*;
     use crate::kernel::kernel_v1::delivery_credential::Body as DeliveryBody;
-    use axum::http::HeaderMap;
+    use crate::kernel::KernelRpc;
+    use crate::ownership::SessionAuthority;
+    use async_trait::async_trait;
+    use axum::http::{HeaderMap, HeaderValue};
+    use futures_util::stream::BoxStream;
+    use futures_util::StreamExt;
+    use std::sync::{Arc, Mutex};
 
     fn hex32(byte: u8) -> String {
         crate::hexutil::encode_hex(&[byte; 32])
@@ -3091,5 +3097,870 @@ mod tests {
             .await
             .expect_err("empty job_id");
         assert_eq!(err.body.error, "malformed_request");
+    }
+
+    // -----------------------------------------------------------------------
+    // JobsKernel test double + remaining llvm-cov paths
+    // -----------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct JobsKernel {
+        submit: Option<Result<JobHandle, ApiError>>,
+        last_submit: Mutex<Option<TransitionRequest>>,
+        get: Option<Result<Job, ApiError>>,
+        sign: Option<Result<Job, ApiError>>,
+        cancel: Option<Result<Job, ApiError>>,
+    }
+
+    #[async_trait]
+    impl KernelRpc for JobsKernel {
+        async fn get_token_provenance(
+            &self,
+            _req: crate::kernel::kernel_v1::GetTokenProvenanceRequest,
+        ) -> Result<crate::kernel::kernel_v1::TokenProvenance, ApiError> {
+            Err(ApiError::internal(
+                "test double: get_token_provenance not configured",
+            ))
+        }
+
+        async fn submit_transition(&self, req: TransitionRequest) -> Result<JobHandle, ApiError> {
+            *self.last_submit.lock().expect("last_submit mutex") = Some(req);
+            match &self.submit {
+                Some(Ok(h)) => Ok(h.clone()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal(
+                    "test double: submit_transition not configured",
+                )),
+            }
+        }
+
+        async fn get_job(&self, _req: JobRequest) -> Result<Job, ApiError> {
+            match &self.get {
+                Some(Ok(j)) => Ok(j.clone()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal("test double: get_job not configured")),
+            }
+        }
+
+        async fn stream_job(
+            &self,
+            _req: JobRequest,
+        ) -> Result<BoxStream<'static, Result<JobEvent, ApiError>>, ApiError> {
+            Err(ApiError::internal("test double: stream_job not configured"))
+        }
+
+        async fn sign_transition(&self, _req: SignRequest) -> Result<Job, ApiError> {
+            match &self.sign {
+                Some(Ok(j)) => Ok(j.clone()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal(
+                    "test double: sign_transition not configured",
+                )),
+            }
+        }
+
+        async fn cancel_job(&self, _req: JobRequest) -> Result<Job, ApiError> {
+            match &self.cancel {
+                Some(Ok(j)) => Ok(j.clone()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(ApiError::internal("test double: cancel_job not configured")),
+            }
+        }
+
+        async fn get_info(&self) -> Result<crate::kernel::kernel_v1::Info, ApiError> {
+            Err(ApiError::internal("test double: get_info not configured"))
+        }
+
+        async fn get_accumulator(
+            &self,
+        ) -> Result<crate::kernel::kernel_v1::AccumulatorTip, ApiError> {
+            Err(ApiError::internal(
+                "test double: get_accumulator not configured",
+            ))
+        }
+
+        async fn list_inscriptions(
+            &self,
+            _req: crate::kernel::kernel_v1::ListInscriptionsRequest,
+        ) -> Result<
+            BoxStream<'static, Result<crate::kernel::kernel_v1::Inscription, ApiError>>,
+            ApiError,
+        > {
+            Err(ApiError::internal(
+                "test double: list_inscriptions not configured",
+            ))
+        }
+
+        async fn get_nullifier_path(
+            &self,
+            _req: crate::kernel::kernel_v1::NullifierPathRequest,
+        ) -> Result<crate::kernel::kernel_v1::NullifierPath, ApiError> {
+            Err(ApiError::internal(
+                "test double: get_nullifier_path not configured",
+            ))
+        }
+
+        async fn open_pull_challenge(
+            &self,
+            _req: crate::kernel::kernel_v1::PullChallengeRequest,
+        ) -> Result<crate::kernel::kernel_v1::Challenge, ApiError> {
+            Err(ApiError::internal(
+                "test double: open_pull_challenge not configured",
+            ))
+        }
+
+        async fn attest_balance(
+            &self,
+            _req: crate::kernel::kernel_v1::AttestRequest,
+        ) -> Result<JobHandle, ApiError> {
+            Err(ApiError::internal(
+                "test double: attest_balance not configured",
+            ))
+        }
+
+        async fn issue_view_grant(
+            &self,
+            _req: crate::kernel::kernel_v1::GrantRequest,
+        ) -> Result<crate::kernel::kernel_v1::GrantResult, ApiError> {
+            Err(ApiError::internal(
+                "test double: issue_view_grant not configured",
+            ))
+        }
+
+        async fn pull(
+            &self,
+            _req: crate::kernel::kernel_v1::PullRequest,
+            _authority: SessionAuthority,
+        ) -> Result<crate::kernel::kernel_v1::PullResult, ApiError> {
+            Err(ApiError::internal("test double: pull not configured"))
+        }
+
+        async fn get_record(
+            &self,
+            _req: crate::kernel::kernel_v1::RecordRequest,
+        ) -> Result<crate::kernel::kernel_v1::RecordBlob, ApiError> {
+            Err(ApiError::internal("test double: get_record not configured"))
+        }
+
+        async fn get_coin_proof(
+            &self,
+            _req: crate::kernel::kernel_v1::CoinProofRequest,
+        ) -> Result<crate::kernel::kernel_v1::CoinProofBlob, ApiError> {
+            Err(ApiError::internal(
+                "test double: get_coin_proof not configured",
+            ))
+        }
+
+        async fn get_account_state(
+            &self,
+            _req: crate::kernel::kernel_v1::AccountStateRequest,
+        ) -> Result<crate::kernel::kernel_v1::AccountStateResult, ApiError> {
+            Err(ApiError::internal(
+                "test double: get_account_state not configured",
+            ))
+        }
+
+        async fn subscribe_receipts(
+            &self,
+            _req: crate::kernel::kernel_v1::SubscribeReceiptsRequest,
+        ) -> Result<BoxStream<'static, Result<crate::kernel::kernel_v1::Receipt, ApiError>>, ApiError>
+        {
+            Err(ApiError::internal(
+                "test double: subscribe_receipts not configured",
+            ))
+        }
+
+        async fn entrust_operational_bundle(
+            &self,
+            _req: crate::kernel::kernel_v1::EntrustRequest,
+        ) -> Result<crate::kernel::kernel_v1::EntrustResult, ApiError> {
+            Err(ApiError::internal(
+                "test double: entrust_operational_bundle not configured",
+            ))
+        }
+
+        async fn revoke_operational_bundle(
+            &self,
+            _req: crate::kernel::kernel_v1::RevokeRequest,
+        ) -> Result<crate::kernel::kernel_v1::RevokeResult, ApiError> {
+            Err(ApiError::internal(
+                "test double: revoke_operational_bundle not configured",
+            ))
+        }
+
+        async fn publish(
+            &self,
+            _req: crate::kernel::kernel_v1::PublishRequest,
+        ) -> Result<crate::kernel::kernel_v1::PublishResult, ApiError> {
+            Err(ApiError::internal("test double: publish not configured"))
+        }
+    }
+
+    /// Every unconfigured JobsKernel KernelRpc arm returns internal_error so
+    /// llvm-cov does not treat the stubs as new misses.
+    #[tokio::test]
+    async fn jobs_kernel_unused_rpcs_are_internal() {
+        let k = JobsKernel::default();
+
+        let err = k
+            .get_token_provenance(crate::kernel::kernel_v1::GetTokenProvenanceRequest {
+                asset_id: vec![],
+            })
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .submit_transition(TransitionRequest::default())
+            .await
+            .expect_err("submit unconfigured");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .get_job(JobRequest {
+                job_id: String::new(),
+            })
+            .await
+            .expect_err("get unconfigured");
+        assert_eq!(err.body.error, "internal_error");
+
+        let result = k
+            .stream_job(JobRequest {
+                job_id: String::new(),
+            })
+            .await;
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert_eq!(e.body.error, "internal_error");
+        }
+
+        let err = k
+            .sign_transition(SignRequest::default())
+            .await
+            .expect_err("sign unconfigured");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .cancel_job(JobRequest {
+                job_id: String::new(),
+            })
+            .await
+            .expect_err("cancel unconfigured");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k.get_info().await.expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k.get_accumulator().await.expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let result = k
+            .list_inscriptions(crate::kernel::kernel_v1::ListInscriptionsRequest::default())
+            .await;
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert_eq!(e.body.error, "internal_error");
+        }
+
+        let err = k
+            .get_nullifier_path(crate::kernel::kernel_v1::NullifierPathRequest { pubkey: vec![] })
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .open_pull_challenge(crate::kernel::kernel_v1::PullChallengeRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .attest_balance(crate::kernel::kernel_v1::AttestRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .issue_view_grant(crate::kernel::kernel_v1::GrantRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .pull(
+                crate::kernel::kernel_v1::PullRequest::default(),
+                SessionAuthority::Ownership,
+            )
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .get_record(crate::kernel::kernel_v1::RecordRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .get_coin_proof(crate::kernel::kernel_v1::CoinProofRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .get_account_state(crate::kernel::kernel_v1::AccountStateRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let result = k
+            .subscribe_receipts(crate::kernel::kernel_v1::SubscribeReceiptsRequest::default())
+            .await;
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert_eq!(e.body.error, "internal_error");
+        }
+
+        let err = k
+            .entrust_operational_bundle(crate::kernel::kernel_v1::EntrustRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .revoke_operational_bundle(crate::kernel::kernel_v1::RevokeRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+
+        let err = k
+            .publish(crate::kernel::kernel_v1::PublishRequest::default())
+            .await
+            .expect_err("unused stub");
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn validate_sse_event_status_rejects_via_validate_job() {
+        let job = sample_job("totally_unknown_phase");
+        let err = validate_sse_event_status("phase", &job).expect_err("unknown status");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("totally_unknown_phase")
+                || err.cause().unwrap_or("").contains("closed"),
+            "must fail inside validate_job, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tx_forwards_idempotency_key() {
+        let k = Arc::new(JobsKernel {
+            submit: Some(Ok(JobHandle {
+                job_id: "job-tx".into(),
+                status: "accepted".into(),
+            })),
+            ..Default::default()
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "abc-key-1".parse().unwrap());
+        let body: TransitionRequestJson = serde_json::from_value(mint_json()).expect("mint shape");
+        let res = post_tx(State(k.clone()), headers, JsonBody(body))
+            .await
+            .expect("post_tx ok");
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        let last = k
+            .last_submit
+            .lock()
+            .expect("last_submit mutex")
+            .clone()
+            .expect("submit called");
+        assert_eq!(last.idempotency_key, "abc-key-1");
+    }
+
+    #[tokio::test]
+    async fn post_tx_rejects_oversized_idempotency_key_without_submit() {
+        let k = Arc::new(JobsKernel::default());
+        let mut headers = HeaderMap::new();
+        let key = "a".repeat(65);
+        headers.insert(
+            "idempotency-key",
+            HeaderValue::from_str(&key).expect("ascii key"),
+        );
+        let body: TransitionRequestJson = serde_json::from_value(mint_json()).expect("mint shape");
+        let err = post_tx(State(k.clone()), headers, JsonBody(body))
+            .await
+            .expect_err("65-byte key");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            k.last_submit.lock().expect("mutex").is_none(),
+            "submit must not run when Idempotency-Key is malformed"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_job_sets_retry_after_for_accepted() {
+        let mut job = sample_job("accepted");
+        job.job_id = "job-poll".into();
+        let k = Arc::new(JobsKernel {
+            get: Some(Ok(job)),
+            ..Default::default()
+        });
+        let res = get_job(State(k), Path("job-poll".into()))
+            .await
+            .expect("get_job ok");
+        assert_eq!(res.status(), StatusCode::OK);
+        let ra = res
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("retry-after present");
+        assert_eq!(ra.to_str().unwrap(), "2");
+    }
+
+    #[tokio::test]
+    async fn post_sign_rejects_bad_signature_hex() {
+        let k = Arc::new(JobsKernel::default());
+        let body = SignBodyJson {
+            signature: "zz".into(),
+            s2c_nonce: hex32(0x01),
+        };
+        let err = post_sign(State(k), Path("j1".into()), JsonBody(body))
+            .await
+            .expect_err("bad signature");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("signature"),
+            "message must name signature, got {}",
+            err.body.message
+        );
+    }
+
+    #[tokio::test]
+    async fn post_sign_rejects_bad_s2c_nonce_hex() {
+        let k = Arc::new(JobsKernel::default());
+        let body = SignBodyJson {
+            signature: hex64(0x01),
+            s2c_nonce: "zz".into(),
+        };
+        let err = post_sign(State(k), Path("j1".into()), JsonBody(body))
+            .await
+            .expect_err("bad s2c_nonce");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("s2c_nonce"),
+            "message must name s2c_nonce, got {}",
+            err.body.message
+        );
+    }
+
+    #[tokio::test]
+    async fn post_sign_success_returns_ok() {
+        let mut job = sample_job("proving");
+        job.job_id = "job-sign".into();
+        let k = Arc::new(JobsKernel {
+            sign: Some(Ok(job)),
+            ..Default::default()
+        });
+        let body = SignBodyJson {
+            signature: hex64(0x01),
+            s2c_nonce: hex32(0x02),
+        };
+        let res = post_sign(State(k), Path("job-sign".into()), JsonBody(body))
+            .await
+            .expect("post_sign ok");
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn post_cancel_success_returns_ok() {
+        let mut job = sample_job("cancelled");
+        job.job_id = "job-cancel".into();
+        job.error = Some(crate::kernel::kernel_v1::JobError {
+            error: "proving_failed".into(),
+            message: "cancelled by client".into(),
+        });
+        let k = Arc::new(JobsKernel {
+            cancel: Some(Ok(job)),
+            ..Default::default()
+        });
+        let res = post_cancel(State(k), Path("job-cancel".into()))
+            .await
+            .expect("post_cancel ok");
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn post_cancel_foreign_job_id_is_internal() {
+        let mut job = sample_job("cancelled");
+        job.job_id = "other-id".into();
+        job.error = Some(crate::kernel::kernel_v1::JobError {
+            error: "proving_failed".into(),
+            message: "cancelled by client".into(),
+        });
+        let k = Arc::new(JobsKernel {
+            cancel: Some(Ok(job)),
+            ..Default::default()
+        });
+        let err = post_cancel(State(k), Path("job-cancel".into()))
+            .await
+            .expect_err("foreign job_id");
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn job_event_to_sse_phase_complete_error_success_and_invalid_job() {
+        let phase = JobEvent {
+            event: "phase".into(),
+            job: Some(sample_job("accepted")),
+        };
+        job_event_to_sse(&phase, "j1").expect("phase ok");
+
+        let mut completed = sample_job("completed");
+        completed.result = Some(sample_transition_result());
+        let complete = JobEvent {
+            event: "complete".into(),
+            job: Some(completed),
+        };
+        job_event_to_sse(&complete, "j1").expect("complete ok");
+
+        let mut failed = sample_job("failed");
+        failed.error = Some(crate::kernel::kernel_v1::JobError {
+            error: "proving_failed".into(),
+            message: "x".into(),
+        });
+        let error_ev = JobEvent {
+            event: "error".into(),
+            job: Some(failed),
+        };
+        job_event_to_sse(&error_ev, "j1").expect("error ok");
+
+        let bad = JobEvent {
+            event: "phase".into(),
+            job: Some(sample_job("totally_unknown_phase")),
+        };
+        let err = job_event_to_sse(&bad, "j1").expect_err("invalid job");
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn phase_event_data_omits_empty_phase_key() {
+        let job = sample_job("proving");
+        let data = phase_event_data(&job).expect("phase data");
+        assert_eq!(data["status"], "proving");
+        assert!(data.get("progress").is_some());
+        assert!(
+            data.get("phase").is_none(),
+            "empty phase must not emit phase key"
+        );
+    }
+
+    #[test]
+    fn phase_event_data_awaiting_signature_short_digest_is_internal() {
+        let mut job = sample_job("awaiting_signature");
+        let mut a = sample_awaiting_signature();
+        a.nav_commitment = vec![0x55; 16];
+        job.awaiting_signature = Some(a);
+        let err = phase_event_data(&job).expect_err("short digest");
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn phase_event_data_awaiting_signature_without_payload_omits_key() {
+        let job = sample_job("awaiting_signature");
+        let data = phase_event_data(&job).expect("no validate_job");
+        assert_eq!(data["status"], "awaiting_signature");
+        assert!(
+            data.get("awaiting_signature").is_none(),
+            "missing payload must omit awaiting_signature key"
+        );
+    }
+
+    #[test]
+    fn json_to_transition_hex_decode_errors() {
+        let mut v = mint_json();
+        v["next_pubkey"] = serde_json::json!("zz");
+        let err = json_to_transition(serde_json::from_value(v).unwrap()).expect_err("next_pubkey");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("next_pubkey"));
+
+        let mut v = mint_json();
+        v["npk_rand"] = serde_json::json!("zz");
+        let err = json_to_transition(serde_json::from_value(v).unwrap()).expect_err("npk_rand");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("npk_rand"));
+
+        let mut v = receive_json();
+        v["publisher_pubkey"] = serde_json::json!("zz");
+        let err =
+            json_to_transition(serde_json::from_value(v).unwrap()).expect_err("publisher_pubkey");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("publisher_pubkey"));
+
+        let mut v = send_json();
+        v["input_coins"] = serde_json::json!(["zz"]);
+        let err = json_to_transition(serde_json::from_value(v).unwrap()).expect_err("input_coins");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("input_coins[0]"));
+
+        let mut v = receive_json();
+        v["fold_coin_ids"] = serde_json::json!(["zz"]);
+        let err =
+            json_to_transition(serde_json::from_value(v).unwrap()).expect_err("fold_coin_ids");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("fold_coin_ids[0]"));
+
+        let mut v = receive_json();
+        v["genesis_pubkey"] = serde_json::json!("zz");
+        let err =
+            json_to_transition(serde_json::from_value(v).unwrap()).expect_err("genesis_pubkey");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("genesis_pubkey"));
+    }
+
+    #[test]
+    fn json_to_transition_rejects_empty_subject() {
+        let mut v = mint_json();
+        v["subject"] = serde_json::json!("");
+        let err =
+            json_to_transition(serde_json::from_value(v).unwrap()).expect_err("empty subject");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("subject is required"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_output_template_rejects_bad_asset_id() {
+        let mut v = mint_json();
+        v["output_templates"][0]["asset_id"] = serde_json::json!("zz");
+        let err = json_to_transition(serde_json::from_value(v).unwrap()).expect_err("asset_id");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("output_templates[0].asset_id"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_delivery_profile_rejects_bad_event_id() {
+        let mut v = mint_with_profile_delivery();
+        v["output_templates"][0]["delivery"]["event"]["id"] = serde_json::json!("zz");
+        let err = json_to_transition(serde_json::from_value(v).unwrap()).expect_err("event.id");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body
+                .message
+                .contains("output_templates[0].delivery.event.id"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_invoice_hex_field_decode_errors() {
+        let fields = [
+            "asset_id",
+            "pk0",
+            "nk_commit",
+            "ivpk",
+            "op_pubkey",
+            "addr_sig",
+            "sig",
+        ];
+        for field in fields {
+            let mut v = mint_with_invoice_delivery();
+            v["output_templates"][0]["delivery"]["invoice"][field] = serde_json::json!("zz");
+            let err = json_to_transition(serde_json::from_value(v).unwrap()).expect_err(field);
+            assert_eq!(err.body.error, "malformed_request");
+            let path = format!("output_templates[0].delivery.invoice.{field}");
+            assert!(
+                err.body.message.contains(&path),
+                "message must name {path}, got {}",
+                err.body.message
+            );
+            assert!(
+                !err.body.message.contains(&distinctive_pk0()),
+                "must not echo pk0, got {}",
+                err.body.message
+            );
+            assert!(
+                !err.body.message.contains(&distinctive_memo()),
+                "must not echo memo, got {}",
+                err.body.message
+            );
+        }
+    }
+
+    #[test]
+    fn json_to_kind0_event_hex_field_decode_errors() {
+        for field in ["id", "pubkey", "sig"] {
+            let mut v = mint_with_profile_delivery();
+            v["output_templates"][0]["delivery"]["event"][field] = serde_json::json!("zz");
+            let err = json_to_transition(serde_json::from_value(v).unwrap()).expect_err(field);
+            assert_eq!(err.body.error, "malformed_request");
+            let path = format!("output_templates[0].delivery.event.{field}");
+            assert!(
+                err.body.message.contains(&path),
+                "message must name {path}, got {}",
+                err.body.message
+            );
+        }
+    }
+
+    #[test]
+    fn json_to_issuance_rejects_bad_creator_pubkey() {
+        let mut v = mint_json();
+        v["issuance"]["creator_pubkey"] = serde_json::json!("zz");
+        let err =
+            json_to_transition(serde_json::from_value(v).unwrap()).expect_err("creator_pubkey");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("creator_pubkey"));
+    }
+
+    #[test]
+    fn json_to_issuance_v2_rejects_bad_terms_salt() {
+        let mut v = mint_json();
+        v["issuance"]["issuance_version"] = serde_json::json!(2);
+        v["issuance"]["cap_total"] = serde_json::json!("5000");
+        v["issuance"]["terms_salt"] = serde_json::json!("zz");
+        let err = json_to_transition(serde_json::from_value(v).unwrap()).expect_err("terms_salt");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(err.body.message.contains("terms_salt"));
+    }
+
+    #[test]
+    fn idempotency_key_non_ascii_is_malformed() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "idempotency-key",
+            HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        let err = idempotency_key_from_headers(&headers).expect_err("non-ascii");
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("ASCII"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn job_to_json_rejects_unknown_status() {
+        let err = job_to_json(&sample_job("totally_unknown_phase")).expect_err("unknown");
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn job_to_json_awaiting_signature_short_digest_is_internal() {
+        let mut job = sample_job("awaiting_signature");
+        let mut a = sample_awaiting_signature();
+        a.nav_commitment = vec![0x55; 16];
+        job.awaiting_signature = Some(a);
+        let err = job_to_json(&job).expect_err("short digest");
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn job_to_json_result_short_publisher_pubkey_is_internal() {
+        let mut job = sample_job("completed");
+        job.result = Some(crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![0x11; 32],
+            output_coins_root: vec![0x22; 32],
+            input_nullifiers_root: vec![0x33; 32],
+            output_coin_ids: vec![],
+            publisher_pubkey: vec![0xBB; 16],
+            attestation: vec![],
+        });
+        let err = job_to_json(&job).expect_err("short publisher_pubkey");
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn job_to_json_result_short_output_coin_id_is_internal() {
+        let mut job = sample_job("completed");
+        job.result = Some(crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![0x11; 32],
+            output_coins_root: vec![0x22; 32],
+            input_nullifiers_root: vec![0x33; 32],
+            output_coin_ids: vec![vec![0xAA; 16]],
+            publisher_pubkey: vec![],
+            attestation: vec![],
+        });
+        let err = job_to_json(&job).expect_err("short output_coin_ids");
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn awaiting_signature_json_rejects_each_short_digest() {
+        let fields: &[(&str, fn(&mut AwaitingSignature))] = &[
+            ("new_account_state_hash", |a| {
+                a.new_account_state_hash = vec![0x11; 16];
+            }),
+            ("output_coins_root", |a| {
+                a.output_coins_root = vec![0x22; 16];
+            }),
+            ("input_nullifiers_root", |a| {
+                a.input_nullifiers_root = vec![0x33; 16];
+            }),
+            ("coin_history_root", |a| {
+                a.coin_history_root = vec![0x44; 16];
+            }),
+            ("nav_commitment", |a| {
+                a.nav_commitment = vec![0x55; 16];
+            }),
+            ("npk_commit", |a| {
+                a.npk_commit = vec![0x66; 16];
+            }),
+            ("proof_data_hash", |a| {
+                a.proof_data_hash = vec![0x77; 16];
+            }),
+            ("txn_pubkey", |a| {
+                a.txn_pubkey = vec![0x88; 16];
+            }),
+        ];
+        for (name, mutate) in fields {
+            let mut a = sample_awaiting_signature();
+            mutate(&mut a);
+            let err = awaiting_signature_json(&a).expect_err(*name);
+            assert_eq!(err.body.error, "internal_error");
+            let cause = err.cause().unwrap_or("");
+            assert!(
+                cause.contains(name) || err.body.message.contains(name),
+                "must name {name}, cause={cause:?} message={}",
+                err.body.message
+            );
+        }
+    }
+
+    #[test]
+    fn job_poll_headers_awaiting_signature_is_zero() {
+        let mut job = sample_job("awaiting_signature");
+        job.awaiting_signature = Some(sample_awaiting_signature());
+        let (status, retry) = job_poll_headers(&job).expect("headers");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(retry, Some(0));
+    }
+
+    #[tokio::test]
+    async fn get_job_awaiting_signature_sets_retry_after_zero() {
+        let mut job = sample_job("awaiting_signature");
+        job.job_id = "job-await".into();
+        job.awaiting_signature = Some(sample_awaiting_signature());
+        let k = Arc::new(JobsKernel {
+            get: Some(Ok(job)),
+            ..Default::default()
+        });
+        let res = get_job(State(k), Path("job-await".into()))
+            .await
+            .expect("get_job ok");
+        assert_eq!(res.status(), StatusCode::OK);
+        let ra = res
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("retry-after present");
+        assert_eq!(ra.to_str().unwrap(), "0");
     }
 }
