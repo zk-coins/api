@@ -14,11 +14,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let include = manifest_dir.join("../proto");
 
     println!("cargo:rerun-if-changed={}", proto.display());
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TEST_SERVER");
 
-    // Pure client: the api never hosts a kernel service. In-process handler
-    // tests use a trait double (`KernelRpc`), not generated server stubs.
+    // Production remains pure-client. Server stubs exist only when api's
+    // dev-dependency enables `test-server` for in-memory transport tests.
+    let build_test_server = env::var_os("CARGO_FEATURE_TEST_SERVER").is_some();
     tonic_build::configure()
-        .build_server(false)
+        .build_server(build_test_server)
         .build_client(true)
         .compile_protos(&[proto], &[include])?;
 

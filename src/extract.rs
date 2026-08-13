@@ -95,13 +95,20 @@ pub fn bytes_rejection_to_api_error(rejection: BytesRejection) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
+    use axum::body::{Body, Bytes};
     use axum::http::{Request, StatusCode};
     use serde::Deserialize;
 
     #[derive(Debug, Deserialize)]
     struct Tiny {
         x: u32,
+    }
+
+    fn broken_body() -> Body {
+        let stream = futures_util::stream::iter([Err::<Bytes, std::io::Error>(
+            std::io::Error::other("broken pipe"),
+        )]);
+        Body::from_stream(stream)
     }
 
     #[tokio::test]
@@ -149,5 +156,50 @@ mod tests {
             .unwrap();
         let JsonBody(v) = JsonBody::<Tiny>::from_request(req, &()).await.expect("ok");
         assert_eq!(v.x, 7);
+    }
+
+    #[tokio::test]
+    async fn json_body_failed_buffer_is_malformed_request() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .body(broken_body())
+            .unwrap();
+        let err = JsonBody::<Tiny>::from_request(req, &())
+            .await
+            .expect_err("broken body");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+    }
+
+    #[tokio::test]
+    async fn limited_bytes_failed_buffer_is_malformed_request() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .body(broken_body())
+            .unwrap();
+        let err = match LimitedBytes::from_request(req, &()).await {
+            Err(err) => err,
+            Ok(_) => panic!("broken body must be rejected"),
+        };
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+    }
+
+    #[tokio::test]
+    async fn json_body_data_error_is_malformed_request() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":"not-a-number"}"#))
+            .unwrap();
+        let err = JsonBody::<Tiny>::from_request(req, &())
+            .await
+            .expect_err("type mismatch");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
     }
 }

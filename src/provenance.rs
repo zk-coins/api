@@ -10,8 +10,8 @@ use serde_json::{json, Map, Value};
 
 use crate::error::ApiError;
 use crate::hexutil::{decode_hex_exact, encode_hex};
-use crate::kernel::KernelHandle;
 use crate::kernel::kernel_v1::{GetTokenProvenanceRequest, TokenProvenance};
+use crate::kernel::KernelHandle;
 
 /// Returns captured issuance terms for an asset when the node holds them.
 ///

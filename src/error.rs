@@ -151,4 +151,12 @@ mod tests {
         );
         assert!(text.contains(PUBLIC_INTERNAL_MESSAGE));
     }
+
+    #[test]
+    fn not_found_is_404_with_code_and_passthrough_message() {
+        let err = ApiError::not_found("unknown blob_id");
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+        assert_eq!(err.body.error, "not_found");
+        assert_eq!(err.body.message, "unknown blob_id");
+    }
 }

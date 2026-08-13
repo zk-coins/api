@@ -1990,4 +1990,861 @@ mod tests {
         assert_eq!(req.kind, "receive");
         assert_eq!(req.genesis_pubkey, vec![0xD0u8; 32]);
     }
+
+    // -----------------------------------------------------------------------
+    // Helpers for uncovered validate_job / parser / projection paths
+    // -----------------------------------------------------------------------
+
+    fn sample_awaiting_signature() -> AwaitingSignature {
+        AwaitingSignature {
+            new_account_state_hash: vec![0x11; 32],
+            output_coins_root: vec![0x22; 32],
+            input_nullifiers_root: vec![0x33; 32],
+            coin_history_root: vec![0x44; 32],
+            nav_commitment: vec![0x55; 32],
+            npk_commit: vec![0x66; 32],
+            proof_data_hash: vec![0x77; 32],
+            txn_pubkey: vec![0x88; 32],
+            send_counter: 7,
+        }
+    }
+
+    fn sample_transition_result() -> crate::kernel::kernel_v1::JobResult {
+        crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![0x11; 32],
+            output_coins_root: vec![0x22; 32],
+            input_nullifiers_root: vec![0x33; 32],
+            output_coin_ids: vec![],
+            publisher_pubkey: vec![],
+            attestation: vec![],
+        }
+    }
+
+    fn send_json() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "send",
+            "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "next_pubkey": hex32(0x11),
+            "npk_rand": hex32(0x22),
+            "input_coins": [hex32(0x01)],
+            "output_templates": [{
+                "recipient": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+                "asset_id": hex32(0x33),
+                "amount": "100"
+            }]
+        })
+    }
+
+    fn receive_json() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "receive",
+            "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "next_pubkey": hex32(0x11),
+            "npk_rand": hex32(0x22),
+            "fold_coin_ids": [hex32(0x33)]
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // is_transition_job_kind
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_transition_job_kind_closed_set() {
+        assert!(is_transition_job_kind("mint"));
+        assert!(is_transition_job_kind("send"));
+        assert!(is_transition_job_kind("receive"));
+        assert!(!is_transition_job_kind("attest_balance"));
+        assert!(!is_transition_job_kind("foo"));
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_job — uncovered exclusivity / shape arms
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_job_rejects_unknown_kind() {
+        let mut job = sample_job("accepted");
+        job.kind = "not_a_closed_kind".into();
+        let err = validate_job(&job).expect_err("unknown kind");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("not_a_closed_kind")
+                || err.cause().unwrap_or("").contains("closed"),
+            "cause must name the foreign kind, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn validate_job_awaiting_signature_requires_payload() {
+        let job = sample_job("awaiting_signature");
+        let err = validate_job(&job).expect_err("missing awaiting_signature");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("awaiting_signature")
+                || err.cause().unwrap_or("").contains("absent"),
+            "cause must name absent awaiting_signature, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn validate_job_awaiting_signature_rejects_result() {
+        let mut job = sample_job("awaiting_signature");
+        job.awaiting_signature = Some(sample_awaiting_signature());
+        job.result = Some(sample_transition_result());
+        let err = validate_job(&job).expect_err("result with awaiting_signature");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("result")
+                || err.cause().unwrap_or("").contains("error"),
+            "cause must name result/error exclusivity, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn validate_job_awaiting_signature_rejects_error() {
+        let mut job = sample_job("awaiting_signature");
+        job.awaiting_signature = Some(sample_awaiting_signature());
+        job.error = Some(crate::kernel::kernel_v1::JobError {
+            error: "proving_failed".into(),
+            message: "x".into(),
+        });
+        let err = validate_job(&job).expect_err("error with awaiting_signature");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("result")
+                || err.cause().unwrap_or("").contains("error"),
+            "cause must name result/error exclusivity, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn validate_job_attest_balance_must_not_await_signature() {
+        let mut job = sample_job("awaiting_signature");
+        job.kind = "attest_balance".into();
+        job.awaiting_signature = Some(sample_awaiting_signature());
+        let err = validate_job(&job).expect_err("attest_balance awaiting_signature");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("attest_balance")
+                || err.cause().unwrap_or("").contains("awaiting_signature"),
+            "cause must name kind / awaiting_signature, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn validate_job_completed_rejects_awaiting_signature() {
+        let mut job = sample_job("completed");
+        job.result = Some(sample_transition_result());
+        job.awaiting_signature = Some(sample_awaiting_signature());
+        let err = validate_job(&job).expect_err("completed + awaiting_signature");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("awaiting_signature")
+                || err.cause().unwrap_or("").contains("error"),
+            "cause must name exclusivity, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn validate_job_completed_rejects_error() {
+        let mut job = sample_job("completed");
+        job.result = Some(sample_transition_result());
+        job.error = Some(crate::kernel::kernel_v1::JobError {
+            error: "proving_failed".into(),
+            message: "x".into(),
+        });
+        let err = validate_job(&job).expect_err("completed + error");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("awaiting_signature")
+                || err.cause().unwrap_or("").contains("error"),
+            "cause must name exclusivity, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn validate_job_failed_rejects_awaiting_signature() {
+        let mut job = sample_job("failed");
+        job.error = Some(crate::kernel::kernel_v1::JobError {
+            error: "proving_failed".into(),
+            message: "x".into(),
+        });
+        job.awaiting_signature = Some(sample_awaiting_signature());
+        let err = validate_job(&job).expect_err("failed + awaiting_signature");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("awaiting_signature")
+                || err.cause().unwrap_or("").contains("result"),
+            "cause must name exclusivity, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn validate_job_cancelled_rejects_result() {
+        let mut job = sample_job("cancelled");
+        job.error = Some(crate::kernel::kernel_v1::JobError {
+            error: "proving_failed".into(),
+            message: "x".into(),
+        });
+        job.result = Some(sample_transition_result());
+        let err = validate_job(&job).expect_err("cancelled + result");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("awaiting_signature")
+                || err.cause().unwrap_or("").contains("result"),
+            "cause must name exclusivity, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn validate_job_transition_rejects_short_new_account_state_hash() {
+        let mut job = sample_job("completed");
+        job.result = Some(crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![0x11; 16],
+            output_coins_root: vec![0x22; 32],
+            input_nullifiers_root: vec![0x33; 32],
+            output_coin_ids: vec![],
+            publisher_pubkey: vec![],
+            attestation: vec![],
+        });
+        let err = validate_job(&job).expect_err("short new_account_state_hash");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("new_account_state_hash"),
+            "cause must name new_account_state_hash, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn validate_job_transition_rejects_short_output_coins_root() {
+        let mut job = sample_job("completed");
+        job.result = Some(crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![0x11; 32],
+            output_coins_root: vec![0x22; 16],
+            input_nullifiers_root: vec![0x33; 32],
+            output_coin_ids: vec![],
+            publisher_pubkey: vec![],
+            attestation: vec![],
+        });
+        let err = validate_job(&job).expect_err("short output_coins_root");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("output_coins_root"),
+            "cause must name output_coins_root, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn validate_job_transition_rejects_short_input_nullifiers_root() {
+        let mut job = sample_job("completed");
+        job.result = Some(crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![0x11; 32],
+            output_coins_root: vec![0x22; 32],
+            input_nullifiers_root: vec![0x33; 16],
+            output_coin_ids: vec![],
+            publisher_pubkey: vec![],
+            attestation: vec![],
+        });
+        let err = validate_job(&job).expect_err("short input_nullifiers_root");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("input_nullifiers_root"),
+            "cause must name input_nullifiers_root, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn validate_job_result_for_kind_rejects_unknown_kind() {
+        let result = sample_transition_result();
+        let err = validate_job_result_for_kind("not_a_kind", &result).expect_err("unknown kind");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("not_a_kind"),
+            "cause must name the kind string, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn validate_job_awaiting_signature_happy_path() {
+        let mut job = sample_job("awaiting_signature");
+        job.awaiting_signature = Some(sample_awaiting_signature());
+        validate_job(&job).expect("valid mint awaiting_signature must pass");
+    }
+
+    // -----------------------------------------------------------------------
+    // SSE event name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_sse_event_status_rejects_unknown_event_name() {
+        let err = validate_sse_event_status("not_an_sse_name", &sample_job("accepted"))
+            .expect_err("unknown SSE name");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("not_an_sse_name"),
+            "cause must name the event, got {:?}",
+            err.cause()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Debug redaction on DeliveryCredentialJson / Kind0EventJson
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn delivery_credential_invoice_debug_redacts_contents() {
+        let invoice: InvoiceJson =
+            serde_json::from_value(sample_invoice_json()).expect("invoice shape");
+        let cred = DeliveryCredentialJson::Invoice { invoice };
+        let dbg = format!("{cred:?}");
+        assert!(
+            dbg.contains("Invoice") && dbg.contains("redacted"),
+            "Debug must name Invoice arm and redaction, got {dbg}"
+        );
+        assert!(
+            !dbg.contains(&distinctive_pk0()),
+            "Debug must not contain pk0, got {dbg}"
+        );
+        assert!(
+            !dbg.contains(&distinctive_memo()),
+            "Debug must not contain memo, got {dbg}"
+        );
+    }
+
+    #[test]
+    fn delivery_credential_profile_debug_redacts_contents() {
+        let event: Kind0EventJson =
+            serde_json::from_value(sample_profile_event_json()).expect("profile shape");
+        let cred = DeliveryCredentialJson::Profile { event };
+        let dbg = format!("{cred:?}");
+        assert!(
+            dbg.contains("Profile") && dbg.contains("redacted"),
+            "Debug must name Profile arm and redaction, got {dbg}"
+        );
+        assert!(
+            !dbg.contains(&distinctive_pk0()),
+            "Debug must not contain pk0, got {dbg}"
+        );
+    }
+
+    #[test]
+    fn kind0_event_json_debug_redacts_sensitive_fields() {
+        let event: Kind0EventJson =
+            serde_json::from_value(sample_profile_event_json()).expect("profile shape");
+        let dbg = format!("{event:?}");
+        assert!(
+            dbg.contains("created_at") && dbg.contains("1700000000"),
+            "created_at must remain visible, got {dbg}"
+        );
+        assert!(
+            dbg.contains("kind") && dbg.contains("0"),
+            "kind must remain visible, got {dbg}"
+        );
+        assert!(
+            !dbg.contains(&distinctive_pk0()),
+            "Debug must not contain pk0 from content, got {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "id/pubkey/sig must be redacted, got {dbg}"
+        );
+        assert!(
+            dbg.contains("redacted content") || dbg.contains("<redacted content"),
+            "content must be redacted, got {dbg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // json_to_transition — kind presence rules
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn json_to_transition_rejects_unknown_kind() {
+        let mut v = receive_json();
+        v["kind"] = serde_json::json!("swap");
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("unknown kind");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("mint|send|receive"),
+            "message must list allowed kinds, got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_transition_forwards_publisher_pubkey() {
+        let mut v = receive_json();
+        v["publisher_pubkey"] = serde_json::json!(hex32(0xAB));
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let req = json_to_transition(parsed).expect("receive with publisher_pubkey");
+        assert_eq!(req.publisher_pubkey, vec![0xAB; 32]);
+    }
+
+    #[test]
+    fn json_to_transition_send_requires_input_coins() {
+        let mut v = send_json();
+        v["input_coins"] = serde_json::json!([]);
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("empty input_coins");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body
+                .message
+                .contains("kind=send requires non-empty input_coins"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_transition_send_requires_output_templates() {
+        let mut v = send_json();
+        v["output_templates"] = serde_json::json!([]);
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("empty output_templates");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body
+                .message
+                .contains("kind=send requires non-empty output_templates"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_transition_send_must_not_carry_fold_coin_ids() {
+        let mut v = send_json();
+        v["fold_coin_ids"] = serde_json::json!([hex32(0x99)]);
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("send + fold_coin_ids");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body
+                .message
+                .contains("kind=send must not carry fold_coin_ids"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_transition_send_must_not_carry_issuance() {
+        let mut v = send_json();
+        v["issuance"] = serde_json::json!({
+            "name": "TestCoin",
+            "decimals": 8,
+            "issuance_version": 1,
+            "amount": "1000",
+            "creator_pubkey": hex32(0x44)
+        });
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("send + issuance");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body
+                .message
+                .contains("kind=send must not carry issuance"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_transition_mint_must_not_carry_input_coins() {
+        let mut v = mint_json();
+        v["input_coins"] = serde_json::json!([hex32(0x01)]);
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("mint + input_coins");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body
+                .message
+                .contains("kind=mint must not carry input_coins"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_transition_mint_must_not_carry_fold_coin_ids() {
+        let mut v = mint_json();
+        v["fold_coin_ids"] = serde_json::json!([hex32(0x99)]);
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("mint + fold_coin_ids");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body
+                .message
+                .contains("kind=mint must not carry fold_coin_ids"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_transition_mint_requires_output_templates() {
+        let mut v = mint_json();
+        v["output_templates"] = serde_json::json!([]);
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("mint empty outputs");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body
+                .message
+                .contains("kind=mint requires non-empty output_templates"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_transition_mint_requires_issuance() {
+        let mut v = mint_json();
+        v.as_object_mut().unwrap().remove("issuance");
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("mint without issuance");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("kind=mint requires issuance"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_transition_receive_must_not_carry_input_coins() {
+        let mut v = receive_json();
+        v["input_coins"] = serde_json::json!([hex32(0x01)]);
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("receive + input_coins");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body
+                .message
+                .contains("kind=receive must not carry input_coins"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_transition_receive_must_not_carry_output_templates() {
+        let mut v = receive_json();
+        v["output_templates"] = serde_json::json!([{
+            "recipient": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "asset_id": hex32(0x33),
+            "amount": "100"
+        }]);
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("receive + output_templates");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body
+                .message
+                .contains("kind=receive must not carry output_templates"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_transition_receive_requires_fold_coin_ids() {
+        let mut v = receive_json();
+        v["fold_coin_ids"] = serde_json::json!([]);
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("empty fold_coin_ids");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body
+                .message
+                .contains("kind=receive requires non-empty fold_coin_ids"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_transition_receive_must_not_carry_issuance() {
+        let mut v = receive_json();
+        v["issuance"] = serde_json::json!({
+            "name": "TestCoin",
+            "decimals": 8,
+            "issuance_version": 1,
+            "amount": "1000",
+            "creator_pubkey": hex32(0x44)
+        });
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("receive + issuance");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body
+                .message
+                .contains("kind=receive must not carry issuance"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // json_to_issuance (via mint body)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn json_to_issuance_rejects_unknown_version() {
+        let mut v = mint_json();
+        v["issuance"]["issuance_version"] = serde_json::json!(3);
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("issuance_version 3");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("issuance_version must be 1 or 2"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_issuance_v2_requires_cap_total() {
+        let mut v = mint_json();
+        v["issuance"]["issuance_version"] = serde_json::json!(2);
+        v["issuance"]["terms_salt"] = serde_json::json!(hex32(0x55));
+        // cap_total intentionally absent
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("v2 without cap_total");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body
+                .message
+                .contains("issuance_version=2 requires cap_total"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_issuance_v2_requires_terms_salt() {
+        let mut v = mint_json();
+        v["issuance"]["issuance_version"] = serde_json::json!(2);
+        v["issuance"]["cap_total"] = serde_json::json!("5000");
+        // terms_salt intentionally absent
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("v2 without terms_salt");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body
+                .message
+                .contains("issuance_version=2 requires terms_salt"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn json_to_issuance_v2_happy_path() {
+        let mut v = mint_json();
+        v["issuance"]["issuance_version"] = serde_json::json!(2);
+        v["issuance"]["cap_total"] = serde_json::json!("5000");
+        v["issuance"]["terms_salt"] = serde_json::json!(hex32(0x55));
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let req = json_to_transition(parsed).expect("issuance v2");
+        let iss = req.issuance.as_ref().expect("issuance present");
+        assert_eq!(iss.issuance_version, 2);
+        assert_eq!(iss.cap_total, "5000");
+        assert_eq!(iss.terms_salt, vec![0x55; 32]);
+    }
+
+    #[test]
+    fn json_to_issuance_v1_must_not_carry_cap_or_salt() {
+        let mut v = mint_json();
+        v["issuance"]["cap_total"] = serde_json::json!("5000");
+        let parsed: TransitionRequestJson = serde_json::from_value(v).expect("shape ok");
+        let err = json_to_transition(parsed).expect_err("v1 + cap_total");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body
+                .message
+                .contains("issuance_version=1 must not carry cap_total or terms_salt"),
+            "got {}",
+            err.body.message
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Idempotency key length
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn idempotency_key_exceeds_64_bytes_is_malformed() {
+        let key = "a".repeat(65);
+        let err = parse_idempotency_key_value(&key).expect_err("65 bytes");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("64"),
+            "message must mention 64-byte limit, got {}",
+            err.body.message
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // job_to_json / awaiting_signature_json / job_result_json / require_hex32
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn job_to_json_includes_phase_for_non_terminal() {
+        let mut job = sample_job("proving");
+        job.phase = "witness".into();
+        let json = job_to_json(&job).expect("project");
+        assert_eq!(json["phase"], "witness");
+    }
+
+    #[test]
+    fn job_to_json_projects_awaiting_signature_fields() {
+        let mut job = sample_job("awaiting_signature");
+        job.awaiting_signature = Some(sample_awaiting_signature());
+        let json = job_to_json(&job).expect("project");
+        let a = &json["awaiting_signature"];
+        assert!(a.is_object(), "awaiting_signature must be an object");
+        assert_eq!(a["new_account_state_hash"], hex32(0x11));
+        assert_eq!(a["output_coins_root"], hex32(0x22));
+        assert_eq!(a["input_nullifiers_root"], hex32(0x33));
+        assert_eq!(a["coin_history_root"], hex32(0x44));
+        assert_eq!(a["nav_commitment"], hex32(0x55));
+        assert_eq!(a["npk_commit"], hex32(0x66));
+        assert_eq!(a["proof_data_hash"], hex32(0x77));
+        assert_eq!(a["txn_pubkey"], hex32(0x88));
+        assert_eq!(a["send_counter"], 7);
+    }
+
+    #[test]
+    fn job_to_json_projects_completed_transition_result() {
+        let mut job = sample_job("completed");
+        job.result = Some(crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![0x11; 32],
+            output_coins_root: vec![0x22; 32],
+            input_nullifiers_root: vec![0x33; 32],
+            output_coin_ids: vec![vec![0xAA; 32]],
+            publisher_pubkey: vec![0xBB; 32],
+            attestation: vec![],
+        });
+        let json = job_to_json(&job).expect("project");
+        let r = &json["result"];
+        assert_eq!(r["new_account_state_hash"], hex32(0x11));
+        assert_eq!(r["output_coins_root"], hex32(0x22));
+        assert_eq!(r["input_nullifiers_root"], hex32(0x33));
+        assert_eq!(r["output_coin_ids"][0], hex32(0xAA));
+        assert_eq!(r["publisher_pubkey"], hex32(0xBB));
+    }
+
+    #[test]
+    fn require_hex32_rejects_wrong_length() {
+        let err = require_hex32(&[0u8; 16], "nav_commitment").expect_err("16 bytes");
+        assert_eq!(err.body.error, "internal_error");
+        let cause = err.cause().unwrap_or("");
+        assert!(
+            cause.contains("nav_commitment") && cause.contains("16"),
+            "cause must name field and length, got {cause:?}"
+        );
+    }
+
+    #[test]
+    fn awaiting_signature_json_rejects_short_digest() {
+        let mut a = sample_awaiting_signature();
+        a.nav_commitment = vec![0x55; 16];
+        let err = awaiting_signature_json(&a).expect_err("short nav_commitment");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("nav_commitment"),
+            "cause must name nav_commitment, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn job_result_json_rejects_short_publisher_pubkey() {
+        let r = crate::kernel::kernel_v1::JobResult {
+            new_account_state_hash: vec![],
+            output_coins_root: vec![],
+            input_nullifiers_root: vec![],
+            output_coin_ids: vec![],
+            publisher_pubkey: vec![0xBB; 16],
+            attestation: vec![],
+        };
+        let err = job_result_json(&r).expect_err("short publisher_pubkey");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause()
+                .unwrap_or("")
+                .contains("result.publisher_pubkey"),
+            "cause must name result.publisher_pubkey, got {:?}",
+            err.cause()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // job_event_to_sse / phase_event_data
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn job_event_to_sse_requires_job_payload() {
+        let ev = JobEvent {
+            event: "phase".into(),
+            job: None,
+        };
+        let err = job_event_to_sse(&ev).expect_err("missing job");
+        assert_eq!(err.body.error, "internal_error");
+        assert!(
+            err.cause().unwrap_or("").contains("missing")
+                || err.cause().unwrap_or("").contains("job"),
+            "cause must name missing job payload, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn phase_event_data_embeds_awaiting_signature() {
+        let mut job = sample_job("awaiting_signature");
+        job.phase = "sign".into();
+        job.awaiting_signature = Some(sample_awaiting_signature());
+        let data = phase_event_data(&job).expect("phase data");
+        assert_eq!(data["status"], "awaiting_signature");
+        assert!(
+            data.get("awaiting_signature").is_some(),
+            "phase data must embed awaiting_signature"
+        );
+        assert_eq!(data["awaiting_signature"]["send_counter"], 7);
+    }
 }

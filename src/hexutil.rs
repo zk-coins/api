@@ -92,13 +92,14 @@ mod tests {
                 assert_eq!(expected_chars, 64);
                 assert_eq!(got_chars, 2);
             }
-            other => panic!("expected Length, got {other:?}"),
+            HexError::InvalidChar(b) => panic!("expected Length, got InvalidChar({b})"),
         }
     }
 
     #[test]
     fn rejects_non_hex() {
         let err = decode_hex_exact("zz", 1).unwrap_err();
-        assert!(matches!(err, HexError::InvalidChar(_)));
+        assert!(matches!(&err, HexError::InvalidChar(_)));
+        assert_eq!(err.to_string(), "invalid hex character 0x7a");
     }
 }

@@ -66,3 +66,9 @@ kernel-proto = { path = "kernel-proto" }
 # Same versions as node/Cargo.toml [dev-dependencies] where shared.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Generated service and tonic router are test-target-only: resolver v2 keeps
+# these features out of ordinary api library/binary builds.
+kernel-proto = { path = "kernel-proto", features = ["test-server"] }
+tonic = { version = "0.13.1", default-features = false, features = ["router"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1", features = ["io-util"] }

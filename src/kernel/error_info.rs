@@ -174,7 +174,10 @@ impl KernelProcedure {
     fn allowed_reasons(self) -> &'static [&'static str] {
         match self {
             Self::GetTokenProvenance => &[
-                "malformed_request", "not_found", "rate_limited", "internal_error",
+                "malformed_request",
+                "not_found",
+                "rate_limited",
+                "internal_error",
             ],
             Self::GetInfo | Self::GetAccumulator => &["internal_error"],
             Self::ListInscriptions => &[
@@ -499,6 +502,17 @@ mod tests {
     use prost::Message;
     use tonic_types::ErrorDetails;
 
+    fn status_with_metadata(
+        code: Code,
+        message: &str,
+        reason: &str,
+        domain: &str,
+        metadata: HashMap<String, String>,
+    ) -> Status {
+        let details = ErrorDetails::with_error_info(reason, domain, metadata);
+        Status::with_error_details(code, message, details)
+    }
+
     #[test]
     fn maps_job_not_found_from_error_info() {
         let st = encode_kernel_error_status(Code::NotFound, "Job not found", "job_not_found", 404);
@@ -624,6 +638,315 @@ mod tests {
         let err = kernel_status_to_api_error_for(&st, Some(KernelProcedure::GetJob));
         assert_eq!(err.status, StatusCode::NOT_FOUND);
         assert_eq!(err.body.error, "job_not_found");
+    }
+
+    #[test]
+    fn per_procedure_allowed_reason_tables_match_the_contract() {
+        use KernelProcedure::*;
+
+        let cases: &[(KernelProcedure, &[&str])] = &[
+            (
+                GetTokenProvenance,
+                &[
+                    "malformed_request",
+                    "not_found",
+                    "rate_limited",
+                    "internal_error",
+                ],
+            ),
+            (GetInfo, &["internal_error"]),
+            (GetAccumulator, &["internal_error"]),
+            (
+                ListInscriptions,
+                &[
+                    "bounds_exceeded",
+                    "malformed_request",
+                    "rate_limited",
+                    "internal_error",
+                ],
+            ),
+            (
+                GetNullifierPath,
+                &["malformed_request", "rate_limited", "internal_error"],
+            ),
+            (
+                SubmitTransition,
+                &[
+                    "malformed_request",
+                    "bounds_exceeded",
+                    "invalid_input_coin",
+                    "insufficient_balance",
+                    "unknown_publisher",
+                    "idempotency_conflict",
+                    "dependency_not_final",
+                    "rate_limited",
+                    "circuit_digest_mismatch",
+                    "internal_error",
+                ],
+            ),
+            (
+                GetJob,
+                &[
+                    "malformed_request",
+                    "job_not_found",
+                    "rate_limited",
+                    "internal_error",
+                ],
+            ),
+            (
+                StreamJob,
+                &[
+                    "malformed_request",
+                    "job_not_found",
+                    "rate_limited",
+                    "internal_error",
+                ],
+            ),
+            (
+                SignTransition,
+                &[
+                    "malformed_request",
+                    "job_not_found",
+                    "wrong_phase",
+                    "stale_message",
+                    "invalid_signature",
+                    "rate_limited",
+                    "internal_error",
+                ],
+            ),
+            (
+                CancelJob,
+                &[
+                    "malformed_request",
+                    "job_not_found",
+                    "wrong_phase",
+                    "rate_limited",
+                    "internal_error",
+                ],
+            ),
+            (
+                OpenPullChallenge,
+                &["malformed_request", "rate_limited", "internal_error"],
+            ),
+            (
+                Pull,
+                &[
+                    "malformed_request",
+                    "unauthorized",
+                    "challenge_expired",
+                    "scope_exceeded",
+                    "rate_limited",
+                    "internal_error",
+                ],
+            ),
+            (
+                GetRecord,
+                &[
+                    "malformed_request",
+                    "not_found",
+                    "unauthorized",
+                    "session_expired",
+                    "scope_exceeded",
+                    "rate_limited",
+                    "internal_error",
+                ],
+            ),
+            (
+                GetCoinProof,
+                &[
+                    "malformed_request",
+                    "not_found",
+                    "unauthorized",
+                    "session_expired",
+                    "scope_exceeded",
+                    "rate_limited",
+                    "internal_error",
+                ],
+            ),
+            (
+                GetAccountState,
+                &[
+                    "malformed_request",
+                    "unauthorized",
+                    "session_expired",
+                    "rate_limited",
+                    "internal_error",
+                ],
+            ),
+            (
+                SubscribeReceipts,
+                &[
+                    "malformed_request",
+                    "unauthorized",
+                    "session_expired",
+                    "scope_exceeded",
+                    "rate_limited",
+                    "internal_error",
+                ],
+            ),
+            (
+                Publish,
+                &["malformed_request", "rate_limited", "internal_error"],
+            ),
+            (
+                EntrustOperationalBundle,
+                &[
+                    "malformed_request",
+                    "unauthorized",
+                    "challenge_expired",
+                    "rate_limited",
+                    "internal_error",
+                ],
+            ),
+            (
+                RevokeOperationalBundle,
+                &[
+                    "malformed_request",
+                    "unauthorized",
+                    "challenge_expired",
+                    "rate_limited",
+                    "internal_error",
+                ],
+            ),
+            (
+                AttestBalance,
+                &[
+                    "malformed_request",
+                    "unauthorized",
+                    "challenge_expired",
+                    "rate_limited",
+                    "circuit_digest_mismatch",
+                    "internal_error",
+                ],
+            ),
+            (
+                IssueViewGrant,
+                &[
+                    "malformed_request",
+                    "unauthorized",
+                    "challenge_expired",
+                    "rate_limited",
+                    "internal_error",
+                ],
+            ),
+        ];
+
+        for (procedure, expected) in cases {
+            assert_eq!(
+                procedure.allowed_reasons(),
+                *expected,
+                "wrong allowed reasons for {procedure:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_reason_and_bad_http_status_metadata_fail_closed() {
+        let cases = [
+            (
+                status_with_metadata(
+                    Code::NotFound,
+                    "x",
+                    "",
+                    ERROR_INFO_DOMAIN,
+                    HashMap::from([("http_status".to_string(), "404".to_string())]),
+                ),
+                "reason is empty",
+            ),
+            (
+                status_with_metadata(
+                    Code::NotFound,
+                    "x",
+                    "job_not_found",
+                    ERROR_INFO_DOMAIN,
+                    HashMap::from([("http_status".to_string(), String::new())]),
+                ),
+                "is empty",
+            ),
+            (
+                status_with_metadata(
+                    Code::NotFound,
+                    "x",
+                    "job_not_found",
+                    ERROR_INFO_DOMAIN,
+                    HashMap::from([("http_status".to_string(), "four-oh-four".to_string())]),
+                ),
+                "not a u16 decimal",
+            ),
+        ];
+
+        for (status, expected_cause) in cases {
+            let err = kernel_status_to_api_error(&status);
+            assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(err.body.error, "internal_error");
+            assert!(
+                err.cause().unwrap_or("").contains(expected_cause),
+                "cause {:?} must contain {expected_cause:?}",
+                err.cause()
+            );
+        }
+    }
+
+    #[test]
+    fn empty_kernel_messages_use_safe_reason_specific_fallbacks() {
+        let public = encode_kernel_error_status(
+            Code::NotFound,
+            "",
+            "job_not_found",
+            StatusCode::NOT_FOUND.as_u16(),
+        );
+        let err = kernel_status_to_api_error(&public);
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+        assert_eq!(err.body.message, "job_not_found");
+
+        let internal = encode_kernel_error_status(
+            Code::Internal,
+            "",
+            "internal_error",
+            StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+        );
+        let err = kernel_status_to_api_error(&internal);
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.body.message, PUBLIC_INTERNAL_MESSAGE);
+        assert_eq!(err.cause(), Some("kernel internal_error"));
+    }
+
+    #[test]
+    fn malformed_empty_multiple_and_non_error_info_details_fail_closed() {
+        let malformed = Status::with_details(Code::Internal, "x", vec![0xff].into());
+        let empty = Status::with_error_details_vec(Code::Internal, "x", Vec::<ErrorDetail>::new());
+
+        let metadata = HashMap::from([("http_status".to_string(), "404".to_string())]);
+        let two = Status::with_error_details_vec(
+            Code::NotFound,
+            "x",
+            vec![
+                tonic_types::ErrorInfo::new("job_not_found", ERROR_INFO_DOMAIN, metadata.clone())
+                    .into(),
+                tonic_types::ErrorInfo::new("not_found", ERROR_INFO_DOMAIN, metadata).into(),
+            ],
+        );
+        let wrong_kind = Status::with_error_details(
+            Code::InvalidArgument,
+            "x",
+            ErrorDetails::with_bad_request_violation("subject", "is required"),
+        );
+
+        for (status, expected_cause) in [
+            (malformed, "details decode failed"),
+            (empty, "zero entries"),
+            (two, "exactly one ErrorInfo"),
+            (wrong_kind, "must be ErrorInfo"),
+        ] {
+            let err = kernel_status_to_api_error(&status);
+            assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(err.body.error, "internal_error");
+            assert!(
+                err.cause().unwrap_or("").contains(expected_cause),
+                "cause {:?} must contain {expected_cause:?}",
+                err.cause()
+            );
+        }
     }
 
     #[test]

@@ -188,3 +188,61 @@ pub async fn post_attest_balance(
     let body = json!({ "job_id": handle.job_id });
     Ok((StatusCode::ACCEPTED, Json(body)).into_response())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hexutil::encode_hex;
+    use crate::kernel::connect_lazy;
+    use crate::ownership::{
+        ChallengeEcho, GrantRevokeChallengeStore, OwnerOnlyProofJson, RevokedGrantSet,
+        SubjectOpDirectory,
+    };
+    use crate::state::AppState;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    fn dummy_state() -> AppState {
+        let kernel = Arc::new(connect_lazy("http://127.0.0.1:1").expect("lazy kernel uri"));
+        AppState {
+            kernel,
+            features: BTreeSet::new(),
+            public_hosts: Arc::new(vec!["node.example.com".into()]),
+            blossom: None,
+            subject_ops: Arc::new(SubjectOpDirectory::new()),
+            revoked_grants: Arc::new(RevokedGrantSet::new()),
+            grant_revoke_challenges: Arc::new(GrantRevokeChallengeStore::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_nav_ceiling_hex_is_copied_then_mixed_ceiling_rejected() {
+        let nav = encode_hex(&[0xABu8; 32]);
+        let body = AttestBalanceBody {
+            subject: "unused".into(),
+            asset_id: "unused".into(),
+            nav_ceiling: Some(nav),
+            size_ceiling: None,
+            challenge: ChallengeEcho {
+                nonce: "00".repeat(32),
+                expiry: "1".into(),
+            },
+            ownership_proof: OwnerOnlyProofJson::Ownership {
+                subject: "unused".into(),
+                public_key: "00".repeat(32),
+                nk_commit: "00".repeat(32),
+                signature: "00".repeat(64),
+            },
+        };
+        let err = post_attest_balance(State(dummy_state()), JsonBody(body))
+            .await
+            .expect_err("mixed ceilings");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains("nav_ceiling") && err.body.message.contains("size_ceiling"),
+            "mixed-presence message, got {:?}",
+            err.body.message
+        );
+    }
+}

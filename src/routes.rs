@@ -24,9 +24,9 @@ use crate::grants;
 use crate::info;
 use crate::jobs;
 use crate::kernel::KernelHandle;
+use crate::provenance;
 use crate::publish;
 use crate::pull;
-use crate::provenance;
 use crate::state::AppState;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
@@ -638,7 +638,8 @@ mod tests {
                 })),
                 ..Default::default()
             }),
-        ).expect("router");
+        )
+        .expect("router");
 
         let response = app
             .oneshot(
@@ -651,8 +652,7 @@ mod tests {
             .expect("provenance response");
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_bytes(response).await;
-        let json: serde_json::Value =
-            serde_json::from_slice(&body).expect("valid provenance JSON");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid provenance JSON");
         assert_eq!(json["asset_id"], asset_id_hex);
         assert_eq!(json["issuance_version"], 1);
         assert_eq!(json["creator_pubkey"].as_str().map(str::len), Some(64));
@@ -678,7 +678,8 @@ mod tests {
                 })),
                 ..Default::default()
             }),
-        ).expect("router");
+        )
+        .expect("router");
 
         let response = app
             .oneshot(
@@ -691,8 +692,7 @@ mod tests {
             .expect("provenance response");
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_bytes(response).await;
-        let json: serde_json::Value =
-            serde_json::from_slice(&body).expect("valid provenance JSON");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid provenance JSON");
         assert_eq!(json["asset_id"], asset_id_hex);
         assert_eq!(json["issuance_version"], 2);
         assert_eq!(json["creator_pubkey"].as_str().map(str::len), Some(64));
@@ -716,12 +716,11 @@ mod tests {
         let app = build_router(
             test_config_no_features(),
             Arc::new(ScriptedKernel {
-                token_provenance: Some(Err(crate::kernel::kernel_status_to_api_error(
-                    &status,
-                ))),
+                token_provenance: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
                 ..Default::default()
             }),
-        ).expect("router");
+        )
+        .expect("router");
         let asset_id_hex = crate::hexutil::encode_hex(&[0xcc; 32]);
 
         let response = app
@@ -779,7 +778,8 @@ mod tests {
                 })),
                 ..Default::default()
             }),
-        ).expect("router");
+        )
+        .expect("router");
         let held_response = held_app
             .oneshot(
                 Request::builder()
@@ -800,12 +800,11 @@ mod tests {
         let missing_app = build_router(
             test_config_no_features(),
             Arc::new(ScriptedKernel {
-                token_provenance: Some(Err(crate::kernel::kernel_status_to_api_error(
-                    &status,
-                ))),
+                token_provenance: Some(Err(crate::kernel::kernel_status_to_api_error(&status))),
                 ..Default::default()
             }),
-        ).expect("router");
+        )
+        .expect("router");
         let missing_response = missing_app
             .oneshot(
                 Request::builder()
@@ -1788,8 +1787,7 @@ mod tests {
 
     #[derive(Default)]
     struct ScriptedKernel {
-        token_provenance:
-            Option<Result<crate::kernel::kernel_v1::TokenProvenance, ApiError>>,
+        token_provenance: Option<Result<crate::kernel::kernel_v1::TokenProvenance, ApiError>>,
         token_provenance_calls: AtomicUsize,
         submit: Option<Result<JobHandle, ApiError>>,
         get: Option<Result<Job, ApiError>>,
@@ -3676,10 +3674,9 @@ mod tests {
         assert_eq!(kernel.attest_calls.load(Ordering::SeqCst), 1);
     }
 
-    /// Without the status gate, any non-empty job_id would be admitted as 202
-    /// even when JobHandle.status is not `"accepted"`.
+    /// Both fields of a successful JobHandle are protocol invariants.
     #[tokio::test]
-    async fn attest_balance_non_accepted_status_is_500() {
+    async fn attest_balance_invalid_job_handle_is_500() {
         let host = "node.example.com";
         let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
         let nonce = [0x11u8; 32];
@@ -3698,14 +3695,6 @@ mod tests {
         );
         let sig = ownership_fixtures::sign_chal(&sk, &chal);
 
-        let kernel = Arc::new(ScriptedKernel {
-            attest: Some(Ok(JobHandle {
-                job_id: "attest-job-bad".into(),
-                status: "proving".into(),
-            })),
-            ..Default::default()
-        });
-        let app = build_router(test_config(), kernel.clone()).expect("router");
         let body = serde_json::json!({
             "subject": subject_bech,
             "asset_id": encode_hex(&asset),
@@ -3715,22 +3704,88 @@ mod tests {
             },
             "ownership_proof": ownership_proof_json(&subject_bech, &pk0, &nkc, &sig),
         });
-        let res = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/attest/balance")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
-        assert_eq!(json["error"], "internal_error");
-        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
-        assert_eq!(kernel.attest_calls.load(Ordering::SeqCst), 1);
+
+        for handle in [
+            JobHandle {
+                job_id: "attest-job-bad".into(),
+                status: "proving".into(),
+            },
+            JobHandle {
+                job_id: String::new(),
+                status: "accepted".into(),
+            },
+        ] {
+            let kernel = Arc::new(ScriptedKernel {
+                attest: Some(Ok(handle)),
+                ..Default::default()
+            });
+            let app = build_router(test_config(), kernel.clone()).expect("router");
+            let res = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/attest/balance")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+            assert_eq!(json["error"], "internal_error");
+            assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
+            assert_eq!(kernel.attest_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn attest_balance_rejects_malformed_ceilings_before_kernel() {
+        let (_, pk0, nkc, _, subject_bech) = ownership_fixtures::identity();
+        let asset = [0x22u8; 32];
+        let nonce = [0x11u8; 32];
+        let signature = [0u8; 64];
+        let proof = ownership_proof_json(&subject_bech, &pk0, &nkc, &signature);
+        let bodies = [
+            serde_json::json!({
+                "subject": subject_bech,
+                "asset_id": encode_hex(&asset),
+                "nav_ceiling": "00",
+                "challenge": {
+                    "nonce": encode_hex(&nonce),
+                    "expiry": "1",
+                },
+                "ownership_proof": proof,
+            }),
+            serde_json::json!({
+                "subject": subject_bech,
+                "asset_id": encode_hex(&asset),
+                "size_ceiling": "-1",
+                "challenge": {
+                    "nonce": encode_hex(&nonce),
+                    "expiry": "1",
+                },
+                "ownership_proof": proof,
+            }),
+        ];
+
+        for body in bodies {
+            let kernel = Arc::new(ScriptedKernel::default());
+            let app = build_router(test_config(), kernel.clone()).expect("router");
+            let res = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/attest/balance")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(kernel.attest_calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]
@@ -4169,6 +4224,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grants_reject_malformed_grantee_and_expiry_before_kernel() {
+        let (_, _, _, _, subject_bech) = ownership_fixtures::identity();
+        let kernel = Arc::new(ScriptedKernel::default());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
+        let base = serde_json::json!({
+            "subject": subject_bech,
+            "grantee_pk": encode_hex(&[0xFF; 32]),
+            "scope": { "asset_ids": "*" },
+            "expiry": "2000000000",
+            "challenge": { "nonce": encode_hex(&[2; 32]), "expiry": "100" },
+            "ownership_proof": {
+                "type": "grant",
+                "grant": "unused",
+                "grantee_pk": encode_hex(&[0xAB; 32]),
+                "signature": encode_hex(&[0; 64])
+            }
+        });
+
+        for (field, value, expected) in [
+            ("grantee_pk", serde_json::json!("abcd"), "grantee_pk"),
+            ("expiry", serde_json::json!("not-decimal"), "expiry"),
+        ] {
+            let mut body = base.clone();
+            body[field] = value;
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/grants")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+            assert_eq!(json["error"], "malformed_request");
+            assert!(json["message"].as_str().unwrap().contains(expected));
+        }
+        assert_eq!(kernel.issue_grant_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn grants_valid_ownership_calls_kernel() {
         let host = "node.example.com";
         let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
@@ -4229,6 +4329,50 @@ mod tests {
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
         assert_eq!(json["grant"], "zkgrant1qpvalid");
         assert_eq!(kernel.issue_grant_calls.load(Ordering::SeqCst), 1);
+
+        let empty_kernel = Arc::new(ScriptedKernel {
+            issue_grant: Some(Ok(GrantResult {
+                grant: String::new(),
+            })),
+            ..Default::default()
+        });
+        let empty_app = build_router(test_config(), empty_kernel.clone()).expect("router");
+        let res = empty_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(empty_kernel.issue_grant_calls.load(Ordering::SeqCst), 1);
+
+        let error_kernel = Arc::new(ScriptedKernel {
+            issue_grant: Some(Err(ApiError::scope_exceeded("scripted scope refusal"))),
+            ..Default::default()
+        });
+        let error_app = build_router(test_config(), error_kernel.clone()).expect("router");
+        let res = error_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "scope_exceeded");
+        assert_eq!(error_kernel.issue_grant_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -4288,6 +4432,99 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
         assert_eq!(json["domain"], ISSUE_GRANT_CHALLENGE_DOMAIN);
+
+        for (path, expected_domain) in [
+            ("/v1/grants/challenge", ISSUE_GRANT_CHALLENGE_DOMAIN),
+            (
+                "/v1/attest/balance/challenge",
+                ATTEST_BALANCE_CHALLENGE_DOMAIN,
+            ),
+        ] {
+            for (challenge, expected_cause) in [
+                (
+                    Challenge {
+                        nonce: vec![0xCD; 31],
+                        expiry: 1,
+                        domain: expected_domain.into(),
+                    },
+                    "nonce",
+                ),
+                (
+                    Challenge {
+                        nonce: vec![0xCD; 32],
+                        expiry: 1,
+                        domain: "wrong-domain".into(),
+                    },
+                    "domain",
+                ),
+            ] {
+                let kernel = Arc::new(ScriptedKernel {
+                    open_challenge: Some(Ok(challenge)),
+                    ..Default::default()
+                });
+                let app = build_router(test_config(), kernel).expect("router");
+                let res = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(path)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({ "subject": subject_bech }).to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+                assert_eq!(json["error"], "internal_error", "{path}: {expected_cause}");
+            }
+        }
+
+        let kernel = Arc::new(ScriptedKernel {
+            open_challenge: Some(Err(ApiError::internal("challenge transport failed"))),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel.clone()).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants/challenge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "subject": subject_bech }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(kernel.open_challenge_calls.load(Ordering::SeqCst), 1);
+
+        for path in [
+            "/v1/attest/balance/challenge",
+            "/v1/grants/challenge",
+            "/v1/grants/revoke/challenge",
+        ] {
+            let app =
+                build_router(test_config(), Arc::new(ScriptedKernel::default())).expect("router");
+            let res = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"subject":""}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{path}");
+            let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+            assert_eq!(json["error"], "malformed_request");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -7970,6 +8207,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grants_revoke_bad_ownership_signature_is_unauthorized() {
+        let (_, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let (grant_bech, _, _, _) = test_signed_zkgrant(&subject_raw, 0x55, 0x66, 0x77);
+        let app = build_router(test_config(), Arc::new(ScriptedKernel::default())).expect("router");
+        let (nonce_hex, _, _) = issue_grant_revoke_challenge(&app, &subject_bech).await;
+        let body = grant_revoke_ownership_body(
+            &nonce_hex,
+            &subject_bech,
+            &pk0,
+            &nkc,
+            &[0xFF; 64],
+            &grant_bech,
+        );
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "unauthorized");
+    }
+
+    #[tokio::test]
     async fn grants_revoke_expired_challenge_is_unauthorized() {
         use crate::ownership::{
             pull_challenge_message, GrantRevokeChallengeStore, RevokedGrantSet, SubjectOpDirectory,
@@ -8064,6 +8331,33 @@ mod tests {
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
         assert_eq!(json["error"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn grants_revoke_malformed_nonce_is_400_before_store_lookup() {
+        let (_, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let (grant_bech, _, _, _) = test_signed_zkgrant(&subject_raw, 0x55, 0x66, 0x77);
+        let body =
+            grant_revoke_ownership_body("abcd", &subject_bech, &pk0, &nkc, &[0; 64], &grant_bech);
+        let app = build_router(test_config(), Arc::new(ScriptedKernel::default())).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/grants/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+        assert!(json["message"]
+            .as_str()
+            .unwrap()
+            .contains("challenge.nonce"));
     }
 
     #[tokio::test]

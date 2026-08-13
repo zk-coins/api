@@ -9,14 +9,13 @@ use crate::error::ApiError;
 use crate::kernel::error_info::{kernel_status_to_api_error_for, KernelProcedure};
 use crate::kernel::pb::kernel_v1::kernel_client::KernelClient as TonicKernelClient;
 use crate::kernel::pb::kernel_v1::{
-    GetTokenProvenanceRequest, TokenProvenance,
     AccountStateRequest, AccountStateResult, AccumulatorTip, AttestRequest, Challenge,
     CoinProofBlob, CoinProofRequest, EntrustRequest, EntrustResult, GetAccumulatorRequest,
-    GetInfoRequest, GrantRequest, GrantResult, Info, Inscription, Job, JobEvent, JobHandle,
-    JobRequest, ListInscriptionsRequest, NullifierPath, NullifierPathRequest, PublishRequest,
-    PublishResult, PullChallengeRequest, PullRequest, PullResult, Receipt, RecordBlob,
-    RecordRequest, RevokeRequest, RevokeResult, SignRequest, SubscribeReceiptsRequest,
-    TransitionRequest,
+    GetInfoRequest, GetTokenProvenanceRequest, GrantRequest, GrantResult, Info, Inscription, Job,
+    JobEvent, JobHandle, JobRequest, ListInscriptionsRequest, NullifierPath, NullifierPathRequest,
+    PublishRequest, PublishResult, PullChallengeRequest, PullRequest, PullResult, Receipt,
+    RecordBlob, RecordRequest, RevokeRequest, RevokeResult, SignRequest, SubscribeReceiptsRequest,
+    TokenProvenance, TransitionRequest,
 };
 use crate::ownership::SessionAuthority;
 use async_trait::async_trait;
@@ -451,11 +450,520 @@ fn map_for(procedure: KernelProcedure) -> impl FnOnce(tonic::Status) -> ApiError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::encode_kernel_error_status;
+    use crate::kernel::pb::kernel_v1::kernel_server::{Kernel, KernelServer};
+    use futures_util::stream::{self, StreamExt};
+    use hyper_util::rt::TokioIo;
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+    use tokio::sync::oneshot;
+    use tonic::transport::{Endpoint, Server};
+    use tonic::{Code, Response, Status};
+
+    type RpcStream<T> = Pin<Box<dyn futures_util::Stream<Item = Result<T, Status>> + Send>>;
+
+    #[derive(Clone)]
+    struct FakeKernelServer {
+        fail: bool,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl FakeKernelServer {
+        fn record(&self, name: &'static str) {
+            self.calls.lock().expect("call trace lock").push(name);
+        }
+
+        fn unary<T: Default>(&self, name: &'static str) -> Result<Response<T>, Status> {
+            self.record(name);
+            if self.fail {
+                Err(rpc_error())
+            } else {
+                Ok(Response::new(T::default()))
+            }
+        }
+
+        fn stream<T>(
+            &self,
+            name: &'static str,
+            items: Vec<T>,
+        ) -> Result<Response<RpcStream<T>>, Status>
+        where
+            T: Send + 'static,
+        {
+            self.record(name);
+            if self.fail {
+                return Err(rpc_error());
+            }
+            let mut frames: Vec<Result<T, Status>> = items.into_iter().map(Ok).collect();
+            frames.push(Err(rpc_error()));
+            Ok(Response::new(Box::pin(stream::iter(frames))))
+        }
+    }
+
+    fn rpc_error() -> Status {
+        encode_kernel_error_status(
+            Code::Internal,
+            "scripted kernel failure",
+            "internal_error",
+            500,
+        )
+    }
+
+    fn provenance_request() -> GetTokenProvenanceRequest {
+        GetTokenProvenanceRequest { asset_id: vec![1] }
+    }
+
+    fn transition_request() -> TransitionRequest {
+        TransitionRequest {
+            kind: "mint".into(),
+            ..Default::default()
+        }
+    }
+
+    fn job_request() -> JobRequest {
+        JobRequest {
+            job_id: "job-1".into(),
+        }
+    }
+
+    fn sign_request() -> SignRequest {
+        SignRequest {
+            job_id: "job-1".into(),
+            ..Default::default()
+        }
+    }
+
+    fn inscriptions_request() -> ListInscriptionsRequest {
+        ListInscriptionsRequest {
+            limit: Some(2),
+            ..Default::default()
+        }
+    }
+
+    fn nullifier_request() -> NullifierPathRequest {
+        NullifierPathRequest { pubkey: vec![2] }
+    }
+
+    fn challenge_request() -> PullChallengeRequest {
+        PullChallengeRequest {
+            subject: "zk1subject".into(),
+            ..Default::default()
+        }
+    }
+
+    fn attest_request() -> AttestRequest {
+        AttestRequest {
+            subject: "zk1subject".into(),
+            ..Default::default()
+        }
+    }
+
+    fn grant_request() -> GrantRequest {
+        GrantRequest {
+            subject: "zk1subject".into(),
+            ..Default::default()
+        }
+    }
+
+    fn pull_request(authority: SessionAuthority) -> PullRequest {
+        PullRequest {
+            subject: authority.as_str().into(),
+            ..Default::default()
+        }
+    }
+
+    fn record_request() -> RecordRequest {
+        RecordRequest {
+            session: "session-1".into(),
+            ..Default::default()
+        }
+    }
+
+    fn coin_request() -> CoinProofRequest {
+        CoinProofRequest {
+            session: "session-1".into(),
+            ..Default::default()
+        }
+    }
+
+    fn account_request() -> AccountStateRequest {
+        AccountStateRequest {
+            session: "session-1".into(),
+            ..Default::default()
+        }
+    }
+
+    fn receipts_request() -> SubscribeReceiptsRequest {
+        SubscribeReceiptsRequest {
+            session: "session-1".into(),
+            ..Default::default()
+        }
+    }
+
+    fn entrust_request() -> EntrustRequest {
+        EntrustRequest {
+            subject: "zk1subject".into(),
+            ..Default::default()
+        }
+    }
+
+    fn revoke_request() -> RevokeRequest {
+        RevokeRequest {
+            subject: "zk1subject".into(),
+            ..Default::default()
+        }
+    }
+
+    fn publish_request() -> PublishRequest {
+        PublishRequest {
+            public_key: vec![3],
+            ..Default::default()
+        }
+    }
+
+    #[tonic::async_trait]
+    impl Kernel for FakeKernelServer {
+        async fn get_token_provenance(
+            &self,
+            request: Request<GetTokenProvenanceRequest>,
+        ) -> Result<Response<TokenProvenance>, Status> {
+            assert_eq!(request.into_inner(), provenance_request());
+            self.unary("get_token_provenance")
+        }
+
+        async fn get_info(
+            &self,
+            request: Request<GetInfoRequest>,
+        ) -> Result<Response<Info>, Status> {
+            assert_eq!(request.into_inner(), GetInfoRequest {});
+            self.unary("get_info")
+        }
+
+        async fn get_accumulator(
+            &self,
+            request: Request<GetAccumulatorRequest>,
+        ) -> Result<Response<AccumulatorTip>, Status> {
+            assert_eq!(request.into_inner(), GetAccumulatorRequest {});
+            self.unary("get_accumulator")
+        }
+
+        type ListInscriptionsStream = RpcStream<Inscription>;
+
+        async fn list_inscriptions(
+            &self,
+            request: Request<ListInscriptionsRequest>,
+        ) -> Result<Response<Self::ListInscriptionsStream>, Status> {
+            assert_eq!(request.into_inner(), inscriptions_request());
+            self.stream(
+                "list_inscriptions",
+                vec![
+                    Inscription {
+                        height: 1,
+                        ..Default::default()
+                    },
+                    Inscription {
+                        height: 2,
+                        ..Default::default()
+                    },
+                ],
+            )
+        }
+
+        async fn get_nullifier_path(
+            &self,
+            request: Request<NullifierPathRequest>,
+        ) -> Result<Response<NullifierPath>, Status> {
+            assert_eq!(request.into_inner(), nullifier_request());
+            self.unary("get_nullifier_path")
+        }
+
+        async fn submit_transition(
+            &self,
+            request: Request<TransitionRequest>,
+        ) -> Result<Response<JobHandle>, Status> {
+            assert_eq!(request.into_inner(), transition_request());
+            self.unary("submit_transition")
+        }
+
+        async fn get_job(&self, request: Request<JobRequest>) -> Result<Response<Job>, Status> {
+            assert_eq!(request.into_inner(), job_request());
+            self.unary("get_job")
+        }
+
+        type StreamJobStream = RpcStream<JobEvent>;
+
+        async fn stream_job(
+            &self,
+            request: Request<JobRequest>,
+        ) -> Result<Response<Self::StreamJobStream>, Status> {
+            assert_eq!(request.into_inner(), job_request());
+            self.stream(
+                "stream_job",
+                vec![
+                    JobEvent {
+                        event: "phase".into(),
+                        ..Default::default()
+                    },
+                    JobEvent {
+                        event: "complete".into(),
+                        ..Default::default()
+                    },
+                ],
+            )
+        }
+
+        async fn sign_transition(
+            &self,
+            request: Request<SignRequest>,
+        ) -> Result<Response<Job>, Status> {
+            assert_eq!(request.into_inner(), sign_request());
+            self.unary("sign_transition")
+        }
+
+        async fn cancel_job(&self, request: Request<JobRequest>) -> Result<Response<Job>, Status> {
+            assert_eq!(request.into_inner(), job_request());
+            self.unary("cancel_job")
+        }
+
+        async fn open_pull_challenge(
+            &self,
+            request: Request<PullChallengeRequest>,
+        ) -> Result<Response<Challenge>, Status> {
+            assert_eq!(request.into_inner(), challenge_request());
+            self.unary("open_pull_challenge")
+        }
+
+        async fn pull(
+            &self,
+            request: Request<PullRequest>,
+        ) -> Result<Response<PullResult>, Status> {
+            let authority = request
+                .metadata()
+                .get(SESSION_AUTHORITY_METADATA)
+                .expect("session authority metadata")
+                .to_str()
+                .expect("ASCII authority");
+            assert_eq!(request.get_ref().subject, authority);
+            assert!(matches!(authority, "ownership" | "grant"));
+            self.unary("pull")
+        }
+
+        async fn get_record(
+            &self,
+            request: Request<RecordRequest>,
+        ) -> Result<Response<RecordBlob>, Status> {
+            assert_eq!(request.into_inner(), record_request());
+            self.unary("get_record")
+        }
+
+        async fn get_coin_proof(
+            &self,
+            request: Request<CoinProofRequest>,
+        ) -> Result<Response<CoinProofBlob>, Status> {
+            assert_eq!(request.into_inner(), coin_request());
+            self.unary("get_coin_proof")
+        }
+
+        async fn get_account_state(
+            &self,
+            request: Request<AccountStateRequest>,
+        ) -> Result<Response<AccountStateResult>, Status> {
+            assert_eq!(request.into_inner(), account_request());
+            self.unary("get_account_state")
+        }
+
+        type SubscribeReceiptsStream = RpcStream<Receipt>;
+
+        async fn subscribe_receipts(
+            &self,
+            request: Request<SubscribeReceiptsRequest>,
+        ) -> Result<Response<Self::SubscribeReceiptsStream>, Status> {
+            assert_eq!(request.into_inner(), receipts_request());
+            self.stream(
+                "subscribe_receipts",
+                vec![
+                    Receipt {
+                        amount: "1".into(),
+                        ..Default::default()
+                    },
+                    Receipt {
+                        amount: "2".into(),
+                        ..Default::default()
+                    },
+                ],
+            )
+        }
+
+        async fn publish(
+            &self,
+            request: Request<PublishRequest>,
+        ) -> Result<Response<PublishResult>, Status> {
+            assert_eq!(request.into_inner(), publish_request());
+            self.unary("publish")
+        }
+
+        async fn entrust_operational_bundle(
+            &self,
+            request: Request<EntrustRequest>,
+        ) -> Result<Response<EntrustResult>, Status> {
+            assert_eq!(request.into_inner(), entrust_request());
+            self.unary("entrust_operational_bundle")
+        }
+
+        async fn revoke_operational_bundle(
+            &self,
+            request: Request<RevokeRequest>,
+        ) -> Result<Response<RevokeResult>, Status> {
+            assert_eq!(request.into_inner(), revoke_request());
+            self.unary("revoke_operational_bundle")
+        }
+
+        async fn attest_balance(
+            &self,
+            request: Request<AttestRequest>,
+        ) -> Result<Response<JobHandle>, Status> {
+            assert_eq!(request.into_inner(), attest_request());
+            self.unary("attest_balance")
+        }
+
+        async fn issue_view_grant(
+            &self,
+            request: Request<GrantRequest>,
+        ) -> Result<Response<GrantResult>, Status> {
+            assert_eq!(request.into_inner(), grant_request());
+            self.unary("issue_view_grant")
+        }
+    }
+
+    struct ServerIo(DuplexStream);
+
+    impl tonic::transport::server::Connected for ServerIo {
+        type ConnectInfo = ();
+
+        fn connect_info(&self) -> Self::ConnectInfo {}
+    }
+
+    impl AsyncRead for ServerIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for ServerIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        }
+    }
+
+    struct Harness {
+        client: Option<KernelClient>,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        shutdown: Option<oneshot::Sender<()>>,
+        server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    impl Harness {
+        async fn start(fail: bool) -> Self {
+            let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let service = FakeKernelServer {
+                fail,
+                calls: Arc::clone(&calls),
+            };
+            // Keep the accept stream open after the single duplex item. tonic 0.13
+            // treats end-of-incoming as accept-loop exit and, with a shutdown
+            // future present, immediately graceful-shuts down live connections —
+            // which races the first RPC and surfaces as a transport Status with
+            // empty details. `pending` holds the loop until `finish` fires the
+            // oneshot. tonic wraps the server half in TokioIo itself.
+            let incoming = stream::once(async move { Ok::<_, io::Error>(ServerIo(server_io)) })
+                .chain(stream::pending());
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                Server::builder()
+                    .add_service(KernelServer::new(service))
+                    .serve_with_incoming_shutdown(incoming, async move {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+
+            let client_io = Arc::new(Mutex::new(Some(client_io)));
+            let connector = tower::service_fn(move |_| {
+                let io = client_io
+                    .lock()
+                    .expect("connector lock")
+                    .take()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotConnected, "already connected")
+                    });
+                async move { io.map(TokioIo::new) }
+            });
+            let channel = Endpoint::from_static("http://kernel.test")
+                .connect_with_connector(connector)
+                .await
+                .expect("in-memory channel");
+
+            Self {
+                client: Some(KernelClient {
+                    inner: TonicKernelClient::new(channel),
+                }),
+                calls,
+                shutdown: Some(shutdown_tx),
+                server,
+            }
+        }
+
+        fn client(&self) -> &KernelClient {
+            self.client.as_ref().expect("live client")
+        }
+
+        async fn finish(mut self, expected_calls: &[&'static str]) {
+            assert_eq!(
+                self.calls.lock().expect("call trace lock").as_slice(),
+                expected_calls
+            );
+            self.client.take();
+            self.shutdown.take().expect("shutdown sender").send(()).ok();
+            self.server
+                .await
+                .expect("server task")
+                .expect("server result");
+        }
+    }
+
+    fn assert_internal(err: ApiError) {
+        assert_eq!(err.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
+        assert_eq!(err.cause(), Some("scripted kernel failure"));
+    }
 
     #[test]
     fn empty_addr_is_build_error() {
         let err = KernelClient::connect_lazy("").expect_err("empty");
         assert_eq!(err, ClientBuildError::EmptyAddr);
+        assert_eq!(err.to_string(), "kernel address is empty");
+        assert!(connect_lazy("").is_err(), "free constructor must delegate");
     }
 
     #[test]
@@ -465,6 +973,14 @@ mod tests {
             ClientBuildError::InvalidUri { value, reason } => {
                 assert_eq!(value, "not a uri");
                 assert!(!reason.is_empty());
+                let display = ClientBuildError::InvalidUri {
+                    value: value.clone(),
+                    reason: reason.clone(),
+                }
+                .to_string();
+                assert!(display.contains("ZKCOINS_KERNEL_ADDR"));
+                assert!(display.contains("not a uri"));
+                assert!(display.contains(&reason));
             }
             other => panic!("expected InvalidUri, got {other:?}"),
         }
@@ -502,5 +1018,271 @@ mod tests {
             "operator cause must name transport class, got {:?}",
             err.cause()
         );
+    }
+
+    #[tokio::test]
+    async fn real_tonic_client_forwards_every_rpc_and_maps_stream_items() {
+        let harness = Harness::start(false).await;
+        let client = harness.client();
+
+        assert_eq!(
+            client
+                .get_token_provenance(provenance_request())
+                .await
+                .unwrap(),
+            TokenProvenance::default()
+        );
+        assert_eq!(
+            client
+                .submit_transition(transition_request())
+                .await
+                .unwrap(),
+            JobHandle::default()
+        );
+        assert_eq!(client.get_job(job_request()).await.unwrap(), Job::default());
+
+        let mut jobs = client.stream_job(job_request()).await.unwrap();
+        assert_eq!(jobs.next().await.unwrap().unwrap().event, "phase");
+        assert_eq!(jobs.next().await.unwrap().unwrap().event, "complete");
+        assert_internal(jobs.next().await.unwrap().unwrap_err());
+        assert!(jobs.next().await.is_none());
+
+        assert_eq!(
+            client.sign_transition(sign_request()).await.unwrap(),
+            Job::default()
+        );
+        assert_eq!(
+            client.cancel_job(job_request()).await.unwrap(),
+            Job::default()
+        );
+        assert_eq!(client.get_info().await.unwrap(), Info::default());
+        assert_eq!(
+            client.get_accumulator().await.unwrap(),
+            AccumulatorTip::default()
+        );
+
+        let mut inscriptions = client
+            .list_inscriptions(inscriptions_request())
+            .await
+            .unwrap();
+        assert_eq!(inscriptions.next().await.unwrap().unwrap().height, 1);
+        assert_eq!(inscriptions.next().await.unwrap().unwrap().height, 2);
+        assert_internal(inscriptions.next().await.unwrap().unwrap_err());
+        assert!(inscriptions.next().await.is_none());
+
+        assert_eq!(
+            client
+                .get_nullifier_path(nullifier_request())
+                .await
+                .unwrap(),
+            NullifierPath::default()
+        );
+        assert_eq!(
+            client
+                .open_pull_challenge(challenge_request())
+                .await
+                .unwrap(),
+            Challenge::default()
+        );
+        assert_eq!(
+            client.attest_balance(attest_request()).await.unwrap(),
+            JobHandle::default()
+        );
+        assert_eq!(
+            client.issue_view_grant(grant_request()).await.unwrap(),
+            GrantResult::default()
+        );
+        assert_eq!(
+            client
+                .pull(
+                    pull_request(SessionAuthority::Ownership),
+                    SessionAuthority::Ownership
+                )
+                .await
+                .unwrap(),
+            PullResult::default()
+        );
+        assert_eq!(
+            client
+                .pull(
+                    pull_request(SessionAuthority::Grant),
+                    SessionAuthority::Grant
+                )
+                .await
+                .unwrap(),
+            PullResult::default()
+        );
+        assert_eq!(
+            client.get_record(record_request()).await.unwrap(),
+            RecordBlob::default()
+        );
+        assert_eq!(
+            client.get_coin_proof(coin_request()).await.unwrap(),
+            CoinProofBlob::default()
+        );
+        assert_eq!(
+            client.get_account_state(account_request()).await.unwrap(),
+            AccountStateResult::default()
+        );
+
+        let mut receipts = client.subscribe_receipts(receipts_request()).await.unwrap();
+        assert_eq!(receipts.next().await.unwrap().unwrap().amount, "1");
+        assert_eq!(receipts.next().await.unwrap().unwrap().amount, "2");
+        assert_internal(receipts.next().await.unwrap().unwrap_err());
+        assert!(receipts.next().await.is_none());
+
+        assert_eq!(
+            client
+                .entrust_operational_bundle(entrust_request())
+                .await
+                .unwrap(),
+            EntrustResult::default()
+        );
+        assert_eq!(
+            client
+                .revoke_operational_bundle(revoke_request())
+                .await
+                .unwrap(),
+            RevokeResult::default()
+        );
+        assert_eq!(
+            client.publish(publish_request()).await.unwrap(),
+            PublishResult::default()
+        );
+
+        harness
+            .finish(&[
+                "get_token_provenance",
+                "submit_transition",
+                "get_job",
+                "stream_job",
+                "sign_transition",
+                "cancel_job",
+                "get_info",
+                "get_accumulator",
+                "list_inscriptions",
+                "get_nullifier_path",
+                "open_pull_challenge",
+                "attest_balance",
+                "issue_view_grant",
+                "pull",
+                "pull",
+                "get_record",
+                "get_coin_proof",
+                "get_account_state",
+                "subscribe_receipts",
+                "entrust_operational_bundle",
+                "revoke_operational_bundle",
+                "publish",
+            ])
+            .await;
+    }
+
+    #[tokio::test]
+    async fn real_tonic_client_maps_rich_status_for_every_rpc_handshake() {
+        let harness = Harness::start(true).await;
+        let client = harness.client();
+
+        assert_internal(
+            client
+                .get_token_provenance(provenance_request())
+                .await
+                .unwrap_err(),
+        );
+        assert_internal(
+            client
+                .submit_transition(transition_request())
+                .await
+                .unwrap_err(),
+        );
+        assert_internal(client.get_job(job_request()).await.unwrap_err());
+        assert_internal(match client.stream_job(job_request()).await {
+            Ok(_) => panic!("stream_job must fail"),
+            Err(err) => err,
+        });
+        assert_internal(client.sign_transition(sign_request()).await.unwrap_err());
+        assert_internal(client.cancel_job(job_request()).await.unwrap_err());
+        assert_internal(client.get_info().await.unwrap_err());
+        assert_internal(client.get_accumulator().await.unwrap_err());
+        assert_internal(
+            match client.list_inscriptions(inscriptions_request()).await {
+                Ok(_) => panic!("list_inscriptions must fail"),
+                Err(err) => err,
+            },
+        );
+        assert_internal(
+            client
+                .get_nullifier_path(nullifier_request())
+                .await
+                .unwrap_err(),
+        );
+        assert_internal(
+            client
+                .open_pull_challenge(challenge_request())
+                .await
+                .unwrap_err(),
+        );
+        assert_internal(client.attest_balance(attest_request()).await.unwrap_err());
+        assert_internal(client.issue_view_grant(grant_request()).await.unwrap_err());
+        assert_internal(
+            client
+                .pull(
+                    pull_request(SessionAuthority::Ownership),
+                    SessionAuthority::Ownership,
+                )
+                .await
+                .unwrap_err(),
+        );
+        assert_internal(client.get_record(record_request()).await.unwrap_err());
+        assert_internal(client.get_coin_proof(coin_request()).await.unwrap_err());
+        assert_internal(
+            client
+                .get_account_state(account_request())
+                .await
+                .unwrap_err(),
+        );
+        assert_internal(match client.subscribe_receipts(receipts_request()).await {
+            Ok(_) => panic!("subscribe_receipts must fail"),
+            Err(err) => err,
+        });
+        assert_internal(
+            client
+                .entrust_operational_bundle(entrust_request())
+                .await
+                .unwrap_err(),
+        );
+        assert_internal(
+            client
+                .revoke_operational_bundle(revoke_request())
+                .await
+                .unwrap_err(),
+        );
+        assert_internal(client.publish(publish_request()).await.unwrap_err());
+
+        harness
+            .finish(&[
+                "get_token_provenance",
+                "submit_transition",
+                "get_job",
+                "stream_job",
+                "sign_transition",
+                "cancel_job",
+                "get_info",
+                "get_accumulator",
+                "list_inscriptions",
+                "get_nullifier_path",
+                "open_pull_challenge",
+                "attest_balance",
+                "issue_view_grant",
+                "pull",
+                "get_record",
+                "get_coin_proof",
+                "get_account_state",
+                "subscribe_receipts",
+                "entrust_operational_bundle",
+                "revoke_operational_bundle",
+                "publish",
+            ])
+            .await;
     }
 }

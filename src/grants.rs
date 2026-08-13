@@ -368,3 +368,98 @@ pub async fn post_grants_revoke(
     let body = json!({ "revoked": true });
     Ok((StatusCode::OK, Json(body)).into_response())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scope(
+        asset_ids: Value,
+        not_before: Option<&str>,
+        not_after: Option<&str>,
+    ) -> GrantScopeJson {
+        GrantScopeJson {
+            asset_ids,
+            not_before: not_before.map(str::to_string),
+            not_after: not_after.map(str::to_string),
+        }
+    }
+
+    fn assert_malformed(result: Result<NormalisedScope, ApiError>, message_fragment: &str) {
+        let err = result.err().expect("scope must be rejected");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.error, "malformed_request");
+        assert!(
+            err.body.message.contains(message_fragment),
+            "expected {message_fragment:?} in {:?}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn normalise_explicit_scope_and_convert_every_field_to_proto() {
+        let first = [0x11; 32];
+        let second = [0x22; 32];
+        let normalised = normalise_scope(&scope(
+            json!([encode_hex(&first), encode_hex(&second)]),
+            Some("7"),
+            Some("99"),
+        ))
+        .expect("valid explicit scope");
+        assert!(!normalised.all_assets);
+        assert_eq!(normalised.asset_ids, vec![first, second]);
+        assert_eq!(normalised.not_before, 7);
+        assert_eq!(normalised.not_after, 99);
+
+        let proto = scope_to_proto(&normalised);
+        assert!(!proto.all_assets);
+        assert_eq!(proto.asset_ids, vec![first.to_vec(), second.to_vec()]);
+        assert_eq!(proto.not_before, 7);
+        assert_eq!(proto.not_after, 99);
+    }
+
+    #[test]
+    fn normalise_scope_rejects_every_malformed_asset_shape() {
+        assert_malformed(
+            normalise_scope(&scope(json!("all"), None, None)),
+            "string must be \"*\"",
+        );
+        assert_malformed(
+            normalise_scope(&scope(json!([7]), None, None)),
+            "asset_ids[0] must be a hex string",
+        );
+        assert_malformed(
+            normalise_scope(&scope(json!(["abcd"]), None, None)),
+            "asset_ids[0]",
+        );
+        assert_malformed(
+            normalise_scope(&scope(json!([]), None, None)),
+            "list must be non-empty",
+        );
+        assert_malformed(
+            normalise_scope(&scope(json!({"asset": "x"}), None, None)),
+            "must be \"*\" or an array",
+        );
+    }
+
+    #[test]
+    fn normalise_scope_rejects_bad_bounds_order_and_duplicates() {
+        assert_malformed(
+            normalise_scope(&scope(json!("*"), Some("-1"), None)),
+            "scope.not_before",
+        );
+        assert_malformed(
+            normalise_scope(&scope(json!("*"), None, Some("nope"))),
+            "scope.not_after",
+        );
+        assert_malformed(
+            normalise_scope(&scope(json!("*"), Some("10"), Some("9"))),
+            "time interval is empty",
+        );
+        let id = encode_hex(&[0x33; 32]);
+        assert_malformed(
+            normalise_scope(&scope(json!([id, encode_hex(&[0x33; 32])]), None, None)),
+            "strictly ascending and unique",
+        );
+    }
+}

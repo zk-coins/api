@@ -17,9 +17,9 @@ pub mod jobs;
 pub mod kernel;
 pub mod ownership;
 pub mod proto_identity;
+pub mod provenance;
 pub mod publish;
 pub mod pull;
-pub mod provenance;
 pub mod routes;
 pub mod state;
 

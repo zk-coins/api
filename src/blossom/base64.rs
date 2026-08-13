@@ -187,5 +187,23 @@ mod tests {
     fn rejects_bad_padding() {
         let err = decode("Zg=A").expect_err("pad then non-pad");
         assert_eq!(err, Base64Error::Padding);
+
+        let err = decode("Zm8=AAAA").expect_err("padding before final quartet");
+        assert_eq!(err, Base64Error::Padding);
+    }
+
+    #[test]
+    fn decodes_both_standard_alphabet_symbols() {
+        assert_eq!(decode("+/8=").unwrap(), [0xfb, 0xff]);
+    }
+
+    #[test]
+    fn errors_have_stable_diagnostic_messages() {
+        assert_eq!(
+            Base64Error::Char(b'_').to_string(),
+            "invalid base64 character 0x5f"
+        );
+        assert_eq!(Base64Error::Length.to_string(), "invalid base64 length");
+        assert_eq!(Base64Error::Padding.to_string(), "invalid base64 padding");
     }
 }
