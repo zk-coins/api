@@ -234,3 +234,50 @@ fn unix_now() -> u64 {
         .expect("system clock before UNIX_EPOCH")
         .as_secs()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+
+    #[test]
+    fn require_octet_stream_missing_content_type_is_malformed() {
+        let headers = HeaderMap::new();
+        let err = require_octet_stream(&headers).expect_err("missing Content-Type");
+        assert_eq!(err.body.error, "malformed_request");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn require_octet_stream_non_utf8_is_malformed() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_bytes(&[0xff, 0xfe]).expect("raw header bytes"),
+        );
+        let err = require_octet_stream(&headers).expect_err("non-utf8 Content-Type");
+        assert_eq!(err.body.error, "malformed_request");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn require_octet_stream_json_and_multipart_are_malformed() {
+        for ct in ["application/json", "multipart/form-data"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(ct));
+            let err = require_octet_stream(&headers).expect_err(ct);
+            assert_eq!(err.body.error, "malformed_request");
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn require_octet_stream_exact_is_ok() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        require_octet_stream(&headers).expect("exact media type");
+    }
+}

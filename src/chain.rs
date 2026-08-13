@@ -1131,4 +1131,137 @@ mod tests {
         let err = require_strict_triple_order(&dup).expect_err("duplicate triple");
         assert_eq!(err.body.error, "internal_error");
     }
+
+    // -----------------------------------------------------------------------
+    // Fail-closed parse / encode / cursor branches (no kernel mock)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_list_inscriptions_query_duplicate_keys_are_malformed() {
+        for (query, key) in [
+            ("from_height=1&from_height=2", "from_height"),
+            ("from_tx_index=1&from_tx_index=2", "from_tx_index"),
+            ("from_vin_index=1&from_vin_index=2", "from_vin_index"),
+            ("limit=1&limit=2", "limit"),
+        ] {
+            let err = parse_list_inscriptions_query(Some(query)).expect_err(key);
+            assert_eq!(err.body.error, "malformed_request");
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            assert!(
+                err.body.message.contains(key),
+                "message must name {key}, got {}",
+                err.body.message
+            );
+        }
+    }
+
+    #[test]
+    fn inscription_to_json_rejects_format_above_one() {
+        let mut ins = sample_inscription(1, 0, 0, "pending", vec![sample_nullifier("pending")]);
+        ins.format = 2;
+        let err = inscription_to_json(&ins).expect_err("format 2");
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            err.cause().unwrap_or("").contains("format"),
+            "operator cause must name format, got {:?}",
+            err.cause()
+        );
+    }
+
+    #[test]
+    fn exclusive_successor_increments_and_rejects_max_triple() {
+        let next = TripleCursor {
+            height: 1,
+            tx_index: 2,
+            vin_index: 3,
+        }
+        .exclusive_successor()
+        .expect("vin+1");
+        assert_eq!((next.height, next.tx_index, next.vin_index), (1, 2, 4));
+
+        let next = TripleCursor {
+            height: 1,
+            tx_index: 2,
+            vin_index: u64::MAX,
+        }
+        .exclusive_successor()
+        .expect("tx+1, vin=0");
+        assert_eq!((next.height, next.tx_index, next.vin_index), (1, 3, 0));
+
+        let next = TripleCursor {
+            height: 1,
+            tx_index: u64::MAX,
+            vin_index: u64::MAX,
+        }
+        .exclusive_successor()
+        .expect("height+1");
+        assert_eq!((next.height, next.tx_index, next.vin_index), (2, 0, 0));
+
+        let err = TripleCursor {
+            height: u64::MAX,
+            tx_index: u64::MAX,
+            vin_index: u64::MAX,
+        }
+        .exclusive_successor()
+        .expect_err("max triple");
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn present_true_empty_leaf_is_internal() {
+        let path = NullifierPath {
+            root: vec![0x01; 32],
+            tip_height: 10,
+            present: true,
+            leaf: Vec::new(),
+            position: 3,
+            audit_path: Vec::new(),
+            tree_size: 4,
+            tip_block_hash: vec![0x04; 32],
+        };
+        let err = nullifier_path_to_json(&path).expect_err("present without leaf");
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn present_false_nonempty_leaf_is_internal() {
+        let path = NullifierPath {
+            root: vec![0x01; 32],
+            tip_height: 10,
+            present: false,
+            leaf: vec![0x02; 32],
+            position: 0,
+            audit_path: Vec::new(),
+            tree_size: 4,
+            tip_block_hash: vec![0x04; 32],
+        };
+        let err = nullifier_path_to_json(&path).expect_err("absent with leaf");
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn present_false_nonempty_audit_path_is_internal() {
+        let path = NullifierPath {
+            root: vec![0x01; 32],
+            tip_height: 10,
+            present: false,
+            leaf: Vec::new(),
+            position: 0,
+            audit_path: vec![vec![0x03; 32]],
+            tree_size: 4,
+            tip_block_hash: vec![0x04; 32],
+        };
+        let err = nullifier_path_to_json(&path).expect_err("absent with audit_path");
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

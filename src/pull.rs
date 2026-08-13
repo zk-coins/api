@@ -805,3 +805,424 @@ fn receipt_to_json(r: &Receipt) -> Result<Value, ApiError> {
         "credited_at": r.credited_at.to_string(),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+    use serde_json::{json, Value};
+
+    fn hex32(byte: u8) -> String {
+        crate::hexutil::encode_hex(&[byte; 32])
+    }
+
+    fn scope(asset_ids: Value, not_before: Option<&str>, not_after: Option<&str>) -> PullScopeJson {
+        PullScopeJson {
+            asset_ids,
+            not_before: not_before.map(str::to_string),
+            not_after: not_after.map(str::to_string),
+        }
+    }
+
+    fn assert_malformed(err: &ApiError) {
+        assert_eq!(err.body.error, "malformed_request");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    fn assert_internal(err: &ApiError) {
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    fn assert_unauthorized(err: &ApiError) {
+        assert_eq!(err.body.error, "unauthorized");
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        assert_ne!(err.status, StatusCode::GONE);
+    }
+
+    fn sample_record_ref(record_type: &str, transition_kind: &str) -> RecordRef {
+        RecordRef {
+            record_id: vec![0x11u8; 32],
+            record_type: record_type.into(),
+            transition_kind: transition_kind.into(),
+            blob_id: vec![0x22u8; 32],
+            occurred_at: 1_700_000_000,
+        }
+    }
+
+    fn sample_receipt(coin_byte: u8, amount: &str, state: &str, credited_at: u64) -> Receipt {
+        Receipt {
+            coin_id: vec![coin_byte; 32],
+            asset_id: vec![0xABu8; 32],
+            amount: amount.to_string(),
+            state: state.into(),
+            credited_at,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // normalise_scope
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalise_scope_star_is_all_assets_empty_ids() {
+        let resolved = normalise_scope(&scope(json!("*"), None, None)).expect("star");
+        assert!(resolved.all_assets);
+        assert!(resolved.asset_ids.is_empty());
+    }
+
+    #[test]
+    fn normalise_scope_non_star_string_is_malformed() {
+        let err = normalise_scope(&scope(json!("foo"), None, None)).expect_err("non-star string");
+        assert_malformed(&err);
+    }
+
+    #[test]
+    fn normalise_scope_empty_array_is_malformed() {
+        let err = normalise_scope(&scope(json!([]), None, None)).expect_err("empty array");
+        assert_malformed(&err);
+    }
+
+    #[test]
+    fn normalise_scope_non_string_array_element_is_malformed() {
+        let err = normalise_scope(&scope(json!([1]), None, None)).expect_err("numeric element");
+        assert_malformed(&err);
+        let err = normalise_scope(&scope(json!([null]), None, None)).expect_err("null element");
+        assert_malformed(&err);
+    }
+
+    #[test]
+    fn normalise_scope_non_hex32_element_is_malformed() {
+        let err = normalise_scope(&scope(json!(["zz"]), None, None)).expect_err("non-hex");
+        assert_malformed(&err);
+        let short = crate::hexutil::encode_hex(&[0xABu8; 16]);
+        let err = normalise_scope(&scope(json!([short]), None, None)).expect_err("16-byte hex");
+        assert_malformed(&err);
+    }
+
+    #[test]
+    fn normalise_scope_number_or_object_asset_ids_is_malformed() {
+        let err = normalise_scope(&scope(json!(1), None, None)).expect_err("number");
+        assert_malformed(&err);
+        let err = normalise_scope(&scope(json!({}), None, None)).expect_err("object");
+        assert_malformed(&err);
+    }
+
+    /// Unsorted ids stay malformed: validate_resolved_scope does not sort.
+    #[test]
+    fn normalise_scope_unsorted_hex32_pair_is_malformed() {
+        let err = normalise_scope(&scope(json!([hex32(0x02), hex32(0x01)]), None, None))
+            .expect_err("descending pair must stay malformed");
+        assert_malformed(&err);
+    }
+
+    #[test]
+    fn normalise_scope_ascending_unique_hex32_pair_is_ok() {
+        let resolved = normalise_scope(&scope(json!([hex32(0x01), hex32(0x02)]), None, None))
+            .expect("ascending pair");
+        assert!(!resolved.all_assets);
+        assert_eq!(resolved.asset_ids, vec![[0x01u8; 32], [0x02u8; 32]]);
+    }
+
+    #[test]
+    fn normalise_scope_absent_bounds_are_sentinels() {
+        let resolved = normalise_scope(&scope(json!("*"), None, None)).expect("sentinels");
+        assert_eq!(resolved.not_before, 0);
+        assert_eq!(resolved.not_after, SCOPE_NOT_AFTER_UNBOUNDED);
+    }
+
+    #[test]
+    fn normalise_scope_non_decimal_bounds_are_malformed() {
+        let err = normalise_scope(&scope(json!("*"), Some("abc"), None))
+            .expect_err("non-decimal not_before");
+        assert_malformed(&err);
+        let err =
+            normalise_scope(&scope(json!("*"), None, Some("-1"))).expect_err("negative not_after");
+        assert_malformed(&err);
+        let err = normalise_scope(&scope(json!("*"), Some("1.5"), None))
+            .expect_err("fractional not_before");
+        assert_malformed(&err);
+        let err = normalise_scope(&scope(json!("*"), None, Some(""))).expect_err("empty not_after");
+        assert_malformed(&err);
+    }
+
+    #[test]
+    fn normalise_scope_empty_interval_is_malformed_without_swap() {
+        let err = normalise_scope(&scope(json!("*"), Some("100"), Some("50")))
+            .expect_err("not_before > not_after must not swap");
+        assert_malformed(&err);
+    }
+
+    // -----------------------------------------------------------------------
+    // map_record_type / map_transition_kind / record_ref_to_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn map_record_type_coinproof_ok() {
+        assert_eq!(
+            map_record_type("coinproof").expect("coinproof"),
+            "coinproof"
+        );
+    }
+
+    #[test]
+    fn map_record_type_self_delivery_ok() {
+        assert_eq!(
+            map_record_type("self_delivery").expect("self_delivery"),
+            "self_delivery"
+        );
+    }
+
+    #[test]
+    fn map_record_type_unknown_is_internal_not_malformed() {
+        let err = map_record_type("invoice").expect_err("unknown type");
+        assert_internal(&err);
+        assert_ne!(err.body.error, "malformed_request");
+    }
+
+    #[test]
+    fn map_transition_kind_empty_coinproof_is_none() {
+        let kind = map_transition_kind("", "coinproof").expect("empty coinproof");
+        assert_eq!(kind, None);
+    }
+
+    #[test]
+    fn map_transition_kind_empty_self_delivery_is_internal() {
+        let err = map_transition_kind("", "self_delivery").expect_err("required kind");
+        assert_internal(&err);
+    }
+
+    #[test]
+    fn map_transition_kind_mint_send_receive_ok() {
+        assert_eq!(
+            map_transition_kind("mint", "self_delivery").expect("mint"),
+            Some("mint")
+        );
+        assert_eq!(
+            map_transition_kind("send", "self_delivery").expect("send"),
+            Some("send")
+        );
+        assert_eq!(
+            map_transition_kind("receive", "coinproof").expect("receive"),
+            Some("receive")
+        );
+    }
+
+    #[test]
+    fn map_transition_kind_unknown_nonempty_is_internal() {
+        let err = map_transition_kind("burn", "coinproof").expect_err("unknown kind");
+        assert_internal(&err);
+    }
+
+    #[test]
+    fn record_ref_to_json_rejects_record_id_not_32() {
+        let mut r = sample_record_ref("coinproof", "");
+        r.record_id = vec![0x11u8; 16];
+        let err = record_ref_to_json(&r).expect_err("short record_id");
+        assert_internal(&err);
+    }
+
+    #[test]
+    fn record_ref_to_json_rejects_blob_id_not_32() {
+        let mut r = sample_record_ref("coinproof", "");
+        r.blob_id = vec![0x22u8; 16];
+        let err = record_ref_to_json(&r).expect_err("short blob_id");
+        assert_internal(&err);
+    }
+
+    #[test]
+    fn record_ref_to_json_coinproof_omits_transition_kind() {
+        let r = sample_record_ref("coinproof", "");
+        let json = record_ref_to_json(&r).expect("coinproof json");
+        assert_eq!(json["record_id"], hex32(0x11));
+        assert_eq!(json["record_type"], "coinproof");
+        assert_eq!(json["blob_id"], hex32(0x22));
+        assert_eq!(json["occurred_at"], "1700000000");
+        assert!(json.get("transition_kind").is_none());
+    }
+
+    #[test]
+    fn record_ref_to_json_self_delivery_includes_transition_kind() {
+        let r = sample_record_ref("self_delivery", "mint");
+        let json = record_ref_to_json(&r).expect("self_delivery json");
+        assert_eq!(json["record_type"], "self_delivery");
+        assert_eq!(json["transition_kind"], "mint");
+        assert_eq!(json["record_id"], hex32(0x11));
+        assert_eq!(json["blob_id"], hex32(0x22));
+    }
+
+    // -----------------------------------------------------------------------
+    // bearer_token
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bearer_token_missing_header_is_unauthorized() {
+        let headers = HeaderMap::new();
+        let err = bearer_token(&headers).expect_err("missing");
+        assert_unauthorized(&err);
+    }
+
+    #[test]
+    fn bearer_token_non_utf8_is_unauthorized() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_bytes(&[0xff, 0xfe]).expect("raw header bytes"),
+        );
+        let err = bearer_token(&headers).expect_err("non-utf8");
+        assert_unauthorized(&err);
+    }
+
+    #[test]
+    fn bearer_token_missing_bearer_prefix_is_unauthorized() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Token tok"));
+        let err = bearer_token(&headers).expect_err("Token prefix");
+        assert_unauthorized(&err);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("bearer tok"),
+        );
+        let err = bearer_token(&headers).expect_err("lowercase bearer");
+        assert_unauthorized(&err);
+    }
+
+    #[test]
+    fn bearer_token_empty_token_is_unauthorized() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer "));
+        let err = bearer_token(&headers).expect_err("empty token");
+        assert_unauthorized(&err);
+    }
+
+    #[test]
+    fn bearer_token_whitespace_or_control_is_unauthorized() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer tok en"),
+        );
+        let err = bearer_token(&headers).expect_err("whitespace in token");
+        assert_unauthorized(&err);
+
+        // Tab is the only ASCII control byte HeaderValue accepts (and is whitespace).
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer tok\t"),
+        );
+        let err = bearer_token(&headers).expect_err("control/whitespace byte in token");
+        assert_unauthorized(&err);
+    }
+
+    #[test]
+    fn bearer_token_valid_returns_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer tok"),
+        );
+        let token = bearer_token(&headers).expect("valid bearer");
+        assert_eq!(token, "tok");
+    }
+
+    // -----------------------------------------------------------------------
+    // session_chan_bind
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn session_chan_bind_empty_hosts_is_internal() {
+        let err = session_chan_bind(&[]).expect_err("empty hosts");
+        assert_internal(&err);
+    }
+
+    #[test]
+    fn session_chan_bind_single_host_matches_chan_bind_for_host() {
+        let host = "example.com";
+        let bind = session_chan_bind(&[host.to_string()]).expect("single host");
+        assert_eq!(bind, chan_bind_for_host(host));
+    }
+
+    #[test]
+    fn session_chan_bind_two_hosts_is_internal() {
+        let hosts = vec!["a.example".to_string(), "b.example".to_string()];
+        let err = session_chan_bind(&hosts).expect_err("two hosts");
+        assert_internal(&err);
+        // Multi-host must fail closed rather than returning either host's bind.
+        assert_ne!(
+            chan_bind_for_host("a.example"),
+            chan_bind_for_host("b.example"),
+            "fixture hosts must have distinct binds so a silent pick would be detectable"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // receipt_to_json / receipt_stream_break_event
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn receipt_to_json_rejects_coin_id_not_32() {
+        let mut r = sample_receipt(0x11, "100", "completed", 1_700_000_000);
+        r.coin_id = vec![0x11u8; 16];
+        let err = receipt_to_json(&r).expect_err("short coin_id");
+        assert_internal(&err);
+    }
+
+    #[test]
+    fn receipt_to_json_rejects_asset_id_not_32() {
+        let mut r = sample_receipt(0x11, "100", "completed", 1_700_000_000);
+        r.asset_id = vec![0xABu8; 16];
+        let err = receipt_to_json(&r).expect_err("short asset_id");
+        assert_internal(&err);
+    }
+
+    #[test]
+    fn receipt_to_json_rejects_empty_amount() {
+        let r = sample_receipt(0x11, "", "completed", 1_700_000_000);
+        let err = receipt_to_json(&r).expect_err("empty amount");
+        assert_internal(&err);
+    }
+
+    #[test]
+    fn receipt_to_json_rejects_empty_state() {
+        let r = sample_receipt(0x11, "100", "", 1_700_000_000);
+        let err = receipt_to_json(&r).expect_err("empty state");
+        assert_internal(&err);
+    }
+
+    #[test]
+    fn receipt_to_json_valid_hex_and_decimal_credited_at() {
+        let r = sample_receipt(0x11, "100", "completed", 1_700_000_000);
+        let json = receipt_to_json(&r).expect("valid receipt");
+        assert_eq!(json["coin_id"], hex32(0x11));
+        assert_eq!(json["asset_id"], hex32(0xAB));
+        assert_eq!(json["amount"], "100");
+        assert_eq!(json["state"], "completed");
+        assert_eq!(json["credited_at"], "1700000000");
+    }
+
+    #[test]
+    fn receipt_stream_break_event_is_error_with_code_and_message() {
+        let err = ApiError::unauthorized("x");
+        let ev = receipt_stream_break_event(&err);
+        let data = json!({
+            "error": err.body.error,
+            "message": err.body.message,
+        });
+        let expected = Event::default().event("error").data(data.to_string());
+        // Event fields are private; compare reconstructed Debug text.
+        assert_eq!(format!("{ev:?}"), format!("{expected:?}"));
+
+        let err = ApiError::internal("cause");
+        let ev = receipt_stream_break_event(&err);
+        let data = json!({
+            "error": err.body.error,
+            "message": err.body.message,
+        });
+        let expected = Event::default().event("error").data(data.to_string());
+        assert_eq!(format!("{ev:?}"), format!("{expected:?}"));
+    }
+}
