@@ -4668,6 +4668,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pull_challenge_invalid_subject_is_400() {
+        let kernel = Arc::new(ScriptedKernel::default());
+        let app = build_router(test_config(), kernel.clone()).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pull/challenge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "subject": "not-a-zk-address" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "malformed_request");
+        assert_eq!(kernel.open_challenge_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn pull_challenge_kernel_nonce_wrong_len_is_500() {
         let (_, _, _, _, subject_bech) = ownership_fixtures::identity();
         let kernel = Arc::new(ScriptedKernel {
@@ -5657,6 +5680,68 @@ mod tests {
                 account_state: vec![0xAAu8; 16],
                 state_head: vec![0xBBu8; 16],
                 head_record_id: vec![0xCCu8; 32],
+                send_counter: 7,
+                current_pubkey: vec![0xDDu8; 32],
+                last_nullifier_pk: vec![0xEEu8; 32],
+                last_nullifier_r: vec![0xFFu8; 32],
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/account/state")
+                    .header("authorization", "Bearer own-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn get_account_state_current_pubkey_wrong_len_is_500() {
+        let kernel = Arc::new(ScriptedKernel {
+            get_account_state: Some(Ok(AccountStateResult {
+                account_state: vec![0xAAu8; 16],
+                state_head: vec![0xBBu8; 32],
+                head_record_id: vec![0xCCu8; 32],
+                send_counter: 7,
+                current_pubkey: vec![0xDD; 16],
+                last_nullifier_pk: vec![0xEEu8; 32],
+                last_nullifier_r: vec![0xFFu8; 32],
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/account/state")
+                    .header("authorization", "Bearer own-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn get_account_state_head_record_id_wrong_len_is_500() {
+        let kernel = Arc::new(ScriptedKernel {
+            get_account_state: Some(Ok(AccountStateResult {
+                account_state: vec![0xAAu8; 16],
+                state_head: vec![0xBBu8; 32],
+                head_record_id: vec![0xCC; 8],
                 send_counter: 7,
                 current_pubkey: vec![0xDDu8; 32],
                 last_nullifier_pk: vec![0xEEu8; 32],
@@ -8854,6 +8939,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res2.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn grants_revoke_parallel_second_take_is_unauthorized() {
+        use crate::ownership::{pull_challenge_message, REVOKE_GRANT_CHALLENGE_DOMAIN};
+
+        let host = "node.example.com"; // matches test_config public host
+        let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
+        let (grant_bech, _, _, _) = test_signed_zkgrant(&subject_raw, 0x55, 0x66, 0x77);
+        let app = build_router(test_config(), Arc::new(ScriptedKernel::default())).expect("router");
+        let (nonce_hex, expiry, nonce_raw) =
+            issue_grant_revoke_challenge(&app, &subject_bech).await;
+
+        let cb = chan_bind_for_host(host);
+        let chal = pull_challenge_message(
+            REVOKE_GRANT_CHALLENGE_DOMAIN,
+            &nonce_raw,
+            &cb,
+            &subject_raw,
+            expiry,
+        );
+        let sig = ownership_fixtures::sign_chal(&sk, &chal);
+        let body =
+            grant_revoke_ownership_body(&nonce_hex, &subject_bech, &pk0, &nkc, &sig, &grant_bech);
+        let body_str = body.to_string();
+
+        let req_a = Request::builder()
+            .method("POST")
+            .uri("/v1/grants/revoke")
+            .header("content-type", "application/json")
+            .body(Body::from(body_str.clone()))
+            .unwrap();
+        let req_b = Request::builder()
+            .method("POST")
+            .uri("/v1/grants/revoke")
+            .header("content-type", "application/json")
+            .body(Body::from(body_str))
+            .unwrap();
+
+        let (res_a, res_b) = tokio::join!(app.clone().oneshot(req_a), app.clone().oneshot(req_b),);
+        let res_a = res_a.unwrap();
+        let res_b = res_b.unwrap();
+        let statuses = [res_a.status(), res_b.status()];
+        assert!(
+            statuses.contains(&StatusCode::OK) && statuses.contains(&StatusCode::UNAUTHORIZED),
+            "parallel revoke on same nonce must yield one 200 and one 401, got {statuses:?}",
+        );
+        assert!(
+            !statuses.contains(&StatusCode::INTERNAL_SERVER_ERROR),
+            "parallel revoke must not 500, got {statuses:?}",
+        );
     }
 
     #[tokio::test]
