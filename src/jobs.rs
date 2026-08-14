@@ -1,6 +1,6 @@
 //! Job-surface REST handlers (§7.5) over kernel job procedures (§7.8).
 //!
-//! Endpoints (Spec-Schreibweise): `POST /v1/tx`, `GET /v1/jobs/<job_id>`,
+//! Endpoints (spec advertised form): `POST /v1/tx`, `GET /v1/jobs/<job_id>`,
 //! `GET /v1/jobs/<job_id>/stream`, `POST /v1/jobs/<job_id>/sign`,
 //! `POST /v1/jobs/<job_id>/cancel`. Axum registers the derived `:job_id` matcher.
 

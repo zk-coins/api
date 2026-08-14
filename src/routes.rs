@@ -66,7 +66,7 @@ impl std::error::Error for StartupError {}
 /// That string is what `GET /` emits. Axum 0.7 / matchit 0.7 do **not** treat
 /// `<name>` (or `{name}`) as a parameter — only `:name` is dynamic — so
 /// registration rewrites via [`advertised_path_to_axum_matcher`]. Discovery
-/// never uses the matcher form; clients see Spec-Schreibweise only.
+/// never uses the matcher form; clients see the spec advertised form only.
 ///
 /// A conforming producer emits exactly the closed keys **for the surfaces this
 /// deployment exposes** and MUST omit keys for unadvertised optional roles.
@@ -456,7 +456,7 @@ async fn feature_disabled_handler() -> ApiError {
 
 /// Look up the canonical **advertised** path for a closed §7.5 key.
 ///
-/// Returns Spec-Schreibweise (`<name>` placeholders). Never the axum matcher
+/// Returns the spec advertised form (`<name>` placeholders). Never the axum matcher
 /// form — that is derived only at registration time.
 ///
 /// Panics if `key` is absent from [`CLOSED_ENDPOINT_KEYS`]: a served key
@@ -1416,7 +1416,7 @@ mod tests {
             endpoints["chain_accumulator"].as_str(),
             Some("/v1/chain/accumulator")
         );
-        // Spec-Schreibweise on the wire — never the axum matcher form.
+        // Spec advertised form on the wire — never the axum matcher form.
         assert_eq!(
             endpoints["chain_nullifier"].as_str(),
             Some("/v1/chain/nullifier/<pubkey>")

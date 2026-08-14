@@ -82,10 +82,10 @@ pub struct GrantsRevokeBody {
     pub grant: String,
 }
 
-/// §5.1 RECOMMENDED challenge TTL, gespiegelt von
-/// `node/src/kernel/bootstrap/challenges.rs::CHALLENGE_TTL_SECS` (60s) — die
-/// gleiche Grössenordnung wie jede andere Challenge in diesem System, auch
-/// wenn dieser Store rein api-lokal ist.
+/// §5.1 RECOMMENDED challenge TTL, mirrored from
+/// `node/src/kernel/bootstrap/challenges.rs::CHALLENGE_TTL_SECS` (60s) — the
+/// same order of magnitude as every other challenge in this system, even
+/// though this store is api-local only.
 const GRANT_REVOKE_CHALLENGE_TTL_SECS: u64 = 60;
 
 fn unix_now() -> Result<u64, ApiError> {
@@ -288,7 +288,7 @@ pub async fn post_grants(
 }
 
 /// `POST /v1/grants/revoke/challenge` — issue a fresh single-use nonce for
-/// grant revocation. Rein api-lokal, kein Kernel-Dial (§5.2).
+/// grant revocation. Api-local only; no kernel dial (§5.2).
 pub async fn post_grants_revoke_challenge(
     State(state): State<AppState>,
     JsonBody(body): JsonBody<GrantsRevokeChallengeBody>,
@@ -312,8 +312,8 @@ pub async fn post_grants_revoke_challenge(
 }
 
 /// `POST /v1/grants/revoke` — verify OwnershipProof under RevokeGrant domain
-/// and grant→subject binding, then populate `revoked_grants`. Rein api-lokal,
-/// KEIN Kernel-Dial an irgendeiner Stelle (§5.2).
+/// and grant→subject binding, then populate `revoked_grants`. Api-local only;
+/// no kernel dial at any point (§5.2).
 pub async fn post_grants_revoke(
     State(state): State<AppState>,
     JsonBody(body): JsonBody<GrantsRevokeBody>,

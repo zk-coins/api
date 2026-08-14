@@ -52,7 +52,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
 async-trait = "0.1"
 # SHA-256 for chal / request_hash / chan_bind / address binding (§1.1, §5.1).
-sha2 = "0.10"
+sha2 = "0.10.9"
 # CSPRNG for the api-local grant-revoke challenge nonce (§5.2) — no kernel
 # Redeem exists for this action, so the api generates its own nonce here.
 getrandom = "0.4"
