@@ -20,12 +20,12 @@
 # Boot environment (from src/config.rs + src/startup.rs — fail-closed; no image
 # defaults for bind/kernel/store). Names, meaning, requiredness:
 #
-# Pflicht (Variable muss gesetzt sein; leerer Wert wo vermerkt erlaubt):
+# Required (variable must be set; empty value allowed where noted):
 #
 #   ZKCOINS_BIND_ADDR
 #     HTTP listen address as `host:port` (parsed as SocketAddr).
 #     Required, non-empty. Empty or garbage → start error (ConfigError).
-#     Codestelle: src/config.rs ENV_BIND / require_present; bind in
+#     Source: src/config.rs ENV_BIND / require_present; bind in
 #     src/startup.rs TcpListener::bind(config.bind_addr).
 #     Convention for local stack / EXPOSE: 0.0.0.0:8080 (not hard-coded
 #     in the binary — only in operator env).
@@ -33,20 +33,20 @@
 #   ZKCOINS_KERNEL_ADDR
 #     Kernel gRPC target URI (opaque non-empty string, tonic Endpoint).
 #     Required, non-empty. Bad URI → start error at connect_lazy.
-#     Codestelle: src/config.rs ENV_KERNEL; dial src/startup.rs
+#     Source: src/config.rs ENV_KERNEL; dial src/startup.rs
 #     connect_lazy / src/kernel/client.rs KernelClient::connect_lazy.
 #
 #   ZKCOINS_FEATURES
 #     Comma-separated subset of §6.1 closed feature set:
 #     wallet, explorer, publisher, lightning_bridge, mail_bridge.
 #     Variable required; empty string = all features off (allowed).
-#     Unknown token → start error. Codestelle: src/config.rs ENV_FEATURES.
+#     Unknown token → start error. Source: src/config.rs ENV_FEATURES.
 #
 #   ZKCOINS_PUBLIC_HOST
 #     Comma-separated authoritative hostnames for §5.1 chan_bind.
 #     Variable required; empty string allowed (then OwnershipProof auth
 #     fails loud — no silent localhost). Never from HTTP Host header.
-#     Codestelle: src/config.rs ENV_PUBLIC_HOST.
+#     Source: src/config.rs ENV_PUBLIC_HOST.
 #
 # Optional Blossom surface (§7.4) — all-or-nothing:
 #
@@ -54,18 +54,18 @@
 #     Filesystem root for the content-addressed store.
 #     Absent ⇒ Blossom routes unmounted, three discovery keys unadvertised.
 #     Present-but-empty ⇒ start error (no /tmp default).
-#     Codestelle: src/config.rs ENV_BLOSSOM_STORE / parse_blossom_config.
+#     Source: src/config.rs ENV_BLOSSOM_STORE / parse_blossom_config.
 #
-#   When ZKCOINS_BLOSSOM_STORE is set, these companions become Pflicht:
+#   When ZKCOINS_BLOSSOM_STORE is set, these companions become required:
 #
 #   ZKCOINS_BLOSSOM_MAX_BLOB_BYTES
 #     Advertised upload size limit; strict decimal u64, must be > 0.
-#     Codestelle: src/config.rs ENV_BLOSSOM_MAX_BLOB_BYTES.
+#     Source: src/config.rs ENV_BLOSSOM_MAX_BLOB_BYTES.
 #
 #   ZKCOINS_BLOSSOM_ALLOWED_OPS
 #     Comma-separated lowercase-hex 32-byte op pubkeys allowed to upload.
 #     Variable required when store is set; empty string allowed
-#     (surface up, every upload 403). Codestelle: ENV_BLOSSOM_ALLOWED_OPS.
+#     (surface up, every upload 403). Source: ENV_BLOSSOM_ALLOWED_OPS.
 #
 # Optional (logging only — not process config):
 #
@@ -79,7 +79,7 @@ WORKDIR /app
 
 # kernel-proto/build.rs → tonic_build::configure().compile_protos(...)
 # needs `protoc` on PATH at compile time (see kernel-proto/build.rs).
-# Pin: Debian bookworm package protobuf-compiler 3.21.12-3
+# Pin: Debian bookworm package protobuf-compiler 3.21.12-3+deb12u1
 # (https://packages.debian.org/bookworm/protobuf-compiler) — not unversioned
 # `latest` and not a floating upstream tag.
 RUN apt-get update \
