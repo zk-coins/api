@@ -126,7 +126,7 @@ beworbene optionale Rollen weglassen. Unbekannte Keys beim Lesen ignorieren.
 | Kategorie | Anzahl |
 |---|---|
 | HTTP-Endpunkte (Method+Path) in der Tabelle oben | **33** |
-| davon in §7.5-Haupttext (ohne §7.4/§7.6/§7.7) | **24** |
+| davon in §7.5-Haupttext (ohne §7.4/§7.6/§7.7) | **25** |
 | + Publisher §7.6 | **1** |
 | + Bootstrap §7.7 | **3** |
 | + Blossom §7.4 (GET/HEAD/PUT/POST; kein DELETE) | **4** |
@@ -205,10 +205,11 @@ unkonfigurierter Blossom-Store bleibt unregistriert (bare 404)
 Discovery/`CLOSED_ENDPOINT_KEYS` nutzen die Spec-Schreibweise `<name>`
 (Axum-Matcher: `:name`).
 
-gRPC: getragenes `proto/kernel/v1/kernel.proto` (Identität per SHA-256-Pin +
-Sibling-Vergleich mit `zk-coins/node`), Client `tonic 0.13.1`, Fehlerübersetzung
-ausschließlich über `google.rpc.ErrorInfo` (`domain`, `reason`,
-`metadata["http_status"]`) — keine zweite Status-Tabelle im api.
+gRPC: getragenes `proto/kernel/v1/kernel.proto`. CI-Identität ist der SHA-256-Pin
+gegen diese getragene proto-Datei (`src/proto_identity.rs`, `PROTO_IDENTITY_CI_BOUNDARY`).
+Sibling-Vergleich mit `zk-coins/node` ist optional/lokal, kein CI-Gate. Client
+`tonic 0.13.1`, Fehlerübersetzung ausschließlich über `google.rpc.ErrorInfo`
+(`domain`, `reason`, `metadata["http_status"]`) — keine zweite Status-Tabelle im api.
 
 ### Dokumentierte Lücken
 
