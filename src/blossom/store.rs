@@ -169,6 +169,19 @@ impl BlobStore {
             .join(format!("{}.uploader", Self::blob_id_hex(id)))
     }
 
+    /// Fsync the store root directory. A complete pair is durable only after
+    /// this succeeds; callers must fail-closed on error (names on disk ≠ durable).
+    fn sync_store_root(&self) -> Result<(), ApiError> {
+        File::open(&self.root)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "blossom store: sync store root {}: {e}",
+                    self.root.display()
+                ))
+            })
+    }
+
     /// Acquire the per-blob serialisation lock (creates the map entry if needed).
     fn acquire_blob_lock(&self, id: &[u8; 32]) -> Arc<Mutex<()>> {
         let mut map = self.blob_locks.lock().unwrap_or_else(|e| e.into_inner());
@@ -348,7 +361,9 @@ impl BlobStore {
         let note_path = self.uploader_path(id);
 
         // Complete pair: first-uploader wins; do not rewrite note.
+        // Names on disk ≠ durable until store-root fsync succeeds.
         if final_path.is_file() && note_path.is_file() {
+            self.sync_store_root()?;
             return Ok(*id);
         }
 
@@ -393,7 +408,10 @@ impl BlobStore {
                 if note_path.is_file() && final_path.is_file() {
                     // per-blob lock makes this a crash leftover, not a concurrent race
                     #[cfg_attr(coverage_nightly, coverage(off))]
-                    return Ok(*id);
+                    {
+                        self.sync_store_root()?;
+                        return Ok(*id);
+                    }
                 }
                 return Err(ApiError::internal(
                     "blossom store: blob slot occupied without complete pair; \
@@ -412,18 +430,12 @@ impl BlobStore {
         match install_no_replace(&note_tmp, &note_path) {
             Ok(()) => {
                 // Both final names installed; durable only after store-root fsync.
-                File::open(&self.root)
-                    .and_then(|d| d.sync_all())
-                    .map_err(|e| {
-                        ApiError::internal(format!(
-                            "blossom store: sync store root {}: {e}",
-                            self.root.display()
-                        ))
-                    })?;
+                self.sync_store_root()?;
                 Ok(*id)
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 if note_path.is_file() {
+                    self.sync_store_root()?;
                     Ok(*id)
                 } else {
                     // Data permanence: do not roll back the installed blob.
