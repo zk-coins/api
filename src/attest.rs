@@ -199,7 +199,7 @@ mod tests {
     use crate::kernel::connect_lazy;
     use crate::ownership::{
         ChallengeEcho, GrantRevokeChallengeStore, OwnerOnlyProofJson, RevokedGrantSet,
-        SubjectOpDirectory,
+        SubjectOpDirectory, SubjectOpLocks,
     };
     use crate::state::AppState;
     use std::collections::BTreeSet;
@@ -213,6 +213,7 @@ mod tests {
             public_hosts: Arc::new(vec!["node.example.com".into()]),
             blossom: None,
             subject_ops: Arc::new(SubjectOpDirectory::new()),
+            subject_op_locks: Arc::new(SubjectOpLocks::new()),
             revoked_grants: Arc::new(RevokedGrantSet::new()),
             grant_revoke_challenges: Arc::new(GrantRevokeChallengeStore::new()),
         }

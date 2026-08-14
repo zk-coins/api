@@ -588,6 +588,7 @@ pub fn build_router(config: Config, kernel: KernelHandle) -> Result<Router, Star
         public_hosts: Arc::new(public_hosts),
         blossom: blossom_state,
         subject_ops: Arc::new(crate::ownership::SubjectOpDirectory::new()),
+        subject_op_locks: Arc::new(crate::ownership::SubjectOpLocks::new()),
         revoked_grants: Arc::new(crate::ownership::RevokedGrantSet::new()),
         grant_revoke_challenges: Arc::new(crate::ownership::GrantRevokeChallengeStore::new()),
     };
@@ -4835,6 +4836,11 @@ mod tests {
         assert_eq!(json["expiry"], "1700000060");
         assert_eq!(json["nonce"].as_str().unwrap().len(), 64);
         assert_eq!(kernel.open_challenge_calls.load(Ordering::SeqCst), 1);
+        // Proto: empty string means pull (`"" (pull) | "entrust" | …`).
+        assert_eq!(
+            kernel.last_open_challenge_action.lock().unwrap().as_deref(),
+            Some("")
+        );
     }
 
     #[tokio::test]
@@ -5187,6 +5193,7 @@ mod tests {
             public_hosts: Arc::new(config.public_hosts.clone()),
             blossom: None,
             subject_ops,
+            subject_op_locks: Arc::new(crate::ownership::SubjectOpLocks::new()),
             revoked_grants: Arc::new(RevokedGrantSet::new()),
             grant_revoke_challenges: Arc::new(crate::ownership::GrantRevokeChallengeStore::new()),
         };
@@ -9110,6 +9117,7 @@ mod tests {
             public_hosts: Arc::new(config.public_hosts.clone()),
             blossom: None,
             subject_ops,
+            subject_op_locks: Arc::new(crate::ownership::SubjectOpLocks::new()),
             revoked_grants: revoked_grants.clone(),
             grant_revoke_challenges,
         };
@@ -9231,6 +9239,7 @@ mod tests {
             public_hosts: Arc::new(config.public_hosts.clone()),
             blossom: None,
             subject_ops: Arc::new(SubjectOpDirectory::new()),
+            subject_op_locks: Arc::new(crate::ownership::SubjectOpLocks::new()),
             revoked_grants: revoked_grants.clone(),
             grant_revoke_challenges,
         };
@@ -9468,6 +9477,7 @@ mod tests {
             public_hosts: Arc::new(config.public_hosts.clone()),
             blossom: None,
             subject_ops: Arc::new(SubjectOpDirectory::new()),
+            subject_op_locks: Arc::new(crate::ownership::SubjectOpLocks::new()),
             revoked_grants: Arc::new(RevokedGrantSet::new()),
             grant_revoke_challenges: challenges,
         };
@@ -9533,6 +9543,7 @@ mod tests {
             public_hosts: Arc::new(config.public_hosts.clone()),
             blossom: None,
             subject_ops: Arc::new(SubjectOpDirectory::new()),
+            subject_op_locks: Arc::new(crate::ownership::SubjectOpLocks::new()),
             revoked_grants: Arc::new(RevokedGrantSet::new()),
             grant_revoke_challenges: challenges.clone(),
         };

@@ -242,7 +242,9 @@ fn unix_now() -> Result<u64, ApiError> {
 mod tests {
     use super::*;
     use crate::kernel::connect_lazy;
-    use crate::ownership::{GrantRevokeChallengeStore, RevokedGrantSet, SubjectOpDirectory};
+    use crate::ownership::{
+        GrantRevokeChallengeStore, RevokedGrantSet, SubjectOpDirectory, SubjectOpLocks,
+    };
     use crate::state::AppState;
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
     use std::collections::BTreeSet;
@@ -256,6 +258,7 @@ mod tests {
             public_hosts: Arc::new(vec!["node.example.com".into()]),
             blossom: None,
             subject_ops: Arc::new(SubjectOpDirectory::new()),
+            subject_op_locks: Arc::new(SubjectOpLocks::new()),
             revoked_grants: Arc::new(RevokedGrantSet::new()),
             grant_revoke_challenges: Arc::new(GrantRevokeChallengeStore::new()),
         }

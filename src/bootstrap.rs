@@ -276,6 +276,10 @@ pub async fn post_bootstrap_entrust(
         state.public_hosts.as_slice(),
     )?;
 
+    // Serialize kernel dial + directory write per subject (lost-update guard).
+    let subject_lock = state.subject_op_locks.mutex_for(verified.subject_raw);
+    let _guard = subject_lock.lock().await;
+
     // ---- only now: kernel (nonce consumption lives here) ----
     let result: EntrustResult = state
         .kernel
@@ -321,6 +325,10 @@ pub async fn post_bootstrap_revoke(
         state.public_hosts.as_slice(),
     )?;
 
+    // Serialize kernel dial + directory write per subject (lost-update guard).
+    let subject_lock = state.subject_op_locks.mutex_for(verified.subject_raw);
+    let _guard = subject_lock.lock().await;
+
     let result: RevokeResult = state
         .kernel
         .revoke_operational_bundle(RevokeRequest {
@@ -347,6 +355,7 @@ mod tests {
     use crate::kernel::connect_lazy;
     use crate::ownership::{
         encode_zk_address, GrantRevokeChallengeStore, RevokedGrantSet, SubjectOpDirectory,
+        SubjectOpLocks,
     };
     use crate::state::AppState;
     use std::collections::BTreeSet;
@@ -360,6 +369,7 @@ mod tests {
             public_hosts: Arc::new(vec!["node.example.com".into()]),
             blossom: None,
             subject_ops: Arc::new(SubjectOpDirectory::new()),
+            subject_op_locks: Arc::new(SubjectOpLocks::new()),
             revoked_grants: Arc::new(RevokedGrantSet::new()),
             grant_revoke_challenges: Arc::new(GrantRevokeChallengeStore::new()),
         }

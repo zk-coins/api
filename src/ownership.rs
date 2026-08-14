@@ -850,6 +850,33 @@ impl SubjectOpDirectory {
     }
 }
 
+/// Process-local map: subject → async mutex.
+///
+/// Serializes kernel dial + `SubjectOpDirectory` write per subject for
+/// entrust/revoke (lost-update guard). Not a multi-process CAS; unused
+/// entries may be retained for the process lifetime (v1, like other maps).
+#[derive(Debug, Default)]
+pub struct SubjectOpLocks {
+    inner: std::sync::Mutex<HashMap<[u8; 32], std::sync::Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl SubjectOpLocks {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Return a cloned Arc mutex for `subject`, creating it if absent.
+    pub fn mutex_for(&self, subject: [u8; 32]) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut guard = self.inner.lock().expect("subject_op_locks lock poisoned");
+        guard
+            .entry(subject)
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+}
+
 /// Node-local revocation set for `grant_id` (§5.2 — forward-only).
 #[derive(Debug, Default)]
 pub struct RevokedGrantSet {

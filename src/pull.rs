@@ -2,7 +2,7 @@
 //!
 //! | Method | Path | Kernel |
 //! |---|---|---|
-//! | `POST` | `/v1/pull/challenge` | `OpenPullChallenge` action=`pull` |
+//! | `POST` | `/v1/pull/challenge` | `OpenPullChallenge` action=`""` (pull) |
 //! | `POST` | `/v1/pull` | `Pull` (after OwnershipProof **or** GrantProof) |
 //! | `GET`  | `/v1/record/<record_id>` | `GetRecord` |
 //! | `GET`  | `/v1/proof/<coin_id>` | `GetCoinProof` |
@@ -339,7 +339,7 @@ fn session_chan_bind(public_hosts: &[String]) -> Result<[u8; 32], ApiError> {
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// `POST /v1/pull/challenge` → OpenPullChallenge(action=pull).
+/// `POST /v1/pull/challenge` → OpenPullChallenge(action=`""` meaning pull).
 pub async fn post_pull_challenge(
     State(state): State<AppState>,
     JsonBody(body): JsonBody<PullChallengeBody>,
@@ -359,7 +359,8 @@ pub async fn post_pull_challenge(
         .open_pull_challenge(PullChallengeRequest {
             subject: body.subject,
             requested_scope,
-            action: "pull".to_string(),
+            // Proto: empty string means pull (`"" (pull) | "entrust" | …`).
+            action: String::new(),
         })
         .await?;
 

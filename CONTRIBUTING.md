@@ -8,9 +8,9 @@ internal kernel RPC
 ## What belongs here
 
 - The public **REST** service layer (multi-tenant, hosted-wallet surface).
-- Its own **non-value-bearing** database (LNURL mappings, aliasing, rate limits,
-  push subscriptions). Coins, proofs, and the nullifier accumulator stay in the
-  node — this layer never touches the node's database directly.
+- Planned API-local scope (**not implemented yet**): LNURL mappings, aliasing,
+  rate limits, push subscriptions. Coins, proofs, and the nullifier accumulator
+  stay in the node — this layer never touches the node's database directly.
 - No SPEND keys, no Bitcoin access — proving, broadcasting, and chain scanning
   stay in the node.
 

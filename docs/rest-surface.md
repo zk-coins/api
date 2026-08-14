@@ -28,9 +28,8 @@ erforderlich. „Nein“ = öffentlich bzw. selbstauthentifizierend (Submit) bzw
 permissionless (Publisher-Hand-off).
 
 **Kernel-RPC:** „API-lokal“ = kein Kernel-Aufruf (§7.5 L2866). Sonst die §7.8-Prozedur
-aus der Backs-Spalte (L3138–L3159). Blossom läuft über den Kernel-Store / die Blossom-Ebene
-(§7.8 L3490: API erreicht Blobs über Kernel oder öffentlichen `/blossom`-Pfad — **kein**
-eigenes `Kernel`-RPC-Verb in der Procedure-Tabelle).
+aus der Backs-Spalte (L3138–L3159). Blossom ist der **API-lokale Filesystem-Store**
+(`ZKCOINS_BLOSSOM_STORE`) — es gibt keinen Kernel-Store und **kein** Kernel-RPC für Blobs.
 
 ---
 
@@ -66,10 +65,10 @@ eigenes `Kernel`-RPC-Verb in der Procedure-Tabelle).
 | 26 | `POST` | `/v1/bootstrap/challenge` | Nein (stellt Challenge aus) | `wallet` | `OpenPullChallenge` (`action` entrust/revoke) | §7.7 L3118; §7.8 L3149, L3341–L3344; Feature §6.1 L2337 |
 | 27 | `POST` | `/v1/bootstrap/entrust` | **Ja** — OwnershipProof (Entrust-Domain) | `wallet` | `EntrustOperationalBundle` | §7.7 L3119; §7.8 L3156; Feature §6.1 L2337 |
 | 28 | `POST` | `/v1/bootstrap/revoke` | **Ja** — OwnershipProof (Revoke-Domain) | `wallet` | `RevokeOperationalBundle` | §7.7 L3120; §7.8 L3157; Feature §6.1 L2337 |
-| 29 | `GET` | `/blossom/<sha256>` | Nein (Ciphertext) | `explorer` (blob fetch) | Blossom-Ebene / Kernel-Store — **kein** eigenes Kernel-RPC-Verb (§7.8 L3490) | §7.4 L2804; Feature §6.1 L2338; `endpoints`-Key §7.5 L2874 |
-| 30 | `HEAD` | `/blossom/<sha256>` | Nein | `explorer` (blob fetch) | Blossom-Ebene / Kernel-Store | §7.4 L2805; Feature §6.1 L2338; Key §7.5 L2874 |
-| 31 | `PUT` | `/blossom/upload` | **Ja** — Nostr kind-`24242` Auth-Event | `explorer` / `wallet` | Blossom-Ebene / Kernel-Store | §7.4; Keys §7.5; Data Permanence (append-only, Antwort `{ blob_id }`) |
-| 32 | `POST` | `/blossom/upload` | **Ja** — Nostr kind-`24242` Auth-Event | `explorer` / `wallet` | Blossom-Ebene / Kernel-Store (äquivalent zu PUT) | §7.4; Keys §7.5 |
+| 29 | `GET` | `/blossom/<sha256>` | Nein (Ciphertext) | `explorer` (blob fetch) | API-lokaler Filesystem-Store — **kein** Kernel-RPC | §7.4 L2804; Feature §6.1 L2338; `endpoints`-Key §7.5 L2874 |
+| 30 | `HEAD` | `/blossom/<sha256>` | Nein | `explorer` (blob fetch) | API-lokaler Filesystem-Store — **kein** Kernel-RPC | §7.4 L2805; Feature §6.1 L2338; Key §7.5 L2874 |
+| 31 | `PUT` | `/blossom/upload` | **Ja** — Nostr kind-`24242` Auth-Event | `explorer` / `wallet` | API-lokaler Filesystem-Store — **kein** Kernel-RPC | §7.4; Keys §7.5; Data Permanence (append-only, Antwort `{ blob_id }`) |
+| 32 | `POST` | `/blossom/upload` | **Ja** — Nostr kind-`24242` Auth-Event | `explorer` / `wallet` | API-lokaler Filesystem-Store — **kein** Kernel-RPC (äquivalent zu PUT) | §7.4; Keys §7.5 |
 | 33 | `GET` | `/v1/token/<asset_id>/provenance` | Nein (offen, unauthentifiziert) | **immer** — nicht feature-gated | `GetTokenProvenance` — offene Class-B-Provenienz; self-verifying; `404 not_found` wenn der Node keine Terms für `asset_id` hält | §7.5; §7.8; §4.6 Class B |
 
 **Kein** `DELETE /blossom/<sha256>` — Data Permanence (Requirement 12): der Blob-Store
@@ -175,7 +174,7 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Blob-Pfad).
 | `POST /v1/grants` | **implementiert** — OwnershipProof-Verifikation am API-Rand, dann `IssueViewGrant` |
 | `POST /v1/grants/revoke/challenge` | **implementiert** — API-lokal, stellt Single-Use-Nonce für Grant-Revoke aus; kein Kernel-Dial (§5.2) |
 | `POST /v1/grants/revoke` | **implementiert** — OwnershipProof-Verifikation am API-Rand (RevokeGrant-Domain, grant→subject binding), dann `revoked_grants`; kein Kernel-Dial (§5.2) |
-| `POST /v1/pull/challenge` | **implementiert** — `OpenPullChallenge` (`action = pull`) |
+| `POST /v1/pull/challenge` | **implementiert** — `OpenPullChallenge` (`action = ""` meaning pull) |
 | `POST /v1/pull` | **implementiert** — OwnershipProof am API-Rand, dann `Pull` (GrantProof fail-closed) |
 | `GET /v1/record/<record_id>` | **implementiert** — `GetRecord` (Bearer-Session) |
 | `GET /v1/proof/<coin_id>` | **implementiert** — `GetCoinProof` (Bearer-Session) |

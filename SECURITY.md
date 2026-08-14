@@ -20,7 +20,7 @@ node kernel still go to [zk-coins/node](https://github.com/zk-coins/node)
 | ------------------------------------------ | -------- |
 | REST endpoints                             | Yes      |
 | Capability gating / rate limiting          | Yes      |
-| LNURL / alias / push-subscription database | Yes      |
+| LNURL / alias / push-subscription database (planned; not implemented yet) | Yes      |
 | Node kernel (see [zk-coins/node](https://github.com/zk-coins/node)) | Report there |
 | Documentation                              | No       |
 

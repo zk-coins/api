@@ -8,7 +8,9 @@
 use crate::blossom::BlossomState;
 use crate::config::Feature;
 use crate::kernel::KernelHandle;
-use crate::ownership::{GrantRevokeChallengeStore, RevokedGrantSet, SubjectOpDirectory};
+use crate::ownership::{
+    GrantRevokeChallengeStore, RevokedGrantSet, SubjectOpDirectory, SubjectOpLocks,
+};
 use axum::extract::FromRef;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -31,6 +33,9 @@ pub struct AppState {
     /// Published `op_pubkey` by subject for GrantProof step 1 (§5.1(b)).
     /// Starts empty — see [`SubjectOpDirectory`].
     pub subject_ops: Arc<SubjectOpDirectory>,
+    /// Per-subject async mutexes for entrust/revoke (kernel dial + directory write).
+    /// Process-local; see [`SubjectOpLocks`].
+    pub subject_op_locks: Arc<SubjectOpLocks>,
     /// Forward-only grant revocation set (§5.2).
     pub revoked_grants: Arc<RevokedGrantSet>,
     /// Single-use, api-local challenge nonce store for `POST /v1/grants/revoke`

@@ -410,7 +410,18 @@ impl BlobStore {
         }
 
         match install_no_replace(&note_tmp, &note_path) {
-            Ok(()) => Ok(*id),
+            Ok(()) => {
+                // Both final names installed; durable only after store-root fsync.
+                File::open(&self.root)
+                    .and_then(|d| d.sync_all())
+                    .map_err(|e| {
+                        ApiError::internal(format!(
+                            "blossom store: sync store root {}: {e}",
+                            self.root.display()
+                        ))
+                    })?;
+                Ok(*id)
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 if note_path.is_file() {
                     Ok(*id)
@@ -483,7 +494,7 @@ fn write_exclusive(path: &Path, bytes: &[u8]) -> io::Result<()> {
     f.write_all(bytes)?;
     f.sync_all()?;
     drop(f);
-    let _ = File::open(path.parent().unwrap_or(Path::new("."))).and_then(|d| d.sync_all());
+    File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
     Ok(())
 }
 
