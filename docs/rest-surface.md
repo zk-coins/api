@@ -224,7 +224,7 @@ Sibling-Vergleich mit `zk-coins/node` ist optional/lokal, kein CI-Gate. Client
 | Variable | Bedeutung |
 |---|---|
 | `ZKCOINS_BIND_ADDR` | Socket-Adresse für den HTTP-Listener (z. B. `127.0.0.1:8080`). **Kein Default.** |
-| `ZKCOINS_KERNEL_ADDR` | Adresse des Kernel-gRPC (z. B. `http://127.0.0.1:50051`). **Kein Default.** Pflicht — dieser API-Prozess dialt den Kernel vor dem Serve; Start ohne konfigurierte Kernel-Adresse ist unzulässig. |
+| `ZKCOINS_KERNEL_ADDR` | Adresse des Kernel-gRPC (z. B. `http://127.0.0.1:50051`). **Kein Default.** Pflicht — vor dem Serve wird die URI geprüft und ein lazy Client gebaut; der TCP-Dial erfolgt erst beim ersten RPC (bzw. `/health/ready`). Start ohne konfigurierte Kernel-Adresse ist unzulässig. |
 | `ZKCOINS_FEATURES` | Komma-separierte Teilmenge von `{wallet,explorer,publisher,lightning_bridge,mail_bridge}`. Darf leer sein (alle Features off). Unbekannter Token → **Startfehler**. Variable selbst ist Pflicht (explizit leer = absichtlich nichts freigeschaltet). |
 | `ZKCOINS_PUBLIC_HOST` | Komma-separierte autoritative Hostnamen für §5.1 `chan_bind` (lowercase, trailing-dot gestrichen). **Nie** aus `Host`-Header. Darf leer sein (dann schlägt OwnershipProof-Auth laut fehl). Variable selbst ist Pflicht. |
 

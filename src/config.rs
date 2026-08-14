@@ -90,7 +90,7 @@ pub struct BlossomConfig {
 pub struct Config {
     /// HTTP bind address. Parsed as `SocketAddr` so empty/garbage fails loudly.
     pub bind_addr: SocketAddr,
-    /// Kernel gRPC target URI; dialled at process start via connect_lazy (no default host/port).
+    /// Kernel gRPC target URI; parsed at process start via connect_lazy (no default host/port). TCP dial is deferred until the first RPC.
     pub kernel_addr: String,
     /// Enabled API features (§6.1 closed set). Empty = all off.
     pub features: BTreeSet<Feature>,

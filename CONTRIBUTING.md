@@ -18,8 +18,11 @@ internal kernel RPC
 
 - Default branch is `develop`; open PRs against it.
 - Commit messages: English, concise, *what* not *how*.
-- House rules (trust model, code style, CI conventions) follow
+- House rules for the trust model and Rust style follow
   [zk-coins/node/CONTRIBUTING.md](https://github.com/zk-coins/node/blob/develop/CONTRIBUTING.md).
+  Workflow here differs: PRs target `develop` (this repo has no `staging`),
+  there is no Node `.githooks` setup, and CI is the single `lint-and-build`
+  job in `.github/workflows/ci.yaml`.
 
 ## Related Repos
 
