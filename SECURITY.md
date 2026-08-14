@@ -10,7 +10,7 @@ If you discover a security vulnerability in zkCoins, please report it responsibl
 4. We will acknowledge within 48 hours and provide a fix timeline
 
 This repository **is** the standalone API process. Vulnerabilities in the live
-REST / LNURL surface are reported here (same email). Issues in the trustless
+REST surface are reported here (same email). Issues in the trustless
 node kernel still go to [zk-coins/node](https://github.com/zk-coins/node)
 (see Scope table).
 
@@ -18,7 +18,7 @@ node kernel still go to [zk-coins/node](https://github.com/zk-coins/node)
 
 | Component                                  | In Scope |
 | ------------------------------------------ | -------- |
-| REST + LNURL endpoints                     | Yes      |
+| REST endpoints                             | Yes      |
 | Capability gating / rate limiting          | Yes      |
 | LNURL / alias / push-subscription database | Yes      |
 | Node kernel (see [zk-coins/node](https://github.com/zk-coins/node)) | Report there |

@@ -7,7 +7,7 @@ internal kernel RPC
 
 ## What belongs here
 
-- The public **REST + LNURL** service layer (multi-tenant, hosted-wallet surface).
+- The public **REST** service layer (multi-tenant, hosted-wallet surface).
 - Its own **non-value-bearing** database (LNURL mappings, aliasing, rate limits,
   push subscriptions). Coins, proofs, and the nullifier accumulator stay in the
   node — this layer never touches the node's database directly.
