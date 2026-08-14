@@ -9466,7 +9466,11 @@ mod tests {
 
         let challenges = Arc::new(GrantRevokeChallengeStore::new());
         let past_expiry = 1u64;
-        let nonce_raw = challenges.issue(subject_raw, past_expiry);
+        // Insert with now <= expiry so the entry is retained; handler wall-clock
+        // is far past expiry and returns 410 after a valid proof.
+        let nonce_raw = challenges
+            .issue(subject_raw, past_expiry, 0)
+            .expect("issue past-expiry challenge for 410 test");
         let nonce_hex = encode_hex(&nonce_raw);
 
         let kernel = Arc::new(ScriptedKernel::default());
@@ -9532,7 +9536,11 @@ mod tests {
 
         let challenges = Arc::new(GrantRevokeChallengeStore::new());
         let past_expiry = 1u64;
-        let nonce_raw = challenges.issue(subject_raw, past_expiry);
+        // Insert with now <= expiry so the entry is retained; handler wall-clock
+        // is far past expiry and returns 410 after a valid proof.
+        let nonce_raw = challenges
+            .issue(subject_raw, past_expiry, 0)
+            .expect("issue past-expiry challenge for 410 test");
         let nonce_hex = encode_hex(&nonce_raw);
 
         let kernel = Arc::new(ScriptedKernel::default());
@@ -9611,7 +9619,7 @@ mod tests {
         let json2: Value = serde_json::from_slice(&body_bytes(res2).await).unwrap();
         assert_eq!(json2["error"], "unauthorized");
         assert!(
-            challenges.get(&nonce_raw).is_none(),
+            challenges.get(&nonce_raw, u64::MAX).is_none(),
             "expired nonce must have been taken"
         );
     }

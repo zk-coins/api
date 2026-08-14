@@ -448,7 +448,24 @@ pub async fn post_pull(
                 signature,
             };
             // Decode first so we know which subject's published op to load.
-            let decoded = crate::ownership::decode_view_grant(&grant)?;
+            // Pull maps grant-decode failures to 401 (capability); decode_view_grant
+            // itself stays 400 so grant-revoke keeps malformed → 400.
+            let decoded = crate::ownership::decode_view_grant(&grant).map_err(|e| {
+                ApiError::unauthorized(format!(
+                    "GrantProof rejected: grant decode failed: {}",
+                    e.body.message
+                ))
+            })?;
+            // Non-mutating probe before mutex_for: unknown subjects must not
+            // insert into SubjectOpLocks (lock-map growth under grant spam).
+            if state.subject_ops.get(&decoded.subject).is_none() {
+                return Err(ApiError::unauthorized(
+                    "GrantProof rejected: subject's published op_pubkey is not available \
+                     (Nostr kind-30420 profile resolution with §4.3 address binding is \
+                     not wired; subject_ops directory has no entry). Half-checked grants \
+                     are forbidden (§5.1(b) step 1)",
+                ));
+            }
             // Serialize lookup + verify against entrust/revoke on this subject.
             let subject_lock = state.subject_op_locks.mutex_for(decoded.subject);
             let guard = subject_lock.lock().await;

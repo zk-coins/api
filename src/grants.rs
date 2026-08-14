@@ -299,7 +299,9 @@ pub async fn post_grants_revoke_challenge(
     let subject_raw = decode_zk_address(&body.subject)?;
     let now = unix_now()?;
     let expiry = now.saturating_add(GRANT_REVOKE_CHALLENGE_TTL_SECS);
-    let nonce = state.grant_revoke_challenges.issue(subject_raw, expiry);
+    let nonce = state
+        .grant_revoke_challenges
+        .issue(subject_raw, expiry, now)?;
 
     let body = json!({
         "nonce": encode_hex(&nonce),
@@ -328,9 +330,12 @@ pub async fn post_grants_revoke(
 
     // 3. Peek — never-issued and already-consumed look identical on the wire
     //    (401). Do not consume yet: a failed proof must not burn the nonce.
+    //    `get` may drop *other* expired entries; the looked-up nonce is kept
+    //    even when expired so step 5 can still return 410 after a valid proof.
+    let now = unix_now()?;
     let entry = state
         .grant_revoke_challenges
-        .get(&nonce_raw)
+        .get(&nonce_raw, now)
         .ok_or_else(|| {
             ApiError::unauthorized("unknown or already-consumed grant-revoke challenge nonce")
         })?;
@@ -354,7 +359,8 @@ pub async fn post_grants_revoke(
 
     // 5. Expiry — immediately after a valid proof, before grant decode.
     //    Clean up the expired nonce via `take`, then 410 `challenge_expired`
-    //    (malformed grant must not mask expiry).
+    //    (malformed grant must not mask expiry). Re-sample wall clock so a
+    //    slow proof does not stretch the challenge lifetime.
     let now = unix_now()?;
     if now > entry.expiry {
         let _ = state.grant_revoke_challenges.take(&nonce_raw);

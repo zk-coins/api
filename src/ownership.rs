@@ -911,6 +911,10 @@ pub struct ChallengeEntry {
     pub expiry: u64,
 }
 
+/// Cap on outstanding (not-yet-consumed, not-yet-expired) grant-revoke
+/// challenges held in [`GrantRevokeChallengeStore`].
+pub const MAX_OUTSTANDING_GRANT_REVOKE_CHALLENGES: usize = 4096;
+
 /// Single-use, api-local challenge store for `POST /v1/grants/revoke` (§5.2).
 ///
 /// Grant revocation is enforced entirely inside this process — the kernel has
@@ -931,11 +935,16 @@ impl GrantRevokeChallengeStore {
     }
 
     /// Issue a fresh single-use nonce bound to `subject` and `expiry`.
+    ///
+    /// Evicts expired entries first (`now > expiry`, matching the handler).
+    /// Refuses with [`ApiError::bounds_exceeded`] when the store is already at
+    /// [`MAX_OUTSTANDING_GRANT_REVOKE_CHALLENGES`] non-expired entries.
+    ///
     /// Nonce is 32 CSPRNG bytes (`getrandom::fill`) — no fixed-nonce fallback,
     /// no weak RNG. A broken system CSPRNG is an unrecoverable process
     /// invariant violation (same class as a poisoned lock elsewhere in this
     /// file) and panics loudly rather than silently degrading the nonce.
-    pub fn issue(&self, subject: [u8; 32], expiry: u64) -> [u8; 32] {
+    pub fn issue(&self, subject: [u8; 32], expiry: u64, now: u64) -> Result<[u8; 32], ApiError> {
         let mut nonce = [0u8; 32];
         getrandom::fill(&mut nonce)
             .expect("system CSPRNG must be available to issue a grant-revoke challenge nonce");
@@ -943,20 +952,33 @@ impl GrantRevokeChallengeStore {
             .inner
             .write()
             .expect("grant_revoke_challenges lock poisoned");
+        guard.retain(|_, entry| now <= entry.expiry);
+        if guard.len() >= MAX_OUTSTANDING_GRANT_REVOKE_CHALLENGES {
+            return Err(ApiError::bounds_exceeded(
+                "too many outstanding grant-revoke challenges",
+            ));
+        }
         guard.insert(nonce, ChallengeEntry { subject, expiry });
-        nonce
+        Ok(nonce)
     }
 
     /// Peek at the entry for `nonce` without consuming it.
     ///
+    /// Evicts *other* expired entries (`now > expiry`). The looked-up nonce is
+    /// still returned when present even if it is itself expired, so the
+    /// revoke handler can verify the proof and then return 410
+    /// `challenge_expired`.
+    ///
     /// `None` covers both "never issued" and "already consumed"; callers must
     /// not distinguish the two on the wire. Use [`Self::take`] only after the
     /// proof (and grant→subject binding) has been validated.
-    pub fn get(&self, nonce: &[u8; 32]) -> Option<ChallengeEntry> {
-        let guard = self
+    pub fn get(&self, nonce: &[u8; 32], now: u64) -> Option<ChallengeEntry> {
+        let mut guard = self
             .inner
-            .read()
+            .write()
             .expect("grant_revoke_challenges lock poisoned");
+        // Keep the looked-up key even when expired (410 path); drop others.
+        guard.retain(|k, entry| k == nonce || now <= entry.expiry);
         guard.get(nonce).copied()
     }
 
@@ -1637,9 +1659,10 @@ mod tests {
     fn grant_revoke_challenge_store_issue_distinct_and_take_is_single_use() {
         let store = GrantRevokeChallengeStore::new();
         let subject = [0xABu8; 32];
+        let now = 1_700_000_000u64;
         let expiry = 1_700_000_060u64;
-        let n1 = store.issue(subject, expiry);
-        let n2 = store.issue(subject, expiry);
+        let n1 = store.issue(subject, expiry, now).expect("issue n1");
+        let n2 = store.issue(subject, expiry, now).expect("issue n2");
         assert_ne!(n1, n2, "CSPRNG nonces must be distinct across issues");
 
         let entry = store
@@ -1661,17 +1684,18 @@ mod tests {
     fn grant_revoke_challenge_store_get_peeks_without_consuming() {
         let store = GrantRevokeChallengeStore::new();
         let subject = [0xABu8; 32];
+        let now = 1_700_000_000u64;
         let expiry = 1_700_000_060u64;
-        let nonce = store.issue(subject, expiry);
+        let nonce = store.issue(subject, expiry, now).expect("issue");
 
         let first = store
-            .get(&nonce)
+            .get(&nonce, now)
             .expect("first get must return issued entry");
         assert_eq!(first.subject, subject);
         assert_eq!(first.expiry, expiry);
 
         let second = store
-            .get(&nonce)
+            .get(&nonce, now)
             .expect("second get must still return entry");
         assert_eq!(second.subject, subject);
         assert_eq!(second.expiry, expiry);
@@ -1680,9 +1704,67 @@ mod tests {
         assert_eq!(taken.subject, subject);
         assert_eq!(taken.expiry, expiry);
 
-        assert!(store.get(&nonce).is_none());
+        assert!(store.get(&nonce, now).is_none());
         assert!(store.take(&nonce).is_none());
-        assert!(store.get(&[0u8; 32]).is_none());
+        assert!(store.get(&[0u8; 32], now).is_none());
+    }
+
+    #[test]
+    fn grant_revoke_challenge_store_issue_evicts_expired() {
+        let store = GrantRevokeChallengeStore::new();
+        let subject = [0xABu8; 32];
+        let n1 = store.issue(subject, 100, 50).expect("issue non-expired");
+        assert!(store.get(&n1, 50).is_some());
+        // now > n1.expiry → issue evicts n1 before insert.
+        let n2 = store
+            .issue(subject, 200, 101)
+            .expect("issue after n1 expired");
+        assert!(
+            store.get(&n1, 101).is_none(),
+            "expired entry must be evicted on issue"
+        );
+        assert!(store.get(&n2, 101).is_some());
+    }
+
+    #[test]
+    fn grant_revoke_challenge_store_get_keeps_expired_looked_up_evicts_others() {
+        let store = GrantRevokeChallengeStore::new();
+        let s1 = [0x01u8; 32];
+        let s2 = [0x02u8; 32];
+        let expired = store.issue(s1, 100, 50).expect("issue expired-to-be");
+        let other_expired = store.issue(s2, 100, 50).expect("issue other");
+        // Looked-up expired entry must remain so the handler can return 410.
+        let entry = store
+            .get(&expired, 101)
+            .expect("expired looked-up entry kept for 410 path");
+        assert_eq!(entry.subject, s1);
+        assert_eq!(entry.expiry, 100);
+        // Other expired entries are hygiene-evicted on get.
+        assert!(
+            store.get(&other_expired, 101).is_none(),
+            "other expired entries must be evicted on get"
+        );
+    }
+
+    #[test]
+    fn grant_revoke_challenge_store_cap_rejects_over_limit() {
+        let store = GrantRevokeChallengeStore::new();
+        let now = 1_700_000_000u64;
+        let expiry = now + 60;
+        for _ in 0..MAX_OUTSTANDING_GRANT_REVOKE_CHALLENGES {
+            store
+                .issue([0u8; 32], expiry, now)
+                .expect("issue under cap");
+        }
+        let err = store
+            .issue([0u8; 32], expiry, now)
+            .expect_err("at cap must refuse");
+        assert_eq!(err.body.error, "bounds_exceeded");
+        // Cap still holds: a subsequent issue also fails without insert growth.
+        let err2 = store
+            .issue([0u8; 32], expiry, now)
+            .expect_err("still at cap");
+        assert_eq!(err2.body.error, "bounds_exceeded");
     }
 
     #[test]
