@@ -197,7 +197,7 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Blob-Pfad).
 | `blossom_delete` | Data Permanence — existiert nicht mehr in der Inventur. |
 
 Router und Discovery teilen eine Quelle (`ServedSurface` in `src/routes.rs`): die
-aktive Mengen folgt `Config::features` und dem Blossom-Store; eine neue
+aktive Menge folgt `Config::features` und dem Blossom-Store; eine neue
 registrierte Fläche erscheint automatisch in `GET /`; deaktivierte Features
 sind unregistriert und unbeworben (fail-closed, §7.5). Path-Parameter in
 Discovery/`CLOSED_ENDPOINT_KEYS` nutzen die Spec-Schreibweise `<name>`

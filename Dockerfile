@@ -17,7 +17,7 @@
 #     zkcoins/api:local
 #
 # ---------------------------------------------------------------------------
-# Boot environment (from src/config.rs + src/main.rs — fail-closed; no image
+# Boot environment (from src/config.rs + src/startup.rs — fail-closed; no image
 # defaults for bind/kernel/store). Names, meaning, requiredness:
 #
 # Pflicht (Variable muss gesetzt sein; leerer Wert wo vermerkt erlaubt):
@@ -26,15 +26,15 @@
 #     HTTP listen address as `host:port` (parsed as SocketAddr).
 #     Required, non-empty. Empty or garbage → start error (ConfigError).
 #     Codestelle: src/config.rs ENV_BIND / require_present; bind in
-#     src/main.rs TcpListener::bind(config.bind_addr).
+#     src/startup.rs TcpListener::bind(config.bind_addr).
 #     Convention for local stack / EXPOSE: 0.0.0.0:8080 (not hard-coded
 #     in the binary — only in operator env).
 #
 #   ZKCOINS_KERNEL_ADDR
 #     Kernel gRPC target URI (opaque non-empty string, tonic Endpoint).
 #     Required, non-empty. Bad URI → start error at connect_lazy.
-#     Codestelle: src/config.rs ENV_KERNEL; dial src/kernel/client.rs
-#     KernelClient::connect_lazy / src/main.rs connect_lazy.
+#     Codestelle: src/config.rs ENV_KERNEL; dial src/startup.rs
+#     connect_lazy / src/kernel/client.rs KernelClient::connect_lazy.
 #
 #   ZKCOINS_FEATURES
 #     Comma-separated subset of §6.1 closed feature set:
@@ -70,8 +70,8 @@
 # Optional (logging only — not process config):
 #
 #   RUST_LOG
-#     tracing-subscriber EnvFilter. Unset ⇒ "info" in main::init_tracing
-#     (src/main.rs). Not a silent fallback for bind/kernel/store.
+#     tracing-subscriber EnvFilter. Unset ⇒ "info" in init_tracing
+#     (src/startup.rs). Not a silent fallback for bind/kernel/store.
 # ---------------------------------------------------------------------------
 
 FROM rust:bookworm AS builder
@@ -100,7 +100,7 @@ RUN cargo build --release -p api
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates wget \
+    && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 zkcoins \
     && useradd --system --uid 10001 --gid zkcoins \
@@ -120,7 +120,7 @@ WORKDIR /data
 USER zkcoins:zkcoins
 
 # Documented local-stack port (ZKCOINS_BIND_ADDR=0.0.0.0:8080). The binary
-# binds only the address from env (src/main.rs); this is not a code default.
+# binds only the address from env (src/startup.rs); this is not a code default.
 EXPOSE 8080
 
 ENTRYPOINT ["zkcoins-api"]

@@ -59,8 +59,8 @@ impl std::error::Error for StartupError {}
 ///
 /// Full inventory of the 31 logical names a conforming producer may emit
 /// (data permanence: no `blossom_delete`). Order matches the closed §7.5
-/// listing. This constant is the reference for surfaces not yet built; it is
-/// **not** what `GET /` returns.
+/// listing. This constant is the closed 31-key catalog; `GET /` returns the
+/// active subset via [`ServedSurface`], not the whole catalog.
 ///
 /// Path parameters use the §7.5 advertised form `<name>` (one path segment).
 /// That string is what `GET /` emits. Axum 0.7 / matchit 0.7 do **not** treat
@@ -238,7 +238,7 @@ impl ServedSurface {
             | ServedSurface::ChainNullifier => features.contains(&Feature::Explorer),
 
             // `wallet` — proving, submission, pull, attest, grants, bootstrap
-            // (§6.1 L2337; rest-surface #8–#22, #24–#26).
+            // (§6.1 L2337; rest-surface #8–#24, #26–#28).
             ServedSurface::Tx
             | ServedSurface::Jobs
             | ServedSurface::JobsStream
@@ -260,7 +260,7 @@ impl ServedSurface {
             | ServedSurface::GrantsRevokeChallenge
             | ServedSurface::GrantsRevoke => features.contains(&Feature::Wallet),
 
-            // `publisher` — hand-off endpoint (§6.1 L2339; rest-surface #23).
+            // `publisher` — hand-off endpoint (§6.1 L2339; rest-surface #25).
             ServedSurface::PublishSpendrecord => features.contains(&Feature::Publisher),
 
             // §7.4 Blossom: store must be configured. Blob fetch (GET/HEAD) is
@@ -6781,7 +6781,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_entrust_invalid_op_secret_is_500() {
+    async fn bootstrap_entrust_invalid_op_secret_is_400() {
         let host = "node.example.com";
         let (sk, pk0, nkc, subject_raw, subject_bech) = ownership_fixtures::identity();
         let nonce = [0x11u8; 32];
@@ -6829,15 +6829,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
-        assert_eq!(json["error"], "internal_error");
-        assert_eq!(
-            json["message"],
-            crate::error::PUBLIC_INTERNAL_MESSAGE,
-            "public internal_error message must be neutral"
-        );
-        assert_eq!(kernel.entrust_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(json["error"], "malformed_request");
+        assert_eq!(kernel.entrust_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -251,6 +251,15 @@ pub async fn post_bootstrap_entrust(
             }
         })?;
 
+    // Derive the op x-only pubkey before any kernel dial so an invalid secret
+    // fails at the edge with 400 (no RPC, no nonce consumption).
+    let secp = Secp256k1::new();
+    let op_sk = SecretKey::from_slice(&op_secret_bytes)
+        .map_err(|_| ApiError::malformed("bundle op field is not a valid secp256k1 secret key"))?;
+    let op_kp = Keypair::from_secret_key(&secp, &op_sk);
+    let (op_xonly, _parity) = op_kp.x_only_public_key();
+    let op_pubkey = op_xonly.serialize();
+
     // GrantProof arm → 401; Ownership arm carries the subject (no outer field).
     let ownership_proof = ownership_proof.require_ownership()?;
     let subject = ownership_proof.subject.clone();
@@ -283,16 +292,9 @@ pub async fn post_bootstrap_entrust(
     // — this is the moment the api co-located with the node legitimately
     // learns the subject's real op_pubkey. Only on success; a rejected
     // entrust must never seed the directory with an unconfirmed key.
+    // Key material was already validated above; insert only the derived pubkey.
     if result.accepted {
-        let secp = Secp256k1::new();
-        let op_sk = SecretKey::from_slice(&op_secret_bytes).map_err(|_| {
-            ApiError::internal("entrusted bundle op field is not a valid secp256k1 secret key")
-        })?;
-        let op_kp = Keypair::from_secret_key(&secp, &op_sk);
-        let (op_xonly, _parity) = op_kp.x_only_public_key();
-        state
-            .subject_ops
-            .insert(verified.subject_raw, op_xonly.serialize());
+        state.subject_ops.insert(verified.subject_raw, op_pubkey);
     }
 
     let body = json!({ "accepted": result.accepted });

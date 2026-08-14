@@ -172,7 +172,7 @@ pub async fn upload_blob(
         .to_str()
         .map_err(|_| ApiError::unauthorized("Authorization header is not valid UTF-8"))?;
 
-    let now = unix_now();
+    let now = unix_now()?;
     let verified = verify_blossom_auth(auth_header, RequiredAction::Upload, &body_hash, now)?;
 
     // ACL: op must be a paired account or configured replication peer.
@@ -228,11 +228,11 @@ fn require_octet_stream(headers: &HeaderMap) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn unix_now() -> u64 {
+fn unix_now() -> Result<u64, ApiError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX_EPOCH")
-        .as_secs()
+        .map(|d| d.as_secs())
+        .map_err(|_| ApiError::internal("system clock is before Unix epoch"))
 }
 
 #[cfg(test)]
