@@ -37,6 +37,8 @@ pub fn decode(input: &str) -> Result<Vec<u8>, Base64Error> {
             (0, true)
         } else {
             if pad2 {
+                // pad2 already required bytes[i+3]==b'=' at lines 26-28; this branch is unreachable
+                #[cfg_attr(coverage_nightly, coverage(off))]
                 return Err(Base64Error::Padding);
             }
             (val(bytes[i + 3])?, false)

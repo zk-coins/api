@@ -196,6 +196,7 @@ fn validate_job(job: &Job) -> Result<(), ApiError> {
                 )));
             }
         }
+        // closed set is exhausted above via is_closed_job_status / match arms
         _ => unreachable!("closed set checked above"),
     }
     Ok(())
@@ -1013,9 +1014,13 @@ fn json_to_kind0_event(
     // tags → tags_json: canonical JSON array, no pretty-print. Failure here is
     // structural (tags not serialisable) — message names the path only.
     let tags_json = serde_json::to_string(&ev.tags).map_err(|_| {
-        ApiError::malformed(format!(
-            "{p}.tags must be a JSON-serialisable array of string arrays"
-        ))
+        // Vec<Vec<String>> always serialises; this arm is untestable
+        #[cfg_attr(coverage_nightly, coverage(off))]
+        {
+            ApiError::malformed(format!(
+                "{p}.tags must be a JSON-serialisable array of string arrays"
+            ))
+        }
     })?;
     Ok(ProtoKind0Event {
         id,
@@ -3613,7 +3618,7 @@ mod tests {
             event: "phase".into(),
             job: Some(sample_job("accepted")),
         };
-        job_event_to_sse(&phase, "j1").expect("phase ok");
+        let _ = job_event_to_sse(&phase, "j1").expect("phase ok");
 
         let mut completed = sample_job("completed");
         completed.result = Some(sample_transition_result());
@@ -3621,7 +3626,7 @@ mod tests {
             event: "complete".into(),
             job: Some(completed),
         };
-        job_event_to_sse(&complete, "j1").expect("complete ok");
+        let _ = job_event_to_sse(&complete, "j1").expect("complete ok");
 
         let mut failed = sample_job("failed");
         failed.error = Some(crate::kernel::kernel_v1::JobError {
@@ -3632,7 +3637,7 @@ mod tests {
             event: "error".into(),
             job: Some(failed),
         };
-        job_event_to_sse(&error_ev, "j1").expect("error ok");
+        let _ = job_event_to_sse(&error_ev, "j1").expect("error ok");
 
         let bad = JobEvent {
             event: "phase".into(),
@@ -3895,7 +3900,8 @@ mod tests {
 
     #[test]
     fn awaiting_signature_json_rejects_each_short_digest() {
-        let fields: &[(&str, fn(&mut AwaitingSignature))] = &[
+        type MutateAwaiting = fn(&mut AwaitingSignature);
+        let fields: &[(&str, MutateAwaiting)] = &[
             ("new_account_state_hash", |a| {
                 a.new_account_state_hash = vec![0x11; 16];
             }),
@@ -3924,7 +3930,7 @@ mod tests {
         for (name, mutate) in fields {
             let mut a = sample_awaiting_signature();
             mutate(&mut a);
-            let err = awaiting_signature_json(&a).expect_err(*name);
+            let err = awaiting_signature_json(&a).expect_err(name);
             assert_eq!(err.body.error, "internal_error");
             let cause = err.cause().unwrap_or("");
             assert!(
@@ -3962,5 +3968,23 @@ mod tests {
             .get(axum::http::header::RETRY_AFTER)
             .expect("retry-after present");
         assert_eq!(ra.to_str().unwrap(), "0");
+    }
+
+    #[tokio::test]
+    async fn job_event_sse_stream_stops_after_terminal() {
+        let mut completed = sample_job("completed");
+        completed.result = Some(sample_transition_result());
+        let terminal = JobEvent {
+            event: "complete".into(),
+            job: Some(completed),
+        };
+        let extra = JobEvent {
+            event: "phase".into(),
+            job: Some(sample_job("accepted")),
+        };
+        let src = futures_util::stream::iter(vec![Ok(terminal), Ok(extra)]);
+        let mut out = std::pin::pin!(job_event_sse_stream(src, "j1".into()));
+        assert!(out.next().await.is_some());
+        assert!(out.next().await.is_none()); // hits if done { return None }
     }
 }

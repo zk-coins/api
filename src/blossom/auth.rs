@@ -156,6 +156,8 @@ pub fn verify_blossom_auth(
     // Tags: t, x, expiration — each required exactly once for v1.
     let action = require_t_tag(&event.tags)?;
     if action != required.as_action() {
+        // v1 defines only t=upload (AuthAction / RequiredAction have only Upload)
+        #[cfg_attr(coverage_nightly, coverage(off))]
         return Err(ApiError::unauthorized(format!(
             "auth event t tag is {:?}, expected {:?} for this method",
             action.as_str(),

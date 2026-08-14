@@ -285,16 +285,13 @@ mod tests {
 
         // If this process can still read mode 0o000 (e.g. root), the arm is not
         // exercised — fail closed rather than pretend success.
-        match std::fs::read(&sibling) {
-            Ok(_) => {
-                drop(_restore);
-                let _ = std::fs::remove_dir_all(&root);
-                panic!(
-                    "sibling mode 0o000 is still readable in this process; \
-                     cannot exercise failed-to-read-sibling arm without root"
-                );
-            }
-            Err(_) => {}
+        if std::fs::read(&sibling).is_ok() {
+            drop(_restore);
+            let _ = std::fs::remove_dir_all(&root);
+            panic!(
+                "sibling mode 0o000 is still readable in this process; \
+                 cannot exercise failed-to-read-sibling arm without root"
+            );
         }
 
         let result = check_sibling(&local, &sibling);

@@ -510,6 +510,14 @@ fn advertised_path_to_axum_matcher(advertised: &str) -> String {
     out
 }
 
+/// Operator detail for Blossom boot failure: prefer `cause`, else public message.
+fn blossom_startup_detail(e: &ApiError) -> String {
+    match e.cause() {
+        Some(c) => c.to_string(),
+        None => e.body.message.clone(),
+    }
+}
+
 /// Build the `endpoints` map for `GET /` from the active surface set.
 fn discovery_endpoints(
     features: &BTreeSet<Feature>,
@@ -563,10 +571,7 @@ pub fn build_router(config: Config, kernel: KernelHandle) -> Result<Router, Star
         None => None,
         Some(cfg) => {
             let state = blossom::BlossomState::from_config(&cfg).map_err(|e| {
-                let detail = match e.cause() {
-                    Some(c) => c.to_string(),
-                    None => e.body.message.clone(),
-                };
+                let detail = blossom_startup_detail(&e);
                 StartupError {
                     message: format!("blossom store open failed: {detail}"),
                 }
@@ -1459,6 +1464,52 @@ mod tests {
                 "key {key}: matcher must not use brace params (axum 0.8); got {matcher}"
             );
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "CLOSED_ENDPOINT_KEYS")]
+    fn closed_path_unknown_key_panics() {
+        let _ = closed_path("not_a_real_key");
+    }
+
+    #[test]
+    #[should_panic(expected = "unclosed")]
+    fn advertised_path_unclosed_placeholder_panics() {
+        let _ = advertised_path_to_axum_matcher("/v1/jobs/<job_id");
+    }
+
+    #[test]
+    #[should_panic(expected = "empty")]
+    fn advertised_path_empty_placeholder_panics() {
+        let _ = advertised_path_to_axum_matcher("/v1/jobs/<>");
+    }
+
+    #[test]
+    #[should_panic(expected = "single segment")]
+    fn advertised_path_placeholder_with_slash_panics() {
+        let _ = advertised_path_to_axum_matcher("/v1/<foo/bar>");
+    }
+
+    #[test]
+    fn register_disabled_is_noop_for_always_on_surfaces() {
+        assert!(ServedSurface::Health.is_active(&BTreeSet::new(), false));
+        assert!(ServedSurface::HealthReady.is_active(&BTreeSet::new(), false));
+        assert!(ServedSurface::Info.is_active(&BTreeSet::new(), false));
+        assert!(ServedSurface::TokenProvenance.is_active(&BTreeSet::new(), false));
+        let router = Router::<AppState>::new();
+        let router = ServedSurface::Health.register_disabled(router);
+        let router = ServedSurface::HealthReady.register_disabled(router);
+        let router = ServedSurface::Info.register_disabled(router);
+        let _router = ServedSurface::TokenProvenance.register_disabled(router);
+    }
+
+    #[test]
+    fn blossom_startup_detail_prefers_cause_then_message() {
+        let with_cause = ApiError::internal("disk");
+        assert_eq!(blossom_startup_detail(&with_cause), "disk");
+        let no_cause = ApiError::malformed("nope");
+        assert!(no_cause.cause().is_none());
+        assert_eq!(blossom_startup_detail(&no_cause), "nope");
     }
 
     /// Concrete segment for an advertised `<name>` placeholder.
@@ -5938,6 +5989,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_account_state_last_nullifier_wrong_width_is_500() {
+        let kernel = Arc::new(ScriptedKernel {
+            get_account_state: Some(Ok(AccountStateResult {
+                account_state: vec![0xAAu8; 16],
+                state_head: vec![0xBBu8; 32],
+                head_record_id: Vec::new(),
+                send_counter: 7,
+                current_pubkey: vec![0xDDu8; 32],
+                last_nullifier_pk: vec![0xEEu8; 1],
+                last_nullifier_r: vec![0xFFu8; 32],
+            })),
+            ..Default::default()
+        });
+        let app = build_router(test_config(), kernel).expect("router");
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/account/state")
+                    .header("authorization", "Bearer own-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        assert_eq!(json["error"], "internal_error");
+        assert_eq!(json["message"], crate::error::PUBLIC_INTERNAL_MESSAGE);
+    }
+
+    #[tokio::test]
     async fn get_proof_returns_binary_octet_stream() {
         let kernel = Arc::new(ScriptedKernel {
             get_coin_proof: Some(Ok(CoinProofBlob {
@@ -8804,6 +8886,41 @@ mod tests {
         assert_eq!(
             body["error"], "feature_disabled",
             "inactive GET stub must be feature_disabled, got {body}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Explorer-only + store: upload active (wallet **or** explorer) and GET/HEAD.
+    #[tokio::test]
+    async fn blossom_explorer_only_advertises_upload_get_head() {
+        let root = blossom_temp_root("explorer-only-blossom");
+        let cfg = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            kernel_addr: "http://127.0.0.1:50051".to_string(),
+            features: BTreeSet::from([Feature::Explorer]),
+            public_hosts: vec!["node.example.com".to_string()],
+            blossom: Some(crate::config::BlossomConfig {
+                store_root: root.clone(),
+                max_blob_bytes: 1024,
+                allowed_upload_ops: BTreeSet::new(),
+            }),
+        };
+        let app = build_router(cfg, Arc::new(UnreachableKernel)).expect("router");
+
+        let res = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body_bytes(res).await).unwrap();
+        let endpoints = json["endpoints"].as_object().unwrap();
+        assert_eq!(endpoints["blossom_upload"], "/blossom/upload");
+        assert_eq!(
+            endpoints["blossom_get"], "/blossom/<sha256>",
+            "explorer must advertise blossom_get"
+        );
+        assert_eq!(
+            endpoints["blossom_head"], "/blossom/<sha256>",
+            "explorer must advertise blossom_head"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

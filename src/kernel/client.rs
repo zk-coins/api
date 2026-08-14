@@ -476,6 +476,7 @@ mod tests {
             self.calls.lock().expect("call trace lock").push(name);
         }
 
+        #[allow(clippy::result_large_err)]
         fn unary<T: Default>(&self, name: &'static str) -> Result<Response<T>, Status> {
             self.record(name);
             if self.fail {
@@ -485,6 +486,7 @@ mod tests {
             }
         }
 
+        #[allow(clippy::result_large_err)]
         fn stream<T>(
             &self,
             name: &'static str,

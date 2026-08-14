@@ -3,6 +3,8 @@
 //! Outward surface of specification §7.5. Consumes the kernel RPC (§7.8) via
 //! `tonic`. Holds no protocol state, no value-bearing store, and no secrets.
 
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 pub mod attest;
 pub mod blossom;
 pub mod bootstrap;

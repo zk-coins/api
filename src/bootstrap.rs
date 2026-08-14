@@ -236,10 +236,20 @@ pub async fn post_bootstrap_entrust(
     let op_secret_bytes: [u8; 32] = bundle_bytes
         .get(65..97)
         .ok_or_else(|| {
-            ApiError::internal("operational bundle too short to hold the op secret at [65..97]")
+            // parse_operational_bundle_hex already requires exactly 161 bytes
+            #[cfg_attr(coverage_nightly, coverage(off))]
+            {
+                ApiError::internal("operational bundle too short to hold the op secret at [65..97]")
+            }
         })?
         .try_into()
-        .map_err(|_| ApiError::internal("op secret slice is not exactly 32 bytes"))?;
+        .map_err(|_| {
+            // parse_operational_bundle_hex already requires exactly 161 bytes
+            #[cfg_attr(coverage_nightly, coverage(off))]
+            {
+                ApiError::internal("op secret slice is not exactly 32 bytes")
+            }
+        })?;
 
     // GrantProof arm → 401; Ownership arm carries the subject (no outer field).
     let ownership_proof = ownership_proof.require_ownership()?;

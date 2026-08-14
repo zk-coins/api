@@ -408,6 +408,8 @@ fn validate_and_build(
     let http_status = match StatusCode::from_u16(code_u16) {
         Ok(s) => s,
         Err(_) => {
+            // every triple-table http_status is a valid HTTP status code
+            #[cfg_attr(coverage_nightly, coverage(off))]
             return Err(format!(
                 "metadata[\"http_status\"] is not a valid HTTP status: {code_u16}"
             ));
@@ -1126,6 +1128,19 @@ mod tests {
         let err = kernel_status_to_api_error(&s);
         assert_eq!(err.status, StatusCode::GONE);
         assert_eq!(err.body.error, "session_expired");
+    }
+
+    #[tokio::test]
+    async fn transport_error_to_api_error_is_internal() {
+        // Fail a connect against a closed local port to get a real transport::Error.
+        let result = tonic::transport::Endpoint::from_static("http://127.0.0.1:1")
+            .connect()
+            .await;
+        let err = result.expect_err("closed port must fail connect");
+        let api = transport_error_to_api_error(&err);
+        assert_eq!(api.body.error, "internal_error");
+        assert_eq!(api.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(api.body.message, PUBLIC_INTERNAL_MESSAGE);
     }
 
     /// Kernel `internal_error` must never leak the status message onto the wire.

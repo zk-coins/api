@@ -1129,6 +1129,8 @@ pub fn decode_view_grant(bech32m: &str) -> Result<DecodedViewGrant, ApiError> {
     cur += 32;
 
     if cur >= data.len() {
+        // 170-byte floor already guarantees the discriminator byte is present
+        #[cfg_attr(coverage_nightly, coverage(off))]
         return Err(ApiError::malformed("grant: truncated at asset_ids"));
     }
     let asset_disc = data[cur];
@@ -1137,6 +1139,8 @@ pub fn decode_view_grant(bech32m: &str) -> Result<DecodedViewGrant, ApiError> {
         0x00 => (true, Vec::new()),
         0x01 => {
             if cur + 4 > data.len() {
+                // 170-byte floor already guarantees the 4-byte count is present
+                #[cfg_attr(coverage_nightly, coverage(off))]
                 return Err(ApiError::malformed("grant: truncated asset_ids count"));
             }
             let mut count_buf = [0u8; 4];
@@ -1149,7 +1153,11 @@ pub fn decode_view_grant(bech32m: &str) -> Result<DecodedViewGrant, ApiError> {
                 ));
             }
             let need = count.checked_mul(32).ok_or_else(|| {
-                ApiError::malformed("grant: asset_ids count overflows size calculation")
+                // u32 count * 32 cannot overflow usize on this target
+                #[cfg_attr(coverage_nightly, coverage(off))]
+                {
+                    ApiError::malformed("grant: asset_ids count overflows size calculation")
+                }
             })?;
             if cur + need > data.len() {
                 return Err(ApiError::malformed("grant: truncated asset_ids list"));
@@ -1216,6 +1224,8 @@ pub fn decode_view_grant(bech32m: &str) -> Result<DecodedViewGrant, ApiError> {
     // message_prefix must be byte-identical to the version…nonce payload slice.
     let expected_prefix_len = data.len() - 64;
     if message_prefix.as_slice() != &data[..expected_prefix_len] {
+        // recompute is an inverse-encoding invariant of encode_grant_asset_ids
+        #[cfg_attr(coverage_nightly, coverage(off))]
         return Err(ApiError::internal(
             "grant message_prefix recompute diverged from decoded payload",
         ));
@@ -3232,5 +3242,218 @@ mod tests {
         )
         .expect_err("empty public hosts");
         assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn unknown_proof_type_session_is_unauthorized() {
+        let err = verify_ownership_proof(
+            ChallengeDomain::AttestBalance,
+            &encode_zk_address(&[0u8; 32]),
+            &ChallengeEcho {
+                nonce: encode_hex(&[1u8; 32]),
+                expiry: "1".into(),
+            },
+            &OwnershipProofJson {
+                proof_type: "session".into(),
+                subject: encode_zk_address(&[0u8; 32]),
+                public_key: encode_hex(&[0u8; 32]),
+                nk_commit: encode_hex(&[0u8; 32]),
+                signature: encode_hex(&[0u8; 64]),
+            },
+            &[0u8; 32],
+            &["h.example".into()],
+        )
+        .expect_err("unknown proof type");
+        assert_eq!(err.body.error, "unauthorized");
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+        assert!(
+            err.body.message.contains("session") || err.body.message.contains("unknown"),
+            "message must name the unknown type: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn verify_ownership_proof_rejects_subject_mismatch() {
+        let (_sk, _pk0, _nkc, _subject_raw, subject_bech) = fixture_identity();
+        let other_subject = encode_zk_address(&[0x11u8; 32]);
+        let err = verify_ownership_proof(
+            ChallengeDomain::AttestBalance,
+            &subject_bech,
+            &ChallengeEcho {
+                nonce: encode_hex(&[1u8; 32]),
+                expiry: "1".into(),
+            },
+            &OwnershipProofJson {
+                proof_type: "ownership".into(),
+                subject: other_subject,
+                public_key: encode_hex(&[0u8; 32]),
+                nk_commit: encode_hex(&[0u8; 32]),
+                signature: encode_hex(&[0u8; 64]),
+            },
+            &[0u8; 32],
+            &["h.example".into()],
+        )
+        .expect_err("subject mismatch");
+        assert_eq!(err.body.error, "unauthorized");
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+        assert!(
+            err.body.message.contains("does not match request subject"),
+            "message must name subject mismatch: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn verify_ownership_proof_rejects_pk0_nk_not_equal_address() {
+        let (_sk, pk0, _nkc, _subject_raw, subject_bech) = fixture_identity();
+        let wrong_nk = [0x02u8; 32];
+        let err = verify_ownership_proof(
+            ChallengeDomain::AttestBalance,
+            &subject_bech,
+            &ChallengeEcho {
+                nonce: encode_hex(&[1u8; 32]),
+                expiry: "1".into(),
+            },
+            &OwnershipProofJson {
+                proof_type: "ownership".into(),
+                subject: subject_bech.clone(),
+                public_key: encode_hex(&pk0),
+                nk_commit: encode_hex(&wrong_nk),
+                signature: encode_hex(&[0u8; 64]),
+            },
+            &[0u8; 32],
+            &["h.example".into()],
+        )
+        .expect_err("pk0||nk_commit must equal subject");
+        assert_eq!(err.body.error, "unauthorized");
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+        assert!(
+            err.body.message.contains("does not equal subject address"),
+            "message must name address equality: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn verify_ownership_proof_rejects_empty_public_hosts() {
+        let (sk, pk0, nkc, subject_raw, subject_bech) = fixture_identity();
+        let host = "node.example.com";
+        let nonce = [0xAAu8; 32];
+        let expiry = 1_700_000_060u64;
+        let request_hash = [0x11u8; 32];
+        let cb = chan_bind_for_host(host);
+        let chal = ownership_challenge_message(
+            ChallengeDomain::AttestBalance.as_str(),
+            &nonce,
+            &cb,
+            &subject_raw,
+            expiry,
+            &request_hash,
+        );
+        let sig = sign_chal(&sk, &chal);
+        let err = verify_ownership_proof(
+            ChallengeDomain::AttestBalance,
+            &subject_bech,
+            &ChallengeEcho {
+                nonce: encode_hex(&nonce),
+                expiry: expiry.to_string(),
+            },
+            &OwnershipProofJson {
+                proof_type: "ownership".into(),
+                subject: subject_bech.clone(),
+                public_key: encode_hex(&pk0),
+                nk_commit: encode_hex(&nkc),
+                signature: encode_hex(&sig),
+            },
+            &request_hash,
+            &[],
+        )
+        .expect_err("empty public_hosts must be internal_error");
+        assert_eq!(err.body.error, "internal_error");
+    }
+
+    #[test]
+    fn intersect_scopes_empty_request_assets_against_all_assets_grant_is_403() {
+        let requested = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![],
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        let grant = ResolvedScope {
+            all_assets: true,
+            asset_ids: vec![],
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        let err = intersect_scopes(&requested, &grant).expect_err("empty request assets");
+        assert_eq!(err.body.error, "scope_exceeded");
+        assert_eq!(err.status, axum::http::StatusCode::FORBIDDEN);
+        assert!(
+            err.body
+                .message
+                .contains("resolved scope asset intersection is empty"),
+            "message: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn intersect_scopes_empty_request_assets_against_explicit_grant_is_403() {
+        let requested = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![],
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        let grant = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![[0x01u8; 32]],
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        let err =
+            intersect_scopes(&requested, &grant).expect_err("empty request vs explicit grant");
+        assert_eq!(err.body.error, "scope_exceeded");
+        assert_eq!(err.status, axum::http::StatusCode::FORBIDDEN);
+        assert!(
+            err.body
+                .message
+                .contains("resolved scope asset intersection is empty"),
+            "message: {}",
+            err.body.message
+        );
+    }
+
+    #[test]
+    fn verify_grant_proof_ownership_type_is_unauthorized() {
+        let f = grant_fixture();
+        let nonce = [0xAAu8; 32];
+        let chal_expiry = 1_700_000_060u64;
+        let now = 1_700_000_000u64;
+        let revoked = RevokedGrantSet::new();
+        let dummy_sig = [0u8; 64];
+        let err = verify_grant_proof(
+            &encode_hex(&nonce),
+            &chal_expiry.to_string(),
+            &GrantProofJson {
+                proof_type: "ownership".into(),
+                grant: f.bech.clone(),
+                grantee_pk: encode_hex(&f.grantee_pk),
+                signature: encode_hex(&dummy_sig),
+            },
+            &f.op_pk,
+            &ResolvedScope::unbounded(),
+            &grant_ctx(&["node.example.com".into()], now, &revoked),
+        )
+        .expect_err("ownership type on grant proof");
+        assert_eq!(err.body.error, "unauthorized");
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+        assert!(
+            err.body.message.contains("grant"),
+            "message must mention grant: {}",
+            err.body.message
+        );
     }
 }

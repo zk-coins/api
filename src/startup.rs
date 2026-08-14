@@ -189,4 +189,13 @@ mod tests {
             assert_eq!(code, ExitCode::from(1));
         }
     }
+
+    #[tokio::test]
+    async fn run_from_config_result_ok_binds_ephemeral_then_is_aborted() {
+        let config = test_config("127.0.0.1:0", "http://127.0.0.1:50051", None);
+        let handle = tokio::spawn(run_from_config_result(Ok(config)));
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        handle.abort();
+        let _ = handle.await; // JoinError from abort is fine
+    }
 }

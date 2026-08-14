@@ -814,4 +814,10 @@ mod tests {
             "expected MissingEnv, got {err:?}"
         );
     }
+
+    #[test]
+    #[should_panic(expected = "caller validated lowercase hex")]
+    fn hex_nibble_non_hex_is_unreachable_contract() {
+        let _ = hex_nibble(b'g');
+    }
 }

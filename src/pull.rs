@@ -180,6 +180,13 @@ fn scope_to_proto(scope: &ResolvedScope) -> Scope {
     }
 }
 
+/// Fail-closed belt for grant pull: resolved fully unbounded while the grant
+/// itself is scoped. Unreachable through [`intersect_scopes`] (clamp / time
+/// intersect always preserve a bound); kept as a defensive predicate.
+fn grant_scope_inconsistency(resolved: &ResolvedScope, grant: &ResolvedScope) -> bool {
+    resolved.is_fully_unbounded() && !grant.is_fully_unbounded()
+}
+
 fn unix_now() -> Result<u64, ApiError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -465,7 +472,7 @@ pub async fn post_pull(
             )?;
             // Fail-closed belt: a grant session must never carry a fully
             // unbounded scope when the grant itself was scoped.
-            if v.resolved_scope.is_fully_unbounded() && !v.grant_scope.is_fully_unbounded() {
+            if grant_scope_inconsistency(&v.resolved_scope, &v.grant_scope) {
                 return Err(ApiError::internal(
                     "grant resolved_scope is fully unbounded while grant.scope is not — refuse",
                 ));
@@ -876,6 +883,31 @@ mod tests {
         let resolved = normalise_scope(&scope(json!("*"), None, None)).expect("star");
         assert!(resolved.all_assets);
         assert!(resolved.asset_ids.is_empty());
+    }
+
+    #[test]
+    fn scope_to_proto_maps_star_normalise_ok() {
+        let resolved = normalise_scope(&scope(json!("*"), None, None)).expect("star");
+        let proto = scope_to_proto(&resolved);
+        assert!(proto.all_assets);
+        assert!(proto.asset_ids.is_empty());
+        assert_eq!(proto.not_before, 0);
+        assert_eq!(proto.not_after, SCOPE_NOT_AFTER_UNBOUNDED);
+    }
+
+    #[test]
+    fn grant_scope_inconsistency_predicate() {
+        let unbounded = ResolvedScope::unbounded();
+        let scoped = ResolvedScope {
+            all_assets: false,
+            asset_ids: vec![[0x01u8; 32]],
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        assert!(grant_scope_inconsistency(&unbounded, &scoped));
+        assert!(!grant_scope_inconsistency(&unbounded, &unbounded));
+        assert!(!grant_scope_inconsistency(&scoped, &scoped));
+        assert!(!grant_scope_inconsistency(&scoped, &unbounded));
     }
 
     #[test]

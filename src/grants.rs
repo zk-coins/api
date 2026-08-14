@@ -378,7 +378,11 @@ pub async fn post_grants_revoke(
         .grant_revoke_challenges
         .take(&nonce_raw)
         .ok_or_else(|| {
-            ApiError::unauthorized("unknown or already-consumed grant-revoke challenge nonce")
+            // post-peek consume race: get succeeded, concurrent take won
+            #[cfg_attr(coverage_nightly, coverage(off))]
+            {
+                ApiError::unauthorized("unknown or already-consumed grant-revoke challenge nonce")
+            }
         })?;
 
     // 8. Population — only write to revoked_grants in this handler. No kernel

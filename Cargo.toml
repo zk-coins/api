@@ -14,6 +14,12 @@ description = "zkCoins public REST API layer"
 license = "MIT"
 publish = false
 
+# Register the `coverage_nightly` cfg so `#[cfg_attr(coverage_nightly,
+# coverage(off))]` is not an `unexpected_cfgs` error under `-D warnings`.
+# `cargo llvm-cov` injects this cfg.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
+
 [dependencies]
 # tonic 0.13.1 matches zk-coins/node (kernel-proto): last line whose
 # tonic-build still owns prost codegen (`compile_protos`). 0.14 moved that

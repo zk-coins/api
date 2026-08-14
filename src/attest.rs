@@ -155,6 +155,7 @@ pub async fn post_attest_balance(
         (Some(nav), Some(size)) => (nav.to_vec(), size),
         _ => {
             // ceiling_encoding already rejected mixed presence.
+            #[cfg_attr(coverage_nightly, coverage(off))]
             return Err(ApiError::internal(
                 "ceiling pair invariant broken after encoding",
             ));

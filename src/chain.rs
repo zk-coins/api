@@ -326,6 +326,7 @@ async fn fetch_inscriptions_page(
             None => {
                 // limit is 1000 and len is 1000, so last is always present;
                 // this arm is unreachable by construction.
+                #[cfg_attr(coverage_nightly, coverage(off))]
                 return Err(ApiError::internal(
                     "page-full inscription stream has no last element",
                 ));
@@ -634,6 +635,28 @@ mod tests {
         assert_eq!(json["leaf"].as_str().unwrap().len(), 64);
         assert_eq!(json["audit_path"].as_array().unwrap().len(), 1);
         assert_eq!(json["tree_size"], 4);
+    }
+
+    #[test]
+    fn present_path_audit_path_node_wrong_width_is_internal() {
+        let path = NullifierPath {
+            root: vec![0x01; 32],
+            tip_height: 10,
+            present: true,
+            leaf: vec![0x02; 32],
+            position: 3,
+            audit_path: vec![vec![0x03; 16]],
+            tree_size: 4,
+            tip_block_hash: vec![0x04; 32],
+        };
+        let err = nullifier_path_to_json(&path).expect_err("audit_path[0] wrong width");
+        assert_eq!(err.body.error, "internal_error");
+        assert_eq!(err.body.message, crate::error::PUBLIC_INTERNAL_MESSAGE);
+        assert!(
+            err.cause().unwrap_or("").contains("audit_path[0]"),
+            "operator cause must name audit_path[0], got {:?}",
+            err.cause()
+        );
     }
 
     #[test]

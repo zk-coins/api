@@ -52,7 +52,13 @@ pub fn json_rejection_to_api_error(rejection: JsonRejection) -> ApiError {
         JsonRejection::JsonDataError(err) => ApiError::malformed(format!("request body: {err}")),
         JsonRejection::JsonSyntaxError(err) => ApiError::malformed(format!("request body: {err}")),
         JsonRejection::BytesRejection(err) => bytes_rejection_to_api_error(err),
-        other => ApiError::malformed(format!("request body: {other}")),
+        // axum's current JsonRejection variants are all matched above (non_exhaustive)
+        other => {
+            #[cfg_attr(coverage_nightly, coverage(off))]
+            {
+                ApiError::malformed(format!("request body: {other}"))
+            }
+        }
     }
 }
 

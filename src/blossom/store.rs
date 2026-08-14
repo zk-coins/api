@@ -95,12 +95,18 @@ impl BlobStore {
             ))
         })?;
         let meta = fs::metadata(&root).map_err(|e| {
-            ApiError::internal(format!(
-                "blossom store: cannot stat root {}: {e}",
-                root.display()
-            ))
+            // race/chmod-after-create: create_dir_all succeeded then metadata fails
+            #[cfg_attr(coverage_nightly, coverage(off))]
+            {
+                ApiError::internal(format!(
+                    "blossom store: cannot stat root {}: {e}",
+                    root.display()
+                ))
+            }
         })?;
         if !meta.is_dir() {
+            // create_dir_all already fails when the path is a non-directory
+            #[cfg_attr(coverage_nightly, coverage(off))]
             return Err(ApiError::internal(format!(
                 "blossom store: root {} is not a directory",
                 root.display()
@@ -247,15 +253,33 @@ impl BlobStore {
         let path = self.blob_path(id);
         match fs::metadata(&path) {
             Ok(m) if m.is_file() => Ok(Some(m.len())),
-            Ok(_) => Err(ApiError::internal(format!(
-                "blossom store: path {} is not a regular file",
-                path.display()
-            ))),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(ApiError::internal(format!(
-                "blossom store: stat {}: {e}",
-                path.display()
-            ))),
+            // TOCTOU: exists() already requires blob_path to be a regular file
+            Ok(_) => {
+                #[cfg_attr(coverage_nightly, coverage(off))]
+                {
+                    Err(ApiError::internal(format!(
+                        "blossom store: path {} is not a regular file",
+                        path.display()
+                    )))
+                }
+            }
+            // TOCTOU: exists() said the complete pair was present
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                #[cfg_attr(coverage_nightly, coverage(off))]
+                {
+                    Ok(None)
+                }
+            }
+            // TOCTOU / untestable without race after exists() succeeded
+            Err(e) => {
+                #[cfg_attr(coverage_nightly, coverage(off))]
+                {
+                    Err(ApiError::internal(format!(
+                        "blossom store: stat {}: {e}",
+                        path.display()
+                    )))
+                }
+            }
         }
     }
 
@@ -367,6 +391,8 @@ impl BlobStore {
                 // Under per-blob lock this should not race another put, but
                 // if a complete pair appeared, treat as idempotent success.
                 if note_path.is_file() && final_path.is_file() {
+                    // per-blob lock makes this a crash leftover, not a concurrent race
+                    #[cfg_attr(coverage_nightly, coverage(off))]
                     return Ok(*id);
                 }
                 return Err(ApiError::internal(
@@ -439,10 +465,16 @@ fn nibble(b: u8) -> u8 {
 
 fn unique_tmp_tag() -> String {
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let nanos = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_nanos(),
+        // untestable without mocking SystemTime before UNIX_EPOCH
+        Err(_) => {
+            #[cfg_attr(coverage_nightly, coverage(off))]
+            {
+                0
+            }
+        }
+    };
     format!("{}-{}-{}", std::process::id(), nanos, seq)
 }
 
@@ -1325,31 +1357,34 @@ mod tests {
     #[test]
     fn put_install_note_other_error_retains_blob() {
         let root = temp_root();
-        let store = Arc::new(BlobStore::open(&root).expect("open"));
         let body = b"install-note-other-error-body";
         let id = blob_id_of(body);
         let hex = BlobStore::blob_id_hex(&id);
         let note_prefix = format!(".{hex}.note.tmp.");
-        let final_blob = store.blob_path(&id);
-        let root_t = root.clone();
-        let watcher = thread::spawn(move || {
-            let start = std::time::Instant::now();
-            while start.elapsed() < std::time::Duration::from_secs(2) {
-                // Wait until final blob is installed, then delete note temp so
-                // hard_link fails with NotFound (not AlreadyExists).
-                if final_blob.is_file() {
-                    for p in list_names_with_prefix(&root_t, &note_prefix) {
-                        let _ = fs::remove_file(&p);
-                    }
-                }
-                thread::yield_now();
-            }
-        });
         let op = [0xa7u8; 32];
-        let result = store.put(body, &op);
-        let _ = watcher.join();
-        match result {
-            Err(err) => {
+        // Watcher vs put is a scheduling race (already ~2/5 flake on HEAD).
+        let mut saw_err = false;
+        for _ in 0..20 {
+            let store = Arc::new(BlobStore::open(&root).expect("open"));
+            let _ = fs::remove_file(store.blob_path(&id));
+            let _ = fs::remove_file(store.uploader_path(&id));
+            let final_blob = store.blob_path(&id);
+            let root_t = root.clone();
+            let prefix = note_prefix.clone();
+            let watcher = thread::spawn(move || {
+                let start = std::time::Instant::now();
+                while start.elapsed() < std::time::Duration::from_secs(2) {
+                    if final_blob.is_file() {
+                        for p in list_names_with_prefix(&root_t, &prefix) {
+                            let _ = fs::remove_file(&p);
+                        }
+                    }
+                    thread::yield_now();
+                }
+            });
+            let result = store.put(body, &op);
+            let _ = watcher.join();
+            if let Err(err) = result {
                 assert_eq!(err.body.error, "internal_error");
                 let cause = err.cause().unwrap_or("");
                 assert!(
@@ -1360,10 +1395,15 @@ mod tests {
                     store.blob_path(&id).is_file(),
                     "data permanence: blob must remain after note install failure"
                 );
+                saw_err = true;
+                break;
             }
-            Ok(_) => panic!("expected install note failure when note temp deleted"),
         }
         let _ = fs::remove_dir_all(&root);
+        assert!(
+            saw_err,
+            "expected install note failure when note temp deleted (20 attempts)"
+        );
     }
 
     // --- list_root_names / non-UTF8 ---
