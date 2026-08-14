@@ -128,11 +128,12 @@ pub const CLOSED_ENDPOINT_KEYS: &[(&str, &str)] = &[
 ///
 /// | Surfaces | Gate |
 /// |---|---|
-/// | `health`, `health_ready`, `info` | always (API process) |
+/// | `health`, `health_ready`, `info`, `token_provenance` | always (API process) |
 /// | `chain_*` | `explorer` |
 /// | `tx`, `jobs*`, `attest_*`, `grants_*`, `grants_revoke*`, `pull*`, `record`, `proof`, `account_state`, `receipts_stream`, `bootstrap_*` | `wallet` |
 /// | `publish_spendrecord` | `publisher` |
-/// | `blossom_get` / `blossom_head` / `blossom_upload` | `ZKCOINS_BLOSSOM_STORE` **and** (`wallet` **or** `explorer`) |
+/// | `blossom_get` / `blossom_head` | `ZKCOINS_BLOSSOM_STORE` **and** `explorer` |
+/// | `blossom_upload` | `ZKCOINS_BLOSSOM_STORE` **and** (`wallet` **or** `explorer`) |
 ///
 /// `lightning_bridge` / `mail_bridge` open no §7.5 inventory paths (extension
 /// docs only) and therefore add no variants here.
