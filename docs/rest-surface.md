@@ -133,7 +133,8 @@ beworbene optionale Rollen weglassen. Unbekannte Keys beim Lesen ignorieren.
 | Geschlossene `endpoints`-Keys | **31** |
 | Capability-gebunden (Ownership / Grant / Session / Nostr-Auth) | **12** (#14, #16, #18, #20–24, #27–28, #31–32) |
 | Challenge-Aussteller ohne Capability | **5** (#13, #15, #17, #19, #26) |
-| API-lokal | **2** (`GET /`, `GET /health`) |
+| API-lokal (origin-lokal, immer an, kein Kernel) | **2** (`GET /`, `GET /health`) |
+| API-lokal (kernel-los, feature-gated) | **2** (Grant-Revoke #17/#18; bereits in der Endpunkt-Tabelle) |
 
 ### Pro Feature (Method+Path, ohne „immer“)
 

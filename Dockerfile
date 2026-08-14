@@ -52,7 +52,7 @@
 #
 #   ZKCOINS_BLOSSOM_STORE
 #     Filesystem root for the content-addressed store.
-#     Absent ⇒ Blossom routes unmounted, four discovery keys unadvertised.
+#     Absent ⇒ Blossom routes unmounted, three discovery keys unadvertised.
 #     Present-but-empty ⇒ start error (no /tmp default).
 #     Codestelle: src/config.rs ENV_BLOSSOM_STORE / parse_blossom_config.
 #

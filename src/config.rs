@@ -11,7 +11,7 @@
 //!
 //! Optional Blossom surface (§7.4) — all-or-nothing:
 //! - `ZKCOINS_BLOSSOM_STORE` — filesystem root for the content-addressed store.
-//!   **Absent** ⇒ Blossom routes are not mounted and the four discovery keys
+//!   **Absent** ⇒ Blossom routes are not mounted and the three discovery keys
 //!   are not advertised. **No default path**, no `/tmp` fallback.
 //! - When the store is set, these companions are required (fail-closed boot):
 //!   - `ZKCOINS_BLOSSOM_MAX_BLOB_BYTES` — advertised upload size limit (`> 0`)
@@ -73,7 +73,7 @@ impl FromStr for Feature {
 
 /// Optional §7.4 Blossom store configuration.
 ///
-/// Present only when `ZKCOINS_BLOSSOM_STORE` is set. Absence means the four
+/// Present only when `ZKCOINS_BLOSSOM_STORE` is set. Absence means the three
 /// Blossom discovery keys stay unadvertised and the routes stay unmounted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlossomConfig {
