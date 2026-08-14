@@ -403,6 +403,8 @@ pub async fn post_pull(
     };
 
     // ---- pure validation + capability gate (no kernel) ----
+    // Grant arm may stash `grant_id` for a last-moment revoke recheck before pull.
+    let mut grant_id_recheck: Option<[u8; 32]> = None;
     let (subject_bech32, nonce, chan_bind, resolved, authority) = match body.proof {
         PullProofJson::Ownership {
             subject,
@@ -447,6 +449,9 @@ pub async fn post_pull(
             };
             // Decode first so we know which subject's published op to load.
             let decoded = crate::ownership::decode_view_grant(&grant)?;
+            // Serialize lookup + verify against entrust/revoke on this subject.
+            let subject_lock = state.subject_op_locks.mutex_for(decoded.subject);
+            let guard = subject_lock.lock().await;
             let op_pubkey = match state.subject_ops.get(&decoded.subject) {
                 Some(pk) => pk,
                 None => {
@@ -478,6 +483,20 @@ pub async fn post_pull(
                     "grant resolved_scope is fully unbounded while grant.scope is not — refuse",
                 ));
             }
+            // Drop before kernel RPC; re-read so we refuse if op was removed/replaced.
+            drop(guard);
+            match state.subject_ops.get(&decoded.subject) {
+                Some(pk) if pk == op_pubkey => {}
+                _ => {
+                    return Err(ApiError::unauthorized(
+                        "GrantProof rejected: subject's published op_pubkey is not available \
+                         (Nostr kind-30420 profile resolution with §4.3 address binding is \
+                         not wired; subject_ops directory has no entry). Half-checked grants \
+                         are forbidden (§5.1(b) step 1)",
+                    ));
+                }
+            }
+            grant_id_recheck = Some(v.grant_id);
             (
                 v.subject_bech32,
                 v.nonce,
@@ -487,6 +506,15 @@ pub async fn post_pull(
             )
         }
     };
+
+    // Last-moment revoke recheck (Grant only): closes TOCTOU vs concurrent POST /v1/grants/revoke.
+    if let Some(grant_id) = grant_id_recheck {
+        if state.revoked_grants.contains(&grant_id) {
+            return Err(ApiError::unauthorized(
+                "view grant has been revoked (grant_id is in the process-local revocation set)",
+            ));
+        }
+    }
 
     // ---- only now: kernel (nonce consumption lives here) ----
     let result: ProtoPullResult = state

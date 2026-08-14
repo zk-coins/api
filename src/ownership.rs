@@ -877,7 +877,10 @@ impl SubjectOpLocks {
     }
 }
 
-/// Node-local revocation set for `grant_id` (§5.2 — forward-only).
+/// Process-local revocation set for `grant_id` (§5.2 — forward-only).
+///
+/// The set is **process-local, not durable**: it starts empty on every boot
+/// (like [`SubjectOpDirectory`]). Forward-only inserts; no persistence.
 #[derive(Debug, Default)]
 pub struct RevokedGrantSet {
     inner: RwLock<HashSet<[u8; 32]>>,
@@ -1389,7 +1392,7 @@ pub struct GrantVerificationContext<'a> {
     pub public_hosts: &'a [String],
     /// Unix seconds used for grant `expiry` (inclusive upper bound).
     pub now: u64,
-    /// Node-local revocation set (`grant_id` → refuse).
+    /// Process-local revocation set (`grant_id` → refuse). Empty on every boot; not durable.
     pub revoked: &'a RevokedGrantSet,
 }
 

@@ -36,7 +36,7 @@ pub struct AppState {
     /// Per-subject async mutexes for entrust/revoke (kernel dial + directory write).
     /// Process-local; see [`SubjectOpLocks`].
     pub subject_op_locks: Arc<SubjectOpLocks>,
-    /// Forward-only grant revocation set (§5.2).
+    /// Forward-only grant revocation set (§5.2). Process-local, not durable; empty on every boot.
     pub revoked_grants: Arc<RevokedGrantSet>,
     /// Single-use, api-local challenge nonce store for `POST /v1/grants/revoke`
     /// (§5.2) — no kernel dial; see `GrantRevokeChallengeStore`.
