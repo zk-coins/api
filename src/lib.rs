@@ -1,7 +1,9 @@
 //! zkCoins public REST API layer.
 //!
 //! Outward surface of specification §7.5. Consumes the kernel RPC (§7.8) via
-//! `tonic`. Holds no protocol state, no value-bearing store, and no secrets.
+//! `tonic`. Holds no value-bearing protocol state and no secrets. API-local
+//! non-value-bearing state does exist (`subject_ops`, `revoked_grants`,
+//! grant-revoke challenges, optional Blossom).
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 

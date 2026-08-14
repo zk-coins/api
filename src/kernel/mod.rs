@@ -1,7 +1,7 @@
 //! Kernel gRPC boundary: generated `kernel.v1` types, client, and ErrorInfo map.
 //!
-//! The api holds no protocol state. Handlers translate REST ↔ these types and
-//! forward every call to the kernel process.
+//! This module is the kernel client and ErrorInfo map. Health, GET `/`, and
+//! Grant-Revoke are API-local and do not go through this module.
 
 mod client;
 mod error_info;

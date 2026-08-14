@@ -27,7 +27,7 @@ Supporting repos: [`zk-coins/research`](https://github.com/zk-coins/research), [
 The API layer sits **outward** of the node. It consumes the node's internal **kernel RPC** (gRPC `kernel.v1`, [specification §7.8](https://docs.zkcoins.com/specification)) and exposes the **public REST API** ([§7.5](https://docs.zkcoins.com/specification)) to wallets, the SDK, the app, and the explorer — REST outward, gRPC inward.
 
 - It owns its **own, non-value-bearing** database (LNURL mappings, `username`/aliasing, rate-limits, push-subscription registrations). The **value-bearing** data — coins, proofs, bundles, the nullifier accumulator — stays in the node ([§4.8](https://docs.zkcoins.com/specification)); the API layer **never** touches the node's database directly.
-- It never touches Bitcoin and holds no SPEND key. Capability-gating and rate-limiting live here; proving, broadcasting, and chain scanning stay in the node.
+- It never touches Bitcoin and holds no SPEND key. Capability-gating lives here; rate-limiting is Kernel ErrorInfo translation (`rate_limited`), not an API-local limiter. Proving, broadcasting, and chain scanning stay in the node.
 - Running it is **optional**: a sovereign personal node serves its own wallet directly; the API layer is the "public service node" role that hosts other accounts.
 
 This repository **is** the standalone API process: `src/startup.rs` loads
