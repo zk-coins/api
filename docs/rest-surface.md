@@ -175,7 +175,7 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Blob-Pfad).
 | `POST /v1/grants/revoke/challenge` | **implementiert** — API-lokal, stellt Single-Use-Nonce für Grant-Revoke aus; kein Kernel-Dial (§5.2) |
 | `POST /v1/grants/revoke` | **implementiert** — OwnershipProof-Verifikation am API-Rand (RevokeGrant-Domain, grant→subject binding), dann `revoked_grants`; kein Kernel-Dial (§5.2) |
 | `POST /v1/pull/challenge` | **implementiert** — `OpenPullChallenge` (`action = ""` meaning pull) |
-| `POST /v1/pull` | **implementiert** — OwnershipProof am API-Rand, dann `Pull` (GrantProof fail-closed) |
+| `POST /v1/pull` | **implementiert** — OwnershipProof oder GrantProof am API-Rand, dann `Pull`. GrantProof ohne veröffentlichten Subject-Op-Eintrag wird 401 (kind-30420-Auflösung nicht verdrahtet); halbgeprüfte Grants sind verboten |
 | `GET /v1/record/<record_id>` | **implementiert** — `GetRecord` (Bearer-Session) |
 | `GET /v1/proof/<coin_id>` | **implementiert** — `GetCoinProof` (Bearer-Session) |
 | `GET /v1/account/state` | **implementiert** — `GetAccountState` (Ownership-Session) |
