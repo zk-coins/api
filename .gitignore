@@ -3,6 +3,8 @@ target/
 
 # Environment & secrets
 .env
+.env.*
+!.env.example
 *.pem
 
 # OS / editor
