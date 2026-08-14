@@ -1385,22 +1385,20 @@ mod tests {
         let hex = BlobStore::blob_id_hex(&id);
         let note_prefix = format!(".{hex}.note.tmp.");
         let op = [0xa7u8; 32];
-        // Watcher vs put is a scheduling race (already ~2/5 flake on HEAD).
+        // Watcher races the note-tmp (exists before final blob hard_link), not the final blob.
+        // Deleting note-tmp as soon as it appears widens the install-note failure window.
         let mut saw_err = false;
-        for _ in 0..20 {
+        for _ in 0..50 {
             let store = Arc::new(BlobStore::open(&root).expect("open"));
             let _ = fs::remove_file(store.blob_path(&id));
             let _ = fs::remove_file(store.uploader_path(&id));
-            let final_blob = store.blob_path(&id);
             let root_t = root.clone();
             let prefix = note_prefix.clone();
             let watcher = thread::spawn(move || {
                 let start = std::time::Instant::now();
                 while start.elapsed() < std::time::Duration::from_secs(2) {
-                    if final_blob.is_file() {
-                        for p in list_names_with_prefix(&root_t, &prefix) {
-                            let _ = fs::remove_file(&p);
-                        }
+                    for p in list_names_with_prefix(&root_t, &prefix) {
+                        let _ = fs::remove_file(&p);
                     }
                     thread::yield_now();
                 }
@@ -1425,7 +1423,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         assert!(
             saw_err,
-            "expected install note failure when note temp deleted (20 attempts)"
+            "expected install note failure when note temp deleted (50 attempts)"
         );
     }
 
