@@ -1,8 +1,11 @@
 //! §7.4 Blossom blob store — API-local, content-addressed, no kernel RPC.
 //!
 //! Three routes, one filesystem store. Discovery keys
-//! `blossom_get` / `blossom_head` / `blossom_upload` are advertised **if and
-//! only if** `ZKCOINS_BLOSSOM_STORE` is configured.
+//! `blossom_get` / `blossom_head` / `blossom_upload` are advertised and real
+//! handlers mounted only when `ZKCOINS_BLOSSOM_STORE` **and** the matching role
+//! are present (`get`/`head`: `explorer`; `upload`: `wallet` or `explorer`).
+//! Without a store the routes stay unregistered; with a store but no matching
+//! role they mount as `404 feature_disabled` stubs and are not advertised.
 //!
 //! ## Data permanence (Requirement 12)
 //!

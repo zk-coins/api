@@ -186,20 +186,22 @@ Deployments mit Wallet- und/oder Explorer-Rolle benötigt (Blob-Pfad).
 | `POST /v1/bootstrap/revoke` | **implementiert** — OwnershipProof (Revoke-Domain), dann `RevokeOperationalBundle` |
 | `POST /v1/publish/spendrecord` | **implementiert** — `Publish`; Ablehnung → HTTP 200 `{accepted:false, reason}`; v1-Fee-Felder → 400 |
 | `GET /v1/token/<asset_id>/provenance` | **implementiert** — `GetTokenProvenance`-Pass-through; offen/unauthentifiziert, nie feature-gated; §7.5-JSON (`name` hex, v1/v2, `cap_total` u128-Dezimalstring, `terms_salt` hex); `404 not_found` ohne Terms; kein Leak (nur IssuanceTerms-Preimage). |
-| `GET`/`HEAD /blossom/<sha256>`, `PUT`/`POST /blossom/upload` | **implementiert** wenn `ZKCOINS_BLOSSOM_STORE` gesetzt — API-lokaler append-only Store (§7.4 / Data Permanence); kein Kernel-RPC; ohne Store unregistriert; **kein** DELETE |
+| `GET`/`HEAD /blossom/<sha256>`, `PUT`/`POST /blossom/upload` | **implementiert** bei Store ∧ Rolle — GET/HEAD: `ZKCOINS_BLOSSOM_STORE` **und** `explorer`; Upload: Store **und** (`wallet` **oder** `explorer`); API-lokaler append-only Store (§7.4 / Data Permanence); kein Kernel-RPC; ohne Store unregistriert (bare 404); Store ohne passende Rolle: Stub `404 feature_disabled`, unbeworben; **kein** DELETE |
 | alle übrigen Method+Path | **nicht registriert** — kein Handler, kein `todo!()`, kein Platzhalter |
 
 **Bewusst nicht beworben:**
 
 | Key | Warum |
 |---|---|
-| `blossom_*` (ohne `ZKCOINS_BLOSSOM_STORE`) | §7.4; die drei Schlüssel (`get`/`head`/`upload`) werden **nur** advertised, wenn der inhaltsadressierte Store konfiguriert ist. |
+| `blossom_*` (ohne Store bzw. ohne passende Rolle) | §7.4; die drei Schlüssel (`get`/`head`/`upload`) werden **nur** advertised, wenn der Store **und** die jeweilige Rolle greifen (GET/HEAD: `explorer`; Upload: `wallet` **oder** `explorer`). Store ohne passende Rolle → Stub `404 feature_disabled`, nicht in `GET /`. Ohne Store → unregistriert, unbeworben. |
 | `blossom_delete` | Data Permanence — existiert nicht mehr in der Inventur. |
 
 Router und Discovery teilen eine Quelle (`ServedSurface` in `src/routes.rs`): die
 aktive Menge folgt `Config::features` und dem Blossom-Store; eine neue
-registrierte Fläche erscheint automatisch in `GET /`; deaktivierte Features
-sind unregistriert und unbeworben (fail-closed, §7.5). Path-Parameter in
+registrierte Fläche erscheint automatisch in `GET /`; deaktivierte bekannte
+Flächen antworten als Stub `404 feature_disabled` und bleiben unbeworben;
+unkonfigurierter Blossom-Store bleibt unregistriert (bare 404)
+(fail-closed, §7.5). Path-Parameter in
 Discovery/`CLOSED_ENDPOINT_KEYS` nutzen die Spec-Schreibweise `<name>`
 (Axum-Matcher: `:name`).
 
@@ -212,7 +214,7 @@ ausschließlich über `google.rpc.ErrorInfo` (`domain`, `reason`,
 
 | Lücke | Warum |
 |---|---|
-| — | Feature-Gating (§6.1 / §7.5) ist aktiv: `ServedSurface::active` filtert nach `ZKCOINS_FEATURES` + Blossom-Store; deaktivierte Flächen sind unregistriert (HTTP 404) und fehlen in `GET /`. |
+| — | Feature-Gating (§6.1 / §7.5) ist aktiv: `ServedSurface::active` filtert nach `ZKCOINS_FEATURES` + Blossom-Store; deaktivierte bekannte Flächen sind Stub `404 feature_disabled` und fehlen in `GET /`; unkonfigurierter Blossom-Store ist unregistriert (bare 404). |
 | — | Data Permanence: Blossom ist append-only (`PUT`/`POST`/`GET`/`HEAD` only); Upload → `{ blob_id }` ohne `receipt`; kein `retention_hold`, kein Orphan-Prune. |
 
 ---

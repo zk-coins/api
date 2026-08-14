@@ -1,7 +1,7 @@
 # Contributing to zkCoins API
 
 This repository **is** the standalone API process (`src/startup.rs` loads
-config and connects the kernel). It exposes REST + LNURL on top of the node's
+config and connects the kernel). It exposes REST on top of the node's
 internal kernel RPC
 ([specification §7.5 / §7.8](https://docs.zkcoins.com/specification)).
 

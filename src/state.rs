@@ -25,6 +25,8 @@ pub struct AppState {
     pub public_hosts: Arc<Vec<String>>,
     /// §7.4 Blossom surface. `None` when `ZKCOINS_BLOSSOM_STORE` is unset —
     /// routes are not mounted and discovery keys are not advertised.
+    /// When the store is present but neither `wallet` nor `explorer` is
+    /// enabled, the keys are not advertised (`feature_disabled` stubs).
     pub blossom: Option<BlossomState>,
     /// Published `op_pubkey` by subject for GrantProof step 1 (§5.1(b)).
     /// Starts empty — see [`SubjectOpDirectory`].
