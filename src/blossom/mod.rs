@@ -182,8 +182,7 @@ pub async fn upload_blob(
     let verified = verify_blossom_auth(auth_header, RequiredAction::Upload, &body_hash, now)?;
 
     // ACL: op must be a paired account or configured replication peer.
-    if !blossom.allow_any_verified_op && !blossom.allowed_upload_ops.contains(&verified.op_pubkey)
-    {
+    if !blossom.allow_any_verified_op && !blossom.allowed_upload_ops.contains(&verified.op_pubkey) {
         return Err(ApiError::scope_exceeded(
             "upload op key is neither a paired account nor a configured replication peer",
         ));
