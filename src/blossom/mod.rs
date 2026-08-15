@@ -47,6 +47,8 @@ pub struct BlossomState {
     pub max_blob_bytes: u64,
     /// `op` keys allowed to upload (paired accounts + replication peers).
     pub allowed_upload_ops: Arc<BTreeSet<[u8; 32]>>,
+    /// When true, any verified kind-24242 may upload (test nodes).
+    pub allow_any_verified_op: bool,
 }
 
 impl BlossomState {
@@ -56,6 +58,7 @@ impl BlossomState {
             store: Arc::new(store),
             max_blob_bytes: cfg.max_blob_bytes,
             allowed_upload_ops: Arc::new(cfg.allowed_upload_ops.clone()),
+            allow_any_verified_op: cfg.allow_any_verified_op,
         })
     }
 }
@@ -179,7 +182,8 @@ pub async fn upload_blob(
     let verified = verify_blossom_auth(auth_header, RequiredAction::Upload, &body_hash, now)?;
 
     // ACL: op must be a paired account or configured replication peer.
-    if !blossom.allowed_upload_ops.contains(&verified.op_pubkey) {
+    if !blossom.allow_any_verified_op && !blossom.allowed_upload_ops.contains(&verified.op_pubkey)
+    {
         return Err(ApiError::scope_exceeded(
             "upload op key is neither a paired account nor a configured replication peer",
         ));
@@ -297,6 +301,7 @@ mod tests {
             store,
             max_blob_bytes: 1,
             allowed_upload_ops: Arc::new(BTreeSet::new()),
+            allow_any_verified_op: false,
         });
         let mut headers = HeaderMap::new();
         headers.insert(

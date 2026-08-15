@@ -17,7 +17,8 @@
 //!   - `ZKCOINS_BLOSSOM_MAX_BLOB_BYTES` — advertised upload size limit (`> 0`)
 //!   - `ZKCOINS_BLOSSOM_ALLOWED_OPS` — comma-separated lowercase-hex 32-byte
 //!     `op` pubkeys allowed to upload (paired accounts + replication peers;
-//!     may be empty ⇒ every upload is `403`)
+//!     may be empty ⇒ every upload is `403`). A sole `*` token allows any
+//!     verified kind-24242 (dedicated test nodes).
 
 use std::collections::BTreeSet;
 use std::env;
@@ -82,8 +83,12 @@ pub struct BlossomConfig {
     /// Advertised maximum upload body size in bytes (`> 0`).
     pub max_blob_bytes: u64,
     /// `op` pubkeys (32 raw bytes) allowed to PUT/POST — paired accounts and
-    /// configured replication peers. Empty set ⇒ every upload is `403`.
+    /// configured replication peers. Empty set ⇒ every upload is `403`,
+    /// unless `allow_any_verified_op` is set.
     pub allowed_upload_ops: BTreeSet<[u8; 32]>,
+    /// When true (`ZKCOINS_BLOSSOM_ALLOWED_OPS=*`), any kind-24242 that
+    /// verifies is accepted. For dedicated test nodes only.
+    pub allow_any_verified_op: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,12 +270,14 @@ where
 
     let ops_raw = require_present(get, ENV_BLOSSOM_ALLOWED_OPS)?;
     // Empty string is allowed: surface is up, but every upload is 403.
-    let allowed_upload_ops = parse_allowed_ops(&ops_raw)?;
+    // A sole `*` token allows any verified kind-24242 (test nodes).
+    let (allowed_upload_ops, allow_any_verified_op) = parse_allowed_ops(&ops_raw)?;
 
     Ok(Some(BlossomConfig {
         store_root: PathBuf::from(store_raw),
         max_blob_bytes,
         allowed_upload_ops,
+        allow_any_verified_op,
     }))
 }
 
@@ -302,13 +309,23 @@ fn parse_max_blob_bytes(raw: &str) -> Result<u64, ConfigError> {
         })
 }
 
-fn parse_allowed_ops(raw: &str) -> Result<BTreeSet<[u8; 32]>, ConfigError> {
+fn parse_allowed_ops(raw: &str) -> Result<(BTreeSet<[u8; 32]>, bool), ConfigError> {
+    let tokens: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens == ["*"] {
+        return Ok((BTreeSet::new(), true));
+    }
+    if tokens.iter().any(|t| *t == "*") {
+        return Err(ConfigError::InvalidBlossomAllowedOp {
+            value: "*".to_string(),
+            reason: "wildcard must be the sole ZKCOINS_BLOSSOM_ALLOWED_OPS token".to_string(),
+        });
+    }
     let mut out = BTreeSet::new();
-    for part in raw.split(',') {
-        let token = part.trim();
-        if token.is_empty() {
-            continue;
-        }
+    for token in tokens {
         // Lowercase hex only — uppercase is rejected (no silent fold).
         if token.len() != 64 {
             return Err(ConfigError::InvalidBlossomAllowedOp {
@@ -336,7 +353,7 @@ fn parse_allowed_ops(raw: &str) -> Result<BTreeSet<[u8; 32]>, ConfigError> {
         }
         out.insert(key);
     }
-    Ok(out)
+    Ok((out, false))
 }
 
 fn hex_nibble(b: u8) -> u8 {
@@ -802,6 +819,44 @@ mod tests {
             &err,
             ConfigError::InvalidBlossomAllowedOp { value, .. }
                 if value == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+    }
+
+    #[test]
+    fn blossom_allowed_ops_star_allows_any_verified_op() {
+        let mut get = getter(HashMap::from([
+            (ENV_BIND, "127.0.0.1:8080"),
+            (ENV_KERNEL, "http://127.0.0.1:50051"),
+            (ENV_FEATURES, ""),
+            (ENV_PUBLIC_HOST, ""),
+            (ENV_BLOSSOM_STORE, "/var/lib/zkcoins/blossom"),
+            (ENV_BLOSSOM_MAX_BLOB_BYTES, "1048576"),
+            (ENV_BLOSSOM_ALLOWED_OPS, "*"),
+        ]));
+        let cfg = Config::from_getter(&mut get).expect("star ops");
+        let blossom = cfg.blossom.expect("blossom configured");
+        assert!(blossom.allow_any_verified_op);
+        assert!(blossom.allowed_upload_ops.is_empty());
+    }
+
+    #[test]
+    fn blossom_allowed_ops_star_mixed_with_hex_is_error() {
+        let mut get = getter(HashMap::from([
+            (ENV_BIND, "127.0.0.1:8080"),
+            (ENV_KERNEL, "http://127.0.0.1:50051"),
+            (ENV_FEATURES, ""),
+            (ENV_PUBLIC_HOST, ""),
+            (ENV_BLOSSOM_STORE, "/var/lib/zkcoins/blossom"),
+            (ENV_BLOSSOM_MAX_BLOB_BYTES, "1048576"),
+            (
+                ENV_BLOSSOM_ALLOWED_OPS,
+                "*,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        ]));
+        let err = Config::from_getter(&mut get).expect_err("mixed star");
+        assert!(matches!(
+            &err,
+            ConfigError::InvalidBlossomAllowedOp { value, .. } if value == "*"
         ));
     }
 

@@ -8195,6 +8195,7 @@ mod tests {
                 store_root: root,
                 max_blob_bytes: max,
                 allowed_upload_ops: ops,
+                allow_any_verified_op: false,
             }),
         };
         build_router(cfg, Arc::new(UnreachableKernel)).expect("router")
@@ -8221,6 +8222,7 @@ mod tests {
                 )),
                 max_blob_bytes: 1024,
                 allowed_upload_ops: BTreeSet::new(),
+                allow_any_verified_op: false,
             }),
         };
         // Create a *file* at store_root so open fails "not a directory".
@@ -8853,6 +8855,7 @@ mod tests {
                 store_root: root.clone(),
                 max_blob_bytes: 1024,
                 allowed_upload_ops: BTreeSet::new(),
+                allow_any_verified_op: false,
             }),
         };
         let app = build_router(cfg, Arc::new(UnreachableKernel)).expect("router");
@@ -8906,6 +8909,7 @@ mod tests {
                 store_root: root.clone(),
                 max_blob_bytes: 1024,
                 allowed_upload_ops: BTreeSet::new(),
+                allow_any_verified_op: false,
             }),
         };
         let app = build_router(cfg, Arc::new(UnreachableKernel)).expect("router");
