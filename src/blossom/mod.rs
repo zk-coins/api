@@ -320,6 +320,103 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    fn sample_sk_pk() -> (bitcoin::secp256k1::SecretKey, [u8; 32]) {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&[0x7au8; 32]).expect("secret");
+        let kp = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &sk);
+        let (xonly, _) = kp.x_only_public_key();
+        (sk, xonly.serialize())
+    }
+
+    fn temp_blossom(allow_any: bool) -> (AppState, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "zkcoins-blossom-acl-{}-{}-{}",
+            allow_any,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Arc::new(BlobStore::open(&root).expect("temp blossom store"));
+        let mut state = dummy_state();
+        state.blossom = Some(BlossomState {
+            store,
+            max_blob_bytes: 1024,
+            allowed_upload_ops: Arc::new(BTreeSet::new()),
+            allow_any_verified_op: allow_any,
+        });
+        (state, root)
+    }
+
+    #[tokio::test]
+    async fn upload_allow_any_accepts_unlisted_verified_op() {
+        let (state, root) = temp_blossom(true);
+        let body = axum::body::Bytes::from_static(b"fixture-blob");
+        let x = blob_id_of(&body);
+        let (sk, pk) = sample_sk_pk();
+        let now = unix_now().expect("clock");
+        let b64 = sign_auth_event_base64(&sk, &pk, AuthAction::Upload, &x, now, now + 60);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Nostr {b64}")).expect("auth header"),
+        );
+        let result = upload_blob(State(state), headers, LimitedBytes(body)).await;
+        let resp = result.expect("allow-any upload");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn upload_allow_any_still_requires_verified_auth() {
+        let (state, root) = temp_blossom(true);
+        let body = axum::body::Bytes::from_static(b"fixture-blob");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        let result = upload_blob(State(state), headers, LimitedBytes(body)).await;
+        assert!(result.is_err(), "missing auth must fail before ACL");
+        if let Err(err) = result {
+            assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+            assert_eq!(err.body.error, "unauthorized");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn upload_empty_acl_without_allow_any_is_403() {
+        let (state, root) = temp_blossom(false);
+        let body = axum::body::Bytes::from_static(b"fixture-blob");
+        let x = blob_id_of(&body);
+        let (sk, pk) = sample_sk_pk();
+        let now = unix_now().expect("clock");
+        let b64 = sign_auth_event_base64(&sk, &pk, AuthAction::Upload, &x, now, now + 60);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Nostr {b64}")).expect("auth header"),
+        );
+        let result = upload_blob(State(state), headers, LimitedBytes(body)).await;
+        assert!(result.is_err(), "empty ACL must deny unlisted op");
+        if let Err(err) = result {
+            assert_eq!(err.status, StatusCode::FORBIDDEN);
+            assert_eq!(err.body.error, "scope_exceeded");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn require_octet_stream_missing_content_type_is_malformed() {
         let headers = HeaderMap::new();
