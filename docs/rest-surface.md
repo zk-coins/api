@@ -234,4 +234,4 @@ Sibling-Vergleich mit `zk-coins/node` ist optional/lokal, kein CI-Gate. Client
 |---|---|
 | `ZKCOINS_BLOSSOM_STORE` | Wurzelverzeichnis des inhaltsadressierten Blob-Stores. **Abwesend** ⇒ die drei Blossom-Keys (`get`/`head`/`upload`) bleiben unbeworben und unmontiert. **Kein Default-Pfad**, kein `/tmp`-Rückfall. Leer gesetzt → Startfehler. |
 | `ZKCOINS_BLOSSOM_MAX_BLOB_BYTES` | Pflicht-Begleiter wenn der Store gesetzt ist: ausgewiesene Upload-Obergrenze (`> 0`). Body darüber → `413 payload_too_large`. |
-| `ZKCOINS_BLOSSOM_ALLOWED_OPS` | Pflicht-Begleiter wenn der Store gesetzt ist: komma-separierte lowercase-hex-32B-`op`-Pubkeys (gepaarte Konten + Replikations-Peers). Darf leer sein (dann ist jeder Upload `403`). |
+| `ZKCOINS_BLOSSOM_ALLOWED_OPS` | Pflicht-Begleiter wenn der Store gesetzt ist: komma-separierte lowercase-hex-32B-`op`-Pubkeys (gepaarte Konten + Replikations-Peers). Darf leer sein (dann ist jeder Upload `403`). Ein alleinstehendes `*` akzeptiert jedes bereits verifizierte Kind-24242 (Test-Nodes). `*` gemischt mit Hex-Keys ist ein Startfehler. |

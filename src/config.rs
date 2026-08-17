@@ -318,7 +318,7 @@ fn parse_allowed_ops(raw: &str) -> Result<(BTreeSet<[u8; 32]>, bool), ConfigErro
     if tokens == ["*"] {
         return Ok((BTreeSet::new(), true));
     }
-    if tokens.iter().any(|t| *t == "*") {
+    if tokens.contains(&"*") {
         return Err(ConfigError::InvalidBlossomAllowedOp {
             value: "*".to_string(),
             reason: "wildcard must be the sole ZKCOINS_BLOSSOM_ALLOWED_OPS token".to_string(),
@@ -453,6 +453,7 @@ mod tests {
         );
         assert_eq!(blossom.max_blob_bytes, 1_048_576);
         assert_eq!(blossom.allowed_upload_ops.len(), 1);
+        assert!(!blossom.allow_any_verified_op);
     }
 
     #[test]

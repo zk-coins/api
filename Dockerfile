@@ -65,7 +65,9 @@
 #   ZKCOINS_BLOSSOM_ALLOWED_OPS
 #     Comma-separated lowercase-hex 32-byte op pubkeys allowed to upload.
 #     Variable required when store is set; empty string allowed
-#     (surface up, every upload 403). Source: ENV_BLOSSOM_ALLOWED_OPS.
+#     (surface up, every upload 403). A sole * token allows any
+#     verified kind-24242 (test nodes). Mixing * with hex is a start
+#     error. Source: ENV_BLOSSOM_ALLOWED_OPS.
 #
 # Optional (logging only — not process config):
 #
