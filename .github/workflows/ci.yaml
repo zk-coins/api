@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  workflow_dispatch:
+
+  # Target-branch gate: every commit that lands on `develop` (direct push
+  # or merge) gets its own run. Grouped by commit SHA below so a simultaneous
+  # `pull_request` synchronize on the same SHA is deduplicated rather than
+  # queued twice.
+  push:
+    branches: [develop]
+
+  # merge_group: required-check runs for merge queue entries (when enabled).
+  merge_group:
+
+  # CI runs on every pull request regardless of target branch. This
+  # makes the default safe for stacked PRs (PR-A → PR-B → PR-C where
+  # each PR's base is the previous PR's branch) and any other workflow
+  # that opens a PR against a non-`develop` branch — previously such
+  # PRs were silently skipped because `branches: [develop]` filtered
+  # them out, and the only fix was to hand-edit ci.yaml on each new
+  # feature stack.
+  #
+  # `ready_for_review` is added so the workflow fires the moment a
+  # draft PR is marked ready — drafts themselves skip CI via the
+  # `if:` guard on the job (saves runner time while work is still in
+  # progress).
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  # Group by commit SHA so:
+  # - a `push` to develop and a `pull_request` event for the same SHA
+  #   collapse into one in-flight run (`cancel-in-progress`);
+  # - re-runs of the same commit replace the previous attempt.
+  # Per-PR "cancel outdated intermediate commits" is not applied: each
+  # distinct SHA is a separate group (preferred for develop target-branch
+  # gates and SHA-stable required checks).
+  group: ci-${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Single job on GitHub-hosted Linux: fmt, clippy, build, test.
+# No Postgres/testcontainers, no Plonky2 prover, no llvm-cov coverage
+# gate, no self-hosted runner — this tree is small enough that the
+# local gates fit on `ubuntu-latest` in one job.
+#
+# No `notify-failure` job: this repository does not hold the Telegram
+# bot secrets (`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`). Add one —
+# modelled on the node's `notify-failure` job — once those secrets
+# are provisioned here.
+jobs:
+  lint-and-build:
+    name: Lint & Build
+    # Skip on draft PRs. Non-PR events (push, merge_group, workflow_dispatch)
+    # always run: `github.event.pull_request` is absent there, so the
+    # `event_name != 'pull_request'` arm keeps them enabled.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The repo pins its toolchain in `rust-toolchain` (a dated nightly,
+      # with `rustfmt` and `clippy` in `components`). Installing that pin
+      # keeps a single compiler for format, lint, build and test — nothing
+      # to drift against a second, explicit channel install. Chosen over
+      # `dtolnay/rust-toolchain@stable` because the pin file is present;
+      # without it this step would use the stable action instead of
+      # inventing a pin.
+      - name: Install the pinned toolchain (rust-toolchain)
+        run: |
+          # `rustup show active-toolchain` installs the pin when the
+          # directory has a `rust-toolchain` file and no matching
+          # toolchain is present yet. The `|| rustup toolchain install`
+          # arm covers the cold case where show exits non-zero before
+          # the pin is available — install is idempotent; a real failure
+          # in the subsequent version checks still fails the step.
+          rustup show active-toolchain || rustup toolchain install
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # kernel-proto/build.rs invokes `protoc` (via tonic-build / prost-build)
+      # to compile proto/kernel/v1/kernel.proto. ubuntu-latest does not ship
+      # protobuf-compiler by default — without this step, fmt is fine but
+      # clippy/build/test fail with "Could not find `protoc`".
+      - name: Install protoc (kernel-proto build.rs)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # `--all-targets` is intentional: without it clippy lints library
+      # targets only, so tests and fixture modules are never linted.
+      # `--all-features` matches the local green suite.
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build
+
+      - name: Test
+        run: cargo test --all-features

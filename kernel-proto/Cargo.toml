@@ -1,0 +1,25 @@
+[package]
+name = "kernel-proto"
+version = "0.1.0"
+edition = "2021"
+description = "Generated kernel.v1 gRPC types and client stubs (no business logic)."
+publish = false
+
+[features]
+# Test-only server stubs for api's in-memory duplex transport tests. Production
+# builds never enable this feature and remain client-only.
+test-server = ["tonic/router"]
+
+[dependencies]
+# Matches zk-coins/node kernel-proto tonic line: last line whose tonic-build
+# still owns prost codegen (`compile_protos`). Client-only: no `router`
+# (Server::add_service) — the api is a pure gRPC client.
+tonic = { version = "0.13.1", default-features = false, features = [
+    "codegen",
+    "prost",
+    "transport",
+] }
+prost = "0.13.5"
+
+[build-dependencies]
+tonic-build = "0.13.1"
