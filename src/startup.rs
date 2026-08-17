@@ -147,6 +147,7 @@ mod tests {
                 store_root: path.clone(),
                 max_blob_bytes: 1024,
                 allowed_upload_ops: BTreeSet::new(),
+                allow_any_verified_op: false,
             }),
         );
         let code = run_with_config(config).await;
